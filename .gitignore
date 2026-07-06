@@ -1,0 +1,11 @@
+*.pyc
+*.swp
+__pycache__/
+tests/__pycache__/
+default.cfg
+www/botlog.json
+www/bot-process.log
+nohup.out
+*.log
+*.idea
+*.lnk

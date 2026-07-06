@@ -1,0 +1,83 @@
+[BITFINEX]
+apikey = YourBitfinexAPIKey
+secret = YourBitfinexSecret
+
+# Bitfinex funding currencies. UST is Bitfinex's USDT currency code.
+currencies = USD,UST
+
+[BOT]
+# The bot is dry-run by default. Use --live to place/cancel real offers.
+
+# sleep between active iterations, time in seconds (1-3600)
+sleeptimeactive = 60
+
+# sleep between inactive iterations, time in seconds (1-3600)
+sleeptimeinactive = 300
+
+# minimum daily funding rate in percent (0.003-5)
+mindailyrate = 0.04
+
+# maximum daily funding rate in percent (0.003-5)
+maxdailyrate = 2
+
+# number of offers to split the available funding balance across (1-20)
+spreadlend = 3
+
+# depth of funding offer book, as percent of lendable balance
+gapbottom = 10
+gaptop = 200
+
+# Smart strategy follows the live funding book instead of holding a fixed minimum rate.
+# It splits offers into quick-fill, balanced, and opportunistic repricing buckets.
+smartstrategy = true
+smartrateoffset = 0.001
+smartfastdepth = 5
+smartbalanceddepth = 150
+smartopportunitydepth = 300
+smartopportunitypremium = 0.01
+
+# Reprice stale active offers instead of canceling every offer each loop.
+repricestaleoffers = true
+repriceafterminutes = 15
+
+# daily rate threshold after which offers use xdays instead of 2 days
+xdaythreshold = 0.2
+xdays = 60
+
+# Bitfinex minimum funding offer is about 150 USD equivalent.
+# For non-USD/UST currencies, set an explicit per-coin minloansize in coinconfig.
+minloansize = 150
+
+# Used only when dry-run has no real API credentials.
+dryrunbalance = 300
+
+# Standard Bitfinex funding provider fee. Hidden offers are higher.
+platformfeerate = 15
+
+# Auto-transfer from exchange/margin wallets to funding wallet.
+# Leave commented to disable.
+# transferableCurrencies = USD,UST
+transferFromWallets = exchange,margin
+
+# Max amount to lend below maxtolentrate. 0 disables this raw amount limit.
+#maxtolent = 0
+
+# Max percent to lend below maxtolentrate. 0 lends 100%.
+#maxpercenttolent = 0
+
+# Conditional rate for maxtolent/maxpercenttolent, in percent.
+# 0 means the limit applies whenever a book rate exists.
+#maxtolentrate = 0
+
+# Per-currency settings:
+# ["COIN:mindailyrate:enabled:maxtolent:maxpercenttolent:maxtolentrate:minloansize", ...]
+# Example for BTC with explicit minimum amount:
+#coinconfig = ["BTC:0.01:1:0:0:0:0.005"]
+
+# JSON status output for the web page.
+#jsonfile = www/botlog.json
+#jsonlogsize = 200
+#startWebServer = true
+
+# Summary output currency for the web page.
+outputCurrency = USD

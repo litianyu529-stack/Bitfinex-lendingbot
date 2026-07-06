@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="author" content="Bitfinex 自动放贷机器人">
+    <link rel="SHORTCUT ICON" href="images/bitfinex-lending-icon.ico">
+    <link rel="icon" href="images/bitfinex-lending-icon-32.png" sizes="32x32">
+    <link rel="icon" href="images/bitfinex-lending-icon-48.png" sizes="48x48">
+    <link rel="apple-touch-icon" href="images/bitfinex-lending-icon-192.png">
+    <link rel="manifest" href="manifest.json">
+    <meta id="theme-color" name="theme-color" content="#f5f7fb">
+    <title>Bitfinex 自动放贷机器人</title>
+    <link rel="stylesheet" href="lendingbot.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="brand">
+            <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 16.5 10.8 5l3.6 6.3L20 8.7l-6.8 10.8-3.6-6.2L4 16.5Z"/></svg>
+            </span>
+            <div>
+                <h1>Bitfinex 自动放贷机器人</h1>
+                <p id="configPath">本地控制台</p>
+            </div>
+        </div>
+        <div class="header-actions">
+            <div class="status-chip" id="connectionChip">
+                <span class="status-dot"></span>
+                <span>连接中</span>
+            </div>
+            <button class="icon-button" id="refreshButton" type="button" title="刷新">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.7M4 12A8 8 0 0 1 17.7 6.3M18 3v4h-4M6 21v-4h4"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <main class="workspace">
+        <section class="hero-panel">
+            <div class="hero-copy">
+                <div class="mode-toggle" role="group" aria-label="运行模式">
+                    <button class="mode-option active" data-mode="dry" type="button">模拟运行</button>
+                    <button class="mode-option" data-mode="live" type="button">实盘运行</button>
+                </div>
+                <h2 id="statusText">等待机器人状态</h2>
+                <p id="lastUpdate">暂无更新时间</p>
+            </div>
+            <div class="command-panel">
+                <div class="control-strip">
+                    <div>
+                        <span class="control-label">机器人控制</span>
+                        <strong id="botProcessStatus">已停止</strong>
+                    </div>
+                    <button class="start-button" id="startBotButton" type="button">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                        <span>启动机器人</span>
+                    </button>
+                </div>
+                <label for="commandOutput">手动命令</label>
+                <div class="command-row">
+                    <code id="commandOutput">python lendingbot.py --server --dryrun</code>
+                    <button class="icon-button filled" id="copyCommandButton" type="button" title="复制命令">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h10v12H9zM5 3h10v4M5 3v12h2"/></svg>
+                    </button>
+                </div>
+                <div class="command-options">
+                    <label><input type="checkbox" id="commandServer" checked> 网页</label>
+                    <label><input type="checkbox" id="commandJson" checked> 状态文件</label>
+                    <label><input type="checkbox" id="commandOnce"> 单次运行</label>
+                </div>
+            </div>
+        </section>
+
+        <section class="summary-grid" aria-label="放贷汇总">
+            <article class="metric">
+                <span>资金钱包</span>
+                <strong id="totalCoins">0.0000</strong>
+                <small id="currencyCount">0 个币种</small>
+            </article>
+            <article class="metric">
+                <span>已放贷</span>
+                <strong id="totalLent">0.0000</strong>
+                <small id="lentRatio">0.00%</small>
+            </article>
+            <article class="metric">
+                <span>平均日利率</span>
+                <strong id="averageRate">0.00000%</strong>
+                <small id="feeLabel">15% 平台费模型</small>
+            </article>
+            <article class="metric warning">
+                <span>API 密钥</span>
+                <strong id="credentialStatus">未知</strong>
+                <small>仅开启资金读取和放贷写入</small>
+            </article>
+        </section>
+
+        <section class="earnings-grid" aria-label="收益统计">
+            <article class="metric">
+                <span>今日收益</span>
+                <strong id="earningsToday">暂无数据</strong>
+                <small id="earningsCurrency">USD/UST 已入账</small>
+            </article>
+            <article class="metric">
+                <span>7 日收益</span>
+                <strong id="earningsSevenDays">暂无数据</strong>
+                <small>来自 Bitfinex 账本</small>
+            </article>
+            <article class="metric">
+                <span>30 日收益</span>
+                <strong id="earningsThirtyDays">暂无数据</strong>
+                <small>已扣除平台入账结果</small>
+            </article>
+            <article class="metric">
+                <span>30 日估算年化</span>
+                <strong id="earningsApy">暂无数据</strong>
+                <small>按当前本金估算</small>
+            </article>
+            <article class="metric">
+                <span>资金闲置比例</span>
+                <strong id="idleRatio">暂无数据</strong>
+                <small>未放出且未挂单资金</small>
+            </article>
+        </section>
+
+        <section class="content-grid">
+            <div class="main-column">
+                <section class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h3>资金钱包</h3>
+                            <p>USD / UST 放贷状态</p>
+                        </div>
+                    </div>
+                    <div class="coin-list" id="coinList"></div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h3>最近日志</h3>
+                            <p id="logCount">0 条记录</p>
+                        </div>
+                        <input class="search-input" id="logFilter" type="search" placeholder="筛选日志">
+                    </div>
+                    <div class="log-stream" id="logStream"></div>
+                </section>
+            </div>
+
+            <aside class="side-column">
+                <section class="panel strategy-panel">
+                    <div class="panel-header">
+                        <div>
+                            <h3>策略设置</h3>
+                            <p>保存到 default.cfg</p>
+                        </div>
+                        <button class="secondary-button" id="reloadConfigButton" type="button">重新加载</button>
+                    </div>
+                    <form id="strategyForm">
+                        <label class="field wide">
+                            <span>币种</span>
+                            <input name="currencies" value="USD,UST">
+                        </label>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>最低日利率 %</span>
+                                <input name="mindailyrate" type="number" step="0.0001" min="0.003" max="5">
+                            </label>
+                            <label class="field">
+                                <span>最高日利率 %</span>
+                                <input name="maxdailyrate" type="number" step="0.0001" min="0.003" max="5">
+                            </label>
+                        </div>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>拆单数量</span>
+                                <input name="spreadlend" type="number" step="1" min="1" max="20">
+                            </label>
+                            <label class="field">
+                                <span>最小单笔</span>
+                                <input name="minloansize" type="number" step="0.00000001" min="0">
+                            </label>
+                        </div>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>盘口起点 %</span>
+                                <input name="gapbottom" type="number" step="0.01" min="0">
+                            </label>
+                            <label class="field">
+                                <span>盘口终点 %</span>
+                                <input name="gaptop" type="number" step="0.01" min="0">
+                            </label>
+                        </div>
+                        <label class="check-field wide">
+                            <input name="smartstrategy" type="checkbox" checked>
+                            <span>启用智能市场策略</span>
+                        </label>
+                        <p class="field-note wide">开启后会参考实时盘口自动定价，并把拆单分成快速成交、平衡和追高等待。</p>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>市场加价 %</span>
+                                <input name="smartrateoffset" type="number" step="0.0001" min="0" max="5">
+                            </label>
+                            <label class="field">
+                                <span>追高加价 %</span>
+                                <input name="smartopportunitypremium" type="number" step="0.0001" min="0" max="5">
+                            </label>
+                        </div>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>快速成交深度 %</span>
+                                <input name="smartfastdepth" type="number" step="0.01" min="0" max="10000">
+                            </label>
+                            <label class="field">
+                                <span>平衡深度 %</span>
+                                <input name="smartbalanceddepth" type="number" step="0.01" min="0" max="10000">
+                            </label>
+                        </div>
+                        <label class="field wide">
+                            <span>追高等待深度 %</span>
+                            <input name="smartopportunitydepth" type="number" step="0.01" min="0" max="10000">
+                        </label>
+                        <label class="check-field wide">
+                            <input name="repricestaleoffers" type="checkbox" checked>
+                            <span>启用超时重定价</span>
+                        </label>
+                        <p class="field-note wide">开启后只会处理等待太久还没成交的挂单，新挂单不会每轮都被撤掉。</p>
+                        <label class="field wide">
+                            <span>重定价等待分钟</span>
+                            <input name="repriceafterminutes" type="number" step="1" min="1" max="1440">
+                        </label>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>长周期阈值 %</span>
+                                <input name="xdaythreshold" type="number" step="0.0001" min="0" max="5">
+                            </label>
+                            <label class="field">
+                                <span>长周期天数</span>
+                                <input name="xdays" type="number" step="1" min="2" max="120">
+                            </label>
+                        </div>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>活跃间隔</span>
+                                <input name="sleeptimeactive" type="number" step="1" min="1" max="3600">
+                            </label>
+                            <label class="field">
+                                <span>空闲间隔</span>
+                                <input name="sleeptimeinactive" type="number" step="1" min="1" max="3600">
+                            </label>
+                        </div>
+                        <div class="field-pair">
+                            <label class="field">
+                                <span>平台费率 %</span>
+                                <input name="platformfeerate" type="number" step="0.01" min="0" max="100">
+                            </label>
+                            <label class="field">
+                                <span>汇总币种</span>
+                                <input name="outputcurrency" value="USD">
+                            </label>
+                        </div>
+                        <label class="field wide">
+                            <span>自动转入币种</span>
+                            <input name="transferablecurrencies" placeholder="已关闭">
+                        </label>
+                        <div class="form-actions">
+                            <button class="primary-button" type="submit">
+                                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17l9-10"/></svg>
+                                保存策略
+                            </button>
+                            <button class="secondary-button" id="copyConfigButton" type="button">复制配置</button>
+                        </div>
+                        <p class="form-message" id="formMessage"></p>
+                    </form>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-header">
+                        <div>
+                            <h3>安全</h3>
+                            <p>本地实盘保护</p>
+                        </div>
+                    </div>
+                    <div class="safety-list">
+                        <label><input type="checkbox" checked disabled> 默认模拟运行</label>
+                        <label><input type="checkbox" checked disabled> 没有提现接口</label>
+                        <label><input type="checkbox" id="ackLive"> 我已确认 Bitfinex 权限</label>
+                    </div>
+                </section>
+            </aside>
+        </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="lendingbot.js"></script>
+</body>
+</html>
