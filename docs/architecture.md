@@ -6,6 +6,8 @@
 
 核心模块：
 
+- `Configuration.py`：配置解析、V3 策略版本持久化、备份与校验。
+- `DashboardServer.py`：本地 HTTP 安全边界、静态资源和路由；业务操作通过显式回调注入。
 - `bitfinex.py`：REST 鉴权、公开读取和三态写入结果。
 - `MarketDataStream.py`：WebSocket 连接代次、快照门槛及 REST 降级。
 - `StrategyV3.py`：纯策略信号、计划与无写入回放。
@@ -24,7 +26,7 @@ flowchart LR
     R --> S["StrategyV3 纯计划"]
     R <--> D["StateStore / SQLite v4"]
     D --> E["StrategyResearch 离线评估"]
-    H["Local Dashboard"] --> R
+    H["DashboardServer / Local HTTP"] --> R
 ```
 
 跨层新增接口应优先使用 `AccountSnapshot`、`MarketSnapshot`、`StrategyPlan` 和 `WriteResult`，避免继续扩散形状不确定的字典。Bitfinex 原始数组只允许出现在适配器边界。

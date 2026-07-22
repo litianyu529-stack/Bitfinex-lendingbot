@@ -1,26 +1,19 @@
 import argparse
-import configparser
 import datetime
 import hashlib
 import json
 import os
 import secrets
-import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import traceback
-import mimetypes
-from dataclasses import dataclass
 from decimal import Decimal, getcontext
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from http.server import ThreadingHTTPServer
 
 from bitfinex import Bitfinex, BitfinexApiError
-from FileUtils import atomic_write_text
 from Logger import Logger
 from AppContext import AppContext
 from ExchangeModels import parse_funding_stats, parse_funding_trades
@@ -34,13 +27,11 @@ from RuntimeV3 import (
 )
 from MarketDataStream import BitfinexMarketDataHub, websocket_dependency_available
 from StrategyV3 import (
-    StrategyPolicyV3,
     build_market_signals_v3,
     gross_daily_floor,
     json_decimal,
     pool_for_period,
     policy_v3_to_json,
-    policy_v3_with_overrides,
     replay_strategy_v3,
     validate_policy_v3,
 )
@@ -49,6 +40,49 @@ from StrategyResearch import (
     evaluate_strategies,
     write_research_report,
 )
+import StrategyV3 as strategy_layer
+from DashboardServer import (
+    ApiRequestError,
+    DashboardApplication,
+    DashboardRequestHandler,
+    load_static_snapshot,
+)
+import Configuration as config_layer
+
+
+ConfigError = config_layer.ConfigError
+StrategyPolicyV3 = strategy_layer.StrategyPolicyV3
+Settings = config_layer.Settings
+V3_BOOL_FIELDS = config_layer.V3_BOOL_FIELDS
+V3_CONFIG_FIELDS = config_layer.V3_CONFIG_FIELDS
+V3_INT_FIELDS = config_layer.V3_INT_FIELDS
+V3_LIST_FIELDS = config_layer.V3_LIST_FIELDS
+V3_PERCENT_FIELDS = config_layer.V3_PERCENT_FIELDS
+backup_strategy_state = config_layer.backup_strategy_state
+build_settings = config_layer.build_settings
+config_api_payload = config_layer.config_api_payload
+decimal_percent_to_config = config_layer.decimal_percent_to_config
+decimal_to_config = config_layer.decimal_to_config
+ensure_active_strategy_v3 = config_layer.ensure_active_strategy_v3
+ensure_config_file = config_layer.ensure_config_file
+get_boolean = config_layer.get_boolean
+get_decimal = config_layer.get_decimal
+get_decimal_percent = config_layer.get_decimal_percent
+get_option = config_layer.get_option
+mirror_active_strategy_v3 = config_layer.mirror_active_strategy_v3
+normalize_current_active_strategy = config_layer.normalize_current_active_strategy
+read_config = config_layer.read_config
+split_csv = config_layer.split_csv
+status_decimal = config_layer.status_decimal
+strategy_v3_api_values = config_layer.strategy_v3_api_values
+strategy_v3_config_values = config_layer.strategy_v3_config_values
+strategy_v3_from_api_payload = config_layer.strategy_v3_from_api_payload
+strategy_v3_from_config = config_layer.strategy_v3_from_config
+strategy_v3_from_record = config_layer.strategy_v3_from_record
+strategy_v3_semantically_equal = config_layer.strategy_v3_semantically_equal
+strategy_v3_version_id = config_layer.strategy_v3_version_id
+update_config_file_preserving_comments = config_layer.update_config_file_preserving_comments
+validate_settings = config_layer.validate_settings
 
 
 getcontext().prec = 28
@@ -62,15 +96,15 @@ PREFLIGHT_TTL_SECONDS = 300
 DASHBOARD_SERVICE_ID = "mika-lending-dashboard-v3"
 DASHBOARD_BUILD_PLACEHOLDER = "__MIKA_DASHBOARD_BUILD_ID__"
 DASHBOARD_CSRF_PLACEHOLDER = "__MIKA_DASHBOARD_CSRF_TOKEN__"
-DASHBOARD_MAX_BODY_BYTES = 64 * 1024
-DASHBOARD_STARTED_AT = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 DASHBOARD_BUILD_FILES = (
     "lendingbot.py",
+    "DashboardServer.py",
     "bitfinex.py",
     "FileUtils.py",
     "Logger.py",
     "MarketDataStream.py",
     "AppContext.py",
+    "Configuration.py",
     "DomainTypes.py",
     "ExchangeModels.py",
     "RuntimeV3.py",
@@ -197,36 +231,6 @@ class LiveProcessLock:
             handle.close()
 
 
-class ConfigError(Exception):
-    pass
-
-
-class ApiRequestError(ConfigError):
-    def __init__(self, message, code="REQUEST_REJECTED", status=400, details=None):
-        super().__init__(message)
-        self.code = code
-        self.status = int(status)
-        self.details = details
-
-
-@dataclass
-class Settings:
-    api_key: str
-    api_secret: str
-    currencies: list[str]
-    sleep_active: float
-    sleep_inactive: float
-    transferable_currencies: list[str]
-    transfer_from_wallets: list[str]
-    output_currency: str
-    json_file: str
-    json_log_size: int
-    web_server: bool
-    once: bool
-    strategy_v3: StrategyPolicyV3
-    state_db_file: str
-
-
 def timestamp():
     ts = time.time()
     return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
@@ -268,434 +272,6 @@ def parse_args(argv=None):
     )
     parser.add_argument("--no-server", action="store_true", help="disable config-driven web server startup")
     return parser.parse_args(argv)
-
-
-def ensure_config_file(config_location):
-    if os.path.exists(config_location):
-        return False
-    if config_location == DEFAULT_CONFIG and os.path.exists(DEFAULT_CONFIG_EXAMPLE):
-        shutil.copy(DEFAULT_CONFIG_EXAMPLE, config_location)
-        return True
-    return False
-
-
-def read_config(config_location):
-    created = ensure_config_file(config_location)
-    config = configparser.ConfigParser()
-    config.read(config_location)
-    return config, created
-
-
-def get_option(config, section, option, fallback=None):
-    if config.has_option(section, option):
-        return config.get(section, option)
-    return fallback
-
-
-def get_decimal(config, section, option, fallback):
-    return Decimal(str(get_option(config, section, option, fallback)))
-
-
-def get_decimal_percent(config, section, option, fallback):
-    return Decimal(str(get_option(config, section, option, fallback))) / Decimal("100")
-
-
-def get_boolean(config, section, option, fallback):
-    if config.has_option(section, option):
-        return config.getboolean(section, option)
-    return fallback
-
-
-def split_csv(raw):
-    if not raw:
-        return []
-    return [part.strip().upper() for part in raw.split(",") if part.strip()]
-
-
-V3_PERCENT_FIELDS = {
-    "short_floor_apr",
-    "medium_floor_apr",
-    "long_floor_apr",
-    "amount_jitter",
-    "normal_fee_rate",
-    "hidden_fee_rate",
-    "minimum_rate_change",
-    "outlier_min_volume_share",
-}
-V3_BOOL_FIELDS = {
-    "enable_limit",
-    "enable_frr",
-    "enable_frr_delta_fixed",
-    "enable_frr_delta_variable",
-    "enable_hidden",
-}
-V3_INT_FIELDS = {
-    "target_slices",
-    "minimum_offer_minutes",
-    "reprice_cooldown_minutes",
-    "max_reprices_per_hour",
-    "ws_fallback_seconds",
-    "rest_stale_seconds",
-    "market_retention_days",
-}
-V3_LIST_FIELDS = {"short_periods", "medium_periods", "long_periods"}
-V3_CONFIG_FIELDS = tuple(name for name in StrategyPolicyV3.__dataclass_fields__ if name not in {"version", "currency"})
-
-
-def strategy_v3_from_config(config):
-    section = "STRATEGY_V3"
-    values = {}
-    if config.has_section(section):
-        for field_name in V3_CONFIG_FIELDS:
-            raw = get_option(config, section, field_name, None)
-            if raw is None:
-                continue
-            if (
-                field_name
-                in {
-                    "short_floor_apr",
-                    "medium_floor_apr",
-                    "long_floor_apr",
-                    "hidden_max_share",
-                    "max_lend_amount",
-                }
-                and str(raw).strip() == ""
-            ):
-                values[field_name] = None
-            elif field_name in V3_PERCENT_FIELDS:
-                values[field_name] = Decimal(str(raw)) / Decimal("100")
-            elif field_name in V3_BOOL_FIELDS:
-                values[field_name] = str(raw).strip().lower() in {"1", "true", "yes", "on"}
-            elif field_name in V3_INT_FIELDS:
-                values[field_name] = int(raw)
-            elif field_name in V3_LIST_FIELDS:
-                values[field_name] = tuple(int(item.strip()) for item in str(raw).split(",") if item.strip())
-            else:
-                values[field_name] = Decimal(str(raw))
-    try:
-        return validate_policy_v3(policy_v3_with_overrides(StrategyPolicyV3(), values))
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def strategy_v3_config_values(policy):
-    values = {}
-    for field_name in V3_CONFIG_FIELDS:
-        value = getattr(policy, field_name)
-        if value is None:
-            values[field_name] = ""
-        elif field_name in V3_PERCENT_FIELDS:
-            values[field_name] = decimal_percent_to_config(value)
-        elif isinstance(value, bool):
-            values[field_name] = str(value).lower()
-        elif isinstance(value, tuple):
-            values[field_name] = ",".join(str(item) for item in value)
-        elif isinstance(value, Decimal):
-            values[field_name] = decimal_to_config(value)
-        else:
-            values[field_name] = str(value)
-    return values
-
-
-def strategy_v3_api_values(policy):
-    payload = policy_v3_to_json(policy)
-    for field_name in V3_PERCENT_FIELDS:
-        value = getattr(policy, field_name)
-        payload[field_name] = None if value is None else decimal_percent_to_config(value)
-    payload["hidden_max_share"] = (
-        None if policy.hidden_max_share is None else decimal_to_config(policy.hidden_max_share)
-    )
-    payload["gross_daily_floors_percent"] = {
-        pool: None
-        if policy.floor_apr(pool) is None
-        else decimal_percent_to_config(Decimal(payload["gross_daily_floors"][pool]))
-        for pool in ("short", "medium", "long")
-    }
-    return payload
-
-
-def strategy_v3_from_api_payload(payload, base=None):
-    values = {}
-    payload = payload or {}
-    for field_name in V3_CONFIG_FIELDS:
-        if field_name not in payload:
-            continue
-        value = payload[field_name]
-        if field_name in {
-            "short_floor_apr",
-            "medium_floor_apr",
-            "long_floor_apr",
-            "hidden_max_share",
-            "max_lend_amount",
-        } and value in (None, ""):
-            values[field_name] = None
-        elif field_name in V3_PERCENT_FIELDS:
-            values[field_name] = Decimal(str(value)) / Decimal("100")
-        elif field_name in V3_BOOL_FIELDS:
-            values[field_name] = (
-                value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
-            )
-        elif field_name in V3_INT_FIELDS:
-            values[field_name] = int(value)
-        elif field_name in V3_LIST_FIELDS:
-            raw = value if isinstance(value, (list, tuple)) else str(value).split(",")
-            values[field_name] = tuple(int(item) for item in raw if str(item).strip())
-        else:
-            values[field_name] = Decimal(str(value))
-    try:
-        return validate_policy_v3(policy_v3_with_overrides(base or StrategyPolicyV3(), values))
-    except (ValueError, ArithmeticError) as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def strategy_v3_from_record(record, require_live=False):
-    if record is None:
-        return None
-    try:
-        return validate_policy_v3(
-            policy_v3_with_overrides(StrategyPolicyV3(), record["policy"]),
-            require_live_floors=require_live,
-        )
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def strategy_v3_semantically_equal(left, right):
-    return json_decimal(left.__dict__) == json_decimal(right.__dict__)
-
-
-def ensure_active_strategy_v3(store, settings):
-    active = store.strategy("ACTIVE")
-    if active is None:
-        store.save_strategy(json_decimal(settings.strategy_v3.__dict__), status="ACTIVE")
-        active = store.strategy("ACTIVE")
-    return active, strategy_v3_from_record(active)
-
-
-def mirror_active_strategy_v3(config_path, policy):
-    update_config_file_preserving_comments(
-        config_path,
-        {"STRATEGY_V3": strategy_v3_config_values(policy)},
-    )
-
-
-def backup_strategy_state(config_path, state_db_file):
-    backup_dir = os.path.join(os.path.dirname(os.path.abspath(state_db_file)), "backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    suffix = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
-    config_backup = os.path.join(backup_dir, f"default-{suffix}.cfg")
-    database_backup = os.path.join(backup_dir, f"lendingbot-v3-{suffix}.sqlite3")
-    shutil.copy2(config_path, config_backup)
-    source = sqlite3.connect(state_db_file)
-    target = sqlite3.connect(database_backup)
-    try:
-        source.backup(target)
-    finally:
-        target.close()
-        source.close()
-    return {"config": config_backup, "database": database_backup}
-
-
-def normalize_current_active_strategy(config_path):
-    config, _ = read_config(config_path)
-    settings = build_settings(parse_args(["--config", config_path]), config)
-    pre_migration_active = None
-    if os.path.exists(settings.state_db_file):
-        try:
-            connection = sqlite3.connect(settings.state_db_file)
-            connection.row_factory = sqlite3.Row
-            row = connection.execute(
-                "SELECT * FROM strategy_versions WHERE status='ACTIVE' ORDER BY activated_at_ms DESC LIMIT 1"
-            ).fetchone()
-            if row is not None:
-                pre_migration_active = dict(row)
-                pre_migration_active["policy"] = json.loads(pre_migration_active.pop("policy_json"))
-        except (sqlite3.Error, ValueError):
-            pre_migration_active = None
-        finally:
-            try:
-                connection.close()
-            except (NameError, sqlite3.Error):
-                pass
-    backup = None
-    if pre_migration_active is not None:
-        pre_policy = strategy_v3_from_record(pre_migration_active)
-        pre_serialized = json.dumps(
-            json_decimal(pre_policy.__dict__), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        pre_version = hashlib.sha256(pre_serialized.encode("utf-8")).hexdigest()[:16]
-        if pre_migration_active["version_id"] != pre_version:
-            backup = backup_strategy_state(config_path, settings.state_db_file)
-    store = LendingStateStore(settings.state_db_file)
-    active, policy = ensure_active_strategy_v3(store, settings)
-    canonical = json_decimal(policy.__dict__)
-    serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    canonical_version = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
-    if active["version_id"] == canonical_version:
-        return {"changed": False, "versionId": canonical_version, "backup": None}
-    if backup is None:
-        backup = backup_strategy_state(config_path, settings.state_db_file)
-    version_id = store.normalize_active_strategy(
-        canonical,
-        reason=f"normalized incomplete ACTIVE {active['version_id']} to full V3 schema",
-    )
-    mirror_active_strategy_v3(config_path, policy)
-    return {"changed": True, "fromVersion": active["version_id"], "versionId": version_id, "backup": backup}
-
-
-def build_settings(args, config, config_created=False):
-    api_key = args.apikey or os.environ.get("BITFINEX_API_KEY") or get_option(config, "BITFINEX", "apikey", "")
-    api_secret = args.apisecret or os.environ.get("BITFINEX_API_SECRET") or get_option(config, "BITFINEX", "secret", "")
-    currencies = split_csv(get_option(config, "BITFINEX", "currencies", "USD"))
-
-    return Settings(
-        api_key=api_key,
-        api_secret=api_secret,
-        currencies=currencies,
-        sleep_active=float(args.sleeptimeactive or get_option(config, "BOT", "sleeptimeactive", "60")),
-        sleep_inactive=float(args.sleeptimeinactive or get_option(config, "BOT", "sleeptimeinactive", "300")),
-        transferable_currencies=split_csv(get_option(config, "BOT", "transferablecurrencies", "")),
-        transfer_from_wallets=split_csv(get_option(config, "BOT", "transferfromwallets", "exchange,margin")),
-        output_currency="USD",
-        json_file=args.jsonfile or get_option(config, "BOT", "jsonfile", ""),
-        json_log_size=int(args.jsonlogsize or get_option(config, "BOT", "jsonlogsize", "-1")),
-        web_server=(args.startwebserver or config.getboolean("BOT", "startwebserver", fallback=False))
-        and not args.no_server,
-        once=args.once,
-        strategy_v3=strategy_v3_from_config(config),
-        state_db_file=get_option(config, "BOT", "statedbfile", DEFAULT_V3_STATE_DB),
-    )
-
-
-def validate_settings(settings):
-    if settings.sleep_active < 1 or settings.sleep_active > 3600:
-        raise ConfigError("sleeptimeactive must be 1-3600")
-    if settings.sleep_inactive < 1 or settings.sleep_inactive > 3600:
-        raise ConfigError("sleeptimeinactive must be 1-3600")
-    if settings.currencies != ["USD"]:
-        raise ConfigError("strategy v3 supports exactly currencies = USD")
-    if set(settings.transferable_currencies) - {"USD"}:
-        raise ConfigError("transferablecurrencies can only contain USD")
-    try:
-        validate_policy_v3(settings.strategy_v3)
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def decimal_percent_to_config(value):
-    text = format(Decimal(value) * Decimal("100"), "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def decimal_to_config(value):
-    text = format(Decimal(value), "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def status_decimal(value):
-    return format(Decimal(value).quantize(Decimal("0.00000001")), "f")
-
-
-def config_api_payload(config_path):
-    config, _ = read_config(config_path)
-    args = parse_args(["--config", config_path])
-    settings = build_settings(args, config)
-    validate_settings(settings)
-    client = Bitfinex(settings.api_key, settings.api_secret)
-    store = LendingStateStore(settings.state_db_file)
-    active, active_policy = ensure_active_strategy_v3(store, settings)
-    return {
-        "configPath": os.path.abspath(config_path),
-        "credentialsConfigured": client.has_credentials(),
-        "bitfinex": {
-            "currencies": ",".join(settings.currencies),
-        },
-        "bot": {
-            "sleeptimeactive": str(
-                int(settings.sleep_active) if settings.sleep_active.is_integer() else settings.sleep_active
-            ),
-            "sleeptimeinactive": str(
-                int(settings.sleep_inactive) if settings.sleep_inactive.is_integer() else settings.sleep_inactive
-            ),
-            "transferablecurrencies": ",".join(settings.transferable_currencies),
-            "transferfromwallets": ",".join(settings.transfer_from_wallets).lower(),
-            "outputcurrency": settings.output_currency,
-            "jsonfile": settings.json_file or DEFAULT_DASHBOARD_JSON.replace("\\", "/"),
-            "jsonlogsize": str(settings.json_log_size if settings.json_log_size != -1 else 200),
-            "startwebserver": str(settings.web_server).lower(),
-        },
-        "strategyV3": strategy_v3_api_values(active_policy),
-        "strategyV3Draft": None
-        if store.strategy("DRAFT") is None
-        else strategy_v3_api_values(strategy_v3_from_record(store.strategy("DRAFT"))),
-        "strategyV3Pending": None
-        if store.strategy("PENDING") is None
-        else strategy_v3_api_values(strategy_v3_from_record(store.strategy("PENDING"))),
-        "strategyV3State": {
-            "active": active,
-            "draft": store.strategy("DRAFT"),
-            "pending": store.strategy("PENDING"),
-        },
-        "runtimeV3": {
-            "defaultMode": "PAUSED",
-            "stateDatabase": os.path.abspath(settings.state_db_file),
-            "supportedCurrencies": ["USD"],
-        },
-    }
-
-
-def update_config_file_preserving_comments(config_path, updates):
-    if not os.path.exists(config_path):
-        ensure_config_file(config_path)
-    with open(config_path, "r", encoding="utf-8") as file:
-        lines = file.readlines()
-
-    pending = {section: dict(values) for section, values in updates.items() if values}
-    output = []
-    current_section = None
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if current_section in pending and pending[current_section]:
-                for key, value in pending[current_section].items():
-                    output.append(f"{key} = {value}\n")
-                pending[current_section].clear()
-            current_section = stripped[1:-1].upper()
-            output.append(line)
-            continue
-
-        handled = False
-        if current_section in pending and "=" in line and not stripped.startswith("#"):
-            key_part = line.split("=", 1)[0].strip().lower()
-            section_updates = pending.get(current_section, {})
-            if key_part in section_updates:
-                output.append(f"{key_part} = {section_updates.pop(key_part)}\n")
-                handled = True
-        if not handled:
-            output.append(line)
-
-    if current_section in pending and pending[current_section]:
-        for key, value in pending[current_section].items():
-            output.append(f"{key} = {value}\n")
-        pending[current_section].clear()
-
-    for section, values in pending.items():
-        if values:
-            output.append(f"\n[{section}]\n")
-            for key, value in values.items():
-                output.append(f"{key} = {value}\n")
-
-    atomic_write_text(config_path, "".join(output))
-
-
-def strategy_v3_version_id(policy):
-    serialized = json.dumps(json_decimal(policy.__dict__), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 def load_v3_account_context(client, store, now_ms):
@@ -1778,254 +1354,13 @@ def stop_controlled_bot(config_path=DEFAULT_CONFIG, reason="stopped_by_dashboard
 
 
 def load_dashboard_static_snapshot(directory, build_id, csrf_token=""):
-    assets = {}
-    root = os.path.abspath(directory)
-    for current, _, files in os.walk(root):
-        for name in files:
-            path = os.path.join(current, name)
-            relative = os.path.relpath(path, root).replace("\\", "/")
-            if relative in {"botlog.json", "bot-process.log"}:
-                continue
-            try:
-                with open(path, "rb") as file:
-                    data = file.read()
-            except OSError:
-                continue
-            if relative == "lendingbot.html":
-                data = data.replace(DASHBOARD_BUILD_PLACEHOLDER.encode("utf-8"), build_id.encode("ascii"))
-                data = data.replace(DASHBOARD_CSRF_PLACEHOLDER.encode("utf-8"), csrf_token.encode("ascii"))
-            assets[relative] = data
-    return assets
-
-
-class DashboardRequestHandler(SimpleHTTPRequestHandler):
-    config_path = DEFAULT_CONFIG
-    status_path = DEFAULT_DASHBOARD_JSON
-    build_id = ""
-    static_assets = {}
-    dashboard_started_at = DASHBOARD_STARTED_AT
-    csrf_token = ""
-    app_context = None
-
-    def log_message(self, format, *args):
-        return
-
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self'; connect-src 'self'; object-src 'none'; "
-            "base-uri 'none'; frame-ancestors 'none'",
-        )
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        super().end_headers()
-
-    def _send_json(self, payload, status=200):
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Mika-Dashboard-Build", self.build_id)
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_api_error(self, code, error, status=400, details=None):
-        payload = {"ok": False, "code": str(code), "error": str(error), "details": details}
-        self._send_json(payload, status=status)
-
-    def _send_static(self, path):
-        relative = path.lstrip("/") or "lendingbot.html"
-        if relative == "lendingbot.html" and relative in self.static_assets:
-            data = self.static_assets[relative]
-        else:
-            data = self.static_assets.get(relative)
-        if data is None:
-            self.send_error(404, "Not found")
-            return
-        content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            content_type
-            + (
-                "; charset=utf-8"
-                if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}
-                else ""
-            ),
-        )
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Mika-Dashboard-Build", self.build_id)
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _validate_json_envelope(self):
-        content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            raise ApiRequestError("写接口只接受 application/json", "CONTENT_TYPE_REQUIRED", 415)
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as exc:
-            raise ApiRequestError("Content-Length 无效", "INVALID_CONTENT_LENGTH", 400) from exc
-        if length < 0:
-            raise ApiRequestError("Content-Length 无效", "INVALID_CONTENT_LENGTH", 400)
-        if length > DASHBOARD_MAX_BODY_BYTES:
-            raise ApiRequestError("请求体不能超过 64 KiB", "REQUEST_TOO_LARGE", 413)
-        return length
-
-    def _read_json_body(self):
-        length = self._validate_json_envelope()
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw)
-
-    def _validate_write_request(self):
-        host = str(self.headers.get("Host") or "").lower()
-        if host not in {"127.0.0.1:8000", "localhost:8000"}:
-            raise ApiRequestError("写请求 Host 不受信任", "INVALID_HOST", 403)
-        origin = str(self.headers.get("Origin") or "").lower()
-        if origin not in {"http://127.0.0.1:8000", "http://localhost:8000"}:
-            raise ApiRequestError("写请求必须来自本地控制台", "INVALID_ORIGIN", 403)
-        supplied = str(self.headers.get("X-Mika-CSRF") or "")
-        if not supplied or not secrets.compare_digest(supplied, self.csrf_token):
-            raise ApiRequestError("控制台安全令牌无效，请刷新页面", "INVALID_CSRF", 403)
-        self._validate_json_envelope()
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        try:
-            if path == "/api/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "service": DASHBOARD_SERVICE_ID,
-                        "buildId": self.build_id,
-                        "pid": os.getpid(),
-                        "startedAt": self.dashboard_started_at,
-                        "projectRoot": os.path.abspath(os.path.dirname(__file__)),
-                        "configPath": os.path.abspath(self.config_path),
-                        "time": timestamp(),
-                    }
-                )
-                return
-            if path == "/api/status":
-                self._send_json(dashboard_status_payload(self.status_path, self.config_path, self.app_context))
-                return
-            if path == "/api/config":
-                self._send_json(config_api_payload(self.config_path))
-                return
-            if path == "/api/control/status":
-                self._send_json(controlled_bot_status(self.config_path, self.app_context))
-                return
-            if path == "/api/runtime/v3":
-                self._send_json({"ok": True, **runtime_v3_payload(self.config_path, self.app_context)})
-                return
-            if path == "/api/stats/v3":
-                store, _ = v3_store_for_config(self.config_path)
-                self._send_json({"ok": True, **stats_v3_payload(store)})
-                return
-        except Exception as exc:
-            self._send_api_error("INTERNAL_ERROR", exc, status=500)
-            return
-        self._send_static(path)
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        try:
-            self._validate_write_request()
-            if path == "/api/config":
-                self._read_json_body()
-                self._send_json(
-                    {
-                        "ok": False,
-                        "code": "V2_STRATEGY_DISABLED",
-                        "details": None,
-                        "error": "V2 配置写入已永久禁用；请使用 /api/strategy/v3/*",
-                    },
-                    status=410,
-                )
-                return
-            if path == "/api/strategy/v3/preview":
-                payload = self._read_json_body()
-                preview = strategy_v3_preview(self.config_path, payload, app_context=self.app_context)
-                self._send_json({"ok": True, **preview})
-                return
-            if path == "/api/strategy/v3/draft":
-                payload = self._read_json_body()
-                result = save_strategy_v3_draft(self.config_path, payload, app_context=self.app_context)
-                self._send_json({"ok": True, **result})
-                return
-            if path == "/api/strategy/v3/apply":
-                payload = self._read_json_body()
-                result = apply_strategy_v3_draft(self.config_path, payload, app_context=self.app_context)
-                self._send_json({"ok": True, **result})
-                return
-            if path == "/api/strategy/v3/discard":
-                self._read_json_body()
-                result = discard_strategy_v3_draft(self.config_path)
-                self._send_json({"ok": True, **result})
-                return
-            if path == "/api/runtime/v3/mode":
-                payload = self._read_json_body()
-                target = str(payload.get("mode", "")).strip().upper()
-                store, _ = v3_store_for_config(self.config_path)
-                if target == "PAUSED":
-                    if controlled_bot_running(self.config_path, self.app_context):
-                        stop_controlled_bot(self.config_path, context=self.app_context)
-                    runtime = store.set_mode("PAUSED", "dashboard_pause")
-                    self._send_json({"ok": True, "runtime": runtime})
-                    return
-                if target == "REPLAY":
-                    replay = replay_v3_from_store(self.config_path, context=self.app_context)
-                    self._send_json({"ok": True, "runtime": store.runtime(), "replay": replay})
-                    return
-                if target == "LIVE":
-                    raise ConfigError("LIVE 必须通过 /api/control/preflight 和 /api/control/start 启动")
-                raise ConfigError("仅允许切换到 PAUSED、REPLAY；SAFE 由安全状态机管理")
-            if path == "/api/runtime/v3/resolve-ambiguous":
-                payload = self._read_json_body()
-                store, _ = v3_store_for_config(self.config_path)
-                result = store.resolve_ambiguous_intent(
-                    payload.get("intentId"),
-                    exchange_offer_id=payload.get("exchangeOfferId"),
-                    close=bool(payload.get("confirmAbsent", False)),
-                )
-                self._send_json({"ok": True, **result})
-                return
-            if path == "/api/control/preflight":
-                self._read_json_body()
-                preflight = create_controlled_bot_preflight(self.config_path, context=self.app_context)
-                self._send_json({"ok": True, **preflight})
-                return
-            if path == "/api/control/start":
-                payload = self._read_json_body()
-                status = start_controlled_bot(
-                    self.config_path,
-                    self.status_path,
-                    str(payload.get("preflightId", "")),
-                    context=self.app_context,
-                )
-                self._send_json({"ok": True, "bot": status})
-                return
-            if path == "/api/control/stop":
-                status = stop_controlled_bot(self.config_path, context=self.app_context)
-                store, _ = v3_store_for_config(self.config_path)
-                runtime = store.runtime()
-                if runtime["mode"] != "SAFE":
-                    runtime = store.set_mode("PAUSED", "dashboard_stop")
-                self._send_json({"ok": True, "bot": status, "runtime": runtime})
-                return
-            self._send_api_error("NOT_FOUND", "Not found", status=404)
-        except ApiRequestError as exc:
-            self._send_api_error(exc.code, exc, status=exc.status, details=exc.details)
-        except Exception as exc:
-            self._send_api_error("REQUEST_REJECTED", exc, status=400)
+    return load_static_snapshot(
+        directory,
+        build_id,
+        csrf_token,
+        DASHBOARD_BUILD_PLACEHOLDER,
+        DASHBOARD_CSRF_PLACEHOLDER,
+    )
 
 
 def make_dashboard_handler(directory, config_path, status_path, build_id=None, context=None):
@@ -2045,6 +1380,26 @@ def make_dashboard_handler(directory, config_path, status_path, build_id=None, c
     Handler.csrf_token = csrf_token
     Handler.app_context = context
     Handler.dashboard_started_at = timestamp()
+    Handler.application = DashboardApplication(
+        project_root=os.path.abspath(os.path.dirname(__file__)),
+        service_id=DASHBOARD_SERVICE_ID,
+        timestamp=timestamp,
+        status_payload=dashboard_status_payload,
+        config_payload=config_api_payload,
+        controlled_status=controlled_bot_status,
+        runtime_payload=runtime_v3_payload,
+        store_for_config=v3_store_for_config,
+        stats_payload=stats_v3_payload,
+        strategy_preview=strategy_v3_preview,
+        save_strategy_draft=save_strategy_v3_draft,
+        apply_strategy_draft=apply_strategy_v3_draft,
+        discard_strategy_draft=discard_strategy_v3_draft,
+        controlled_running=controlled_bot_running,
+        stop_controlled=stop_controlled_bot,
+        replay_from_store=replay_v3_from_store,
+        create_preflight=create_controlled_bot_preflight,
+        start_controlled=start_controlled_bot,
+    )
     return Handler
 
 
