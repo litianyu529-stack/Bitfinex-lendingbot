@@ -8,6 +8,7 @@
         draftVersionId: null, applyToken: null,
     };
     const byId = (id) => document.getElementById(id);
+    const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
     const surface = byId("v3StrategySurface");
     if (!surface) return;
 
@@ -73,27 +74,9 @@
                 ["market_retention_days", "市场数据保留", "number", "天", { min: 1 }],
             ],
         },
-        {
-            title: "候选订单评分权重",
-            details: true,
-            description: "全部权重必须合计 100%。",
-            fields: [
-                ["score_net_yield", "净收益", "number", "%", { min: 0, max: 100 }],
-                ["score_fill_probability", "成交概率", "number", "%", { min: 0, max: 100 }],
-                ["score_wait_time", "预计等待", "number", "%", { min: 0, max: 100 }],
-                ["score_book_depth", "盘口深度", "number", "%", { min: 0, max: 100 }],
-                ["score_trade_speed", "成交速度", "number", "%", { min: 0, max: 100 }],
-                ["score_utilization", "资金利用率", "number", "%", { min: 0, max: 100 }],
-                ["score_trend_volatility", "趋势与波动", "number", "%", { min: 0, max: 100 }],
-                ["score_term_opportunity", "期限机会成本", "number", "%", { min: 0, max: 100 }],
-                ["score_hidden_cost", "Hidden成本", "number", "%", { min: 0, max: 100 }],
-                ["score_variable_risk", "Variable风险", "number", "%", { min: 0, max: 100 }],
-            ],
-        },
     ];
 
     const allFields = groups.flatMap((group) => group.fields.map((field) => field[0]));
-    const scoreFields = allFields.filter((name) => name.startsWith("score_"));
 
     function createField([name, label, type, unit, options]) {
         const wrapper = document.createElement("label");
@@ -202,7 +185,7 @@
     function postJson(path, payload) {
         return requestJson(path, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "X-Mika-CSRF": dashboardCsrf },
             body: JSON.stringify(payload || {}),
         });
     }
@@ -247,10 +230,8 @@
     function validateForm() {
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
-        const scoreTotal = scoreFields.reduce((sum, name) => sum + numberValue(name), 0);
         if (poolTotal !== 100) throw new Error(`期限资金池比例当前为 ${poolTotal}%，必须等于100%`);
         if (layerTotal !== 100) throw new Error(`成交层比例当前为 ${layerTotal}%，必须等于100%`);
-        if (scoreTotal !== 100) throw new Error(`评分权重当前为 ${scoreTotal}%，必须等于100%`);
         if (numberValue("min_order_amount") < 150) throw new Error("USD最低单笔金额不能低于150");
         if (input("enable_hidden").checked && numberValue("hidden_max_share") <= 0) throw new Error("启用Hidden时必须设置最高占比");
         if (![input("enable_limit"), input("enable_frr"), input("enable_frr_delta_fixed"), input("enable_frr_delta_variable")].some((item) => item.checked)) {
@@ -268,8 +249,7 @@
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
-        const scoreTotal = scoreFields.reduce((sum, name) => sum + numberValue(name), 0);
-        byId("v3FormMessage").textContent = `资金池 ${poolTotal}% · 成交层 ${layerTotal}% · 评分 ${scoreTotal}%${state.dirty ? " · 未保存" : ""}`;
+        byId("v3FormMessage").textContent = `资金池 ${poolTotal}% · 成交层 ${layerTotal}%${state.dirty ? " · 未保存" : ""}`;
     }
 
     function percentDaily(value) {
@@ -314,7 +294,13 @@
             const [pool, layer, type, period] = key.split("|");
             const item = document.createElement("div");
             item.className = "v3-plan-summary";
-            item.innerHTML = `<strong>${pool} · ${layer}</strong><span>${type} · ${period}天 · ${row.count}笔</span><b>${row.amount.toFixed(2)} USD · ${((row.rate / row.count) * 100).toFixed(5)}%</b>`;
+            const heading = document.createElement("strong");
+            const detail = document.createElement("span");
+            const value = document.createElement("b");
+            heading.textContent = `${pool} · ${layer}`;
+            detail.textContent = `${type} · ${period}天 · ${row.count}笔`;
+            value.textContent = `${row.amount.toFixed(2)} USD · ${((row.rate / row.count) * 100).toFixed(5)}%`;
+            item.append(heading, detail, value);
             list.append(item);
         }
     }
@@ -350,7 +336,15 @@
             if (!row) continue;
             const item = document.createElement("div");
             item.className = "v3-stat-summary";
-            item.innerHTML = `<strong>${key === "all" ? "全部" : key}</strong><span>利用率 ${Number(row.utilizationPercent).toFixed(1)}%</span><span>净利息 ${Number(row.netInterest).toFixed(4)} USD</span><b>净APR ${Number(row.actualNetAprPercent).toFixed(2)}%</b>`;
+            const heading = document.createElement("strong");
+            const utilization = document.createElement("span");
+            const interest = document.createElement("span");
+            const apr = document.createElement("b");
+            heading.textContent = key === "all" ? "全部" : key;
+            utilization.textContent = `利用率 ${Number(row.utilizationPercent).toFixed(1)}%`;
+            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} USD`;
+            apr.textContent = `净APR ${Number(row.actualNetAprPercent).toFixed(2)}%`;
+            item.append(heading, utilization, interest, apr);
             container.append(item);
         }
     }

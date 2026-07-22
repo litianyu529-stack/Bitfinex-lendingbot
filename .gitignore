@@ -1,4 +1,7 @@
 *.pyc
+.coverage
+.pytest_cache/
+htmlcov/
 *.swp
 __pycache__/
 tests/__pycache__/

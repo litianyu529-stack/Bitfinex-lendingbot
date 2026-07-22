@@ -1,11 +1,20 @@
 import threading
 import time
-from decimal import Decimal
 
 from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
+from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
-from StateStore import InsufficientReservedBalance, LendingStateStore
-from StrategyEngine import extract_submitted_offer_id, parse_funding_stats, parse_funding_trades
+from StateStore import InsufficientReservedBalance
+from ExchangeModels import (
+    extract_submitted_offer_id,
+    parse_book as parse_book_v3,
+    parse_credit_rows as parse_credit_rows_v3,
+    parse_funding_stats,
+    parse_funding_trade_history as parse_funding_trade_rows_v3,
+    parse_funding_trades,
+    parse_offer_rows as parse_offer_rows_v3,
+    parse_wallet_rows as parse_wallet_rows_v3,
+)
 from StrategyV3 import (
     D,
     POOLS,
@@ -14,7 +23,6 @@ from StrategyV3 import (
     build_strategy_plan_v3,
     gross_daily_floor,
     json_decimal,
-    net_apr_from_daily,
     pool_for_period,
     policy_v3_with_overrides,
     replay_strategy_v3,
@@ -22,113 +30,17 @@ from StrategyV3 import (
 )
 
 
-def parse_book_v3(rows):
-    result = []
-    for row in rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 4:
-            continue
-        try:
-            result.append({
-                "rate": D(str(row[0])),
-                "period": int(row[1]),
-                "count": int(row[2]),
-                "amount": D(str(row[3])),
-            })
-        except (TypeError, ValueError, ArithmeticError):
-            continue
-    return result
-
-
-def parse_wallet_rows_v3(rows):
-    result = []
-    for row in rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 3:
-            continue
-        wallet_type = str(row[0]).lower()
-        currency = str(row[1]).upper()
-        if currency != "USD":
-            continue
-        balance = D(str(row[2]))
-        available = balance if len(row) < 5 or row[4] is None else D(str(row[4]))
-        result.append({
-            "wallet_type": wallet_type,
-            "currency": currency,
-            "balance": balance,
-            "available": available,
-            "unsettled_interest": D(str(row[3] or 0)) if len(row) > 3 else D("0"),
-        })
-    return result
-
-
-def parse_offer_rows_v3(rows):
-    result = []
-    for row in rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 16:
-            continue
-        try:
-            result.append({
-                "id": int(row[0]),
-                "currency": "USD",
-                "mts_created": int(row[2] or 0),
-                "mts_updated": int(row[3] or 0),
-                "amount": abs(D(str(row[4]))),
-                "amount_original": abs(D(str(row[5]))),
-                "offer_type": str(row[6]),
-                "flags": int(row[9] or 0),
-                "status": str(row[10]),
-                "rate": D(str(row[14])),
-                "period": int(row[15]),
-                "hidden": bool(row[17]) if len(row) > 17 else bool(int(row[9] or 0) & 64),
-                "rate_real": D(str(row[20])) if len(row) > 20 and row[20] is not None else None,
-            })
-        except (TypeError, ValueError, ArithmeticError):
-            continue
-    return result
-
-
-def parse_credit_rows_v3(rows):
-    result = []
-    for row in rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 13:
-            continue
-        try:
-            result.append({
-                "id": int(row[0]),
-                "currency": "USD",
-                "mts_created": int(row[3] or 0),
-                "mts_updated": int(row[4] or 0),
-                "amount": abs(D(str(row[5]))),
-                "status": str(row[7]),
-                "rate_type": str(row[8]) if len(row) > 8 and row[8] is not None else None,
-                "rate": D(str(row[11])),
-                "period": int(row[12]),
-                "mts_opening": int(row[13] or 0) if len(row) > 13 else 0,
-                "hidden": bool(row[16]) if len(row) > 16 else False,
-                "rate_real": D(str(row[19])) if len(row) > 19 and row[19] is not None else None,
-            })
-        except (TypeError, ValueError, ArithmeticError):
-            continue
-    return result
-
-
-def parse_funding_trade_rows_v3(rows):
-    result = []
-    for row in rows or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 7:
-            continue
-        try:
-            result.append({
-                "id": int(row[0]),
-                "currency": "USD",
-                "mts": int(row[2]),
-                "offer_id": int(row[3]),
-                "amount": abs(D(str(row[4]))),
-                "rate": D(str(row[5])),
-                "period": int(row[6]),
-            })
-        except (TypeError, ValueError, ArithmeticError):
-            continue
-    return result
+def _write_result(client, result_method, legacy_method, *args, **kwargs):
+    method = getattr(client, result_method, None)
+    if method is not None:
+        return method(*args, **kwargs)
+    try:
+        response = getattr(client, legacy_method)(*args, **kwargs)
+        return WriteResult(WriteOutcome.CONFIRMED, response=response)
+    except BitfinexAmbiguousWriteError as exc:
+        return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+    except BitfinexApiError as exc:
+        return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
 
 
 def parse_ledger_rows_v3(rows):
@@ -137,15 +49,17 @@ def parse_ledger_rows_v3(rows):
         if not isinstance(row, (list, tuple)) or len(row) < 9:
             continue
         try:
-            result.append({
-                "id": int(row[0]),
-                "currency": str(row[1]).upper(),
-                "wallet": None if row[2] is None else str(row[2]).lower(),
-                "mts": int(row[3]),
-                "amount": D(str(row[5])),
-                "balance": None if row[6] is None else D(str(row[6])),
-                "description": str(row[8] or ""),
-            })
+            result.append(
+                {
+                    "id": int(row[0]),
+                    "currency": str(row[1]).upper(),
+                    "wallet": None if row[2] is None else str(row[2]).lower(),
+                    "mts": int(row[3]),
+                    "amount": D(str(row[5])),
+                    "balance": None if row[6] is None else D(str(row[6])),
+                    "description": str(row[8] or ""),
+                }
+            )
         except (TypeError, ValueError, ArithmeticError):
             continue
     return result
@@ -153,8 +67,15 @@ def parse_ledger_rows_v3(rows):
 
 class LendingRuntimeV3:
     def __init__(
-        self, client, policy, store, log=None, hub=None, legacy_state_path=None,
-        auto_transfer_wallets=(), on_policy_activated=None,
+        self,
+        client,
+        policy,
+        store,
+        log=None,
+        hub=None,
+        auto_transfer_wallets=(),
+        on_policy_activated=None,
+        clock=time.time,
     ):
         self.client = client
         self.policy = validate_policy_v3(policy)
@@ -168,9 +89,9 @@ class LendingRuntimeV3:
             fallback_seconds=policy.ws_fallback_seconds,
             rest_stale_seconds=policy.rest_stale_seconds,
         )
-        self.legacy_state_path = legacy_state_path
         self.auto_transfer_wallets = tuple(str(item).lower() for item in auto_transfer_wallets)
         self.on_policy_activated = on_policy_activated
+        self.clock = clock
         self._last_rest_sync_ms = 0
         self._last_history_sync_ms = 0
         self._stats = []
@@ -211,16 +132,20 @@ class LendingRuntimeV3:
     def bootstrap(self, start_websocket=True):
         if self._bootstrapped:
             return
-        if self.legacy_state_path:
-            imported = self.store.import_legacy_managed_offers(self.legacy_state_path)
-            if imported:
-                self._log(f"v3 已导入 {imported} 个旧版托管挂单标记。")
+        recovery = self.store.recover_incomplete_writes()
+        if recovery["ambiguousAfterSend"]:
+            self._log(f"检测到 {recovery['ambiguousAfterSend']} 个进程中断时未确认的写入；已进入人工 SAFE。")
         if self.store.strategy("ACTIVE") is None:
             self.store.save_strategy(json_decimal(self.policy.__dict__), status="ACTIVE")
         else:
-            self.policy = validate_policy_v3(policy_v3_with_overrides(StrategyPolicyV3(), self.store.strategy("ACTIVE")["policy"]))
+            self.policy = validate_policy_v3(
+                policy_v3_with_overrides(StrategyPolicyV3(), self.store.strategy("ACTIVE")["policy"])
+            )
         self._apply_policy_runtime_settings()
         self.sync_rest(include_history=True)
+        auto_resolved = self.store.reconcile_ambiguous_candidates()
+        if auto_resolved:
+            self._log(f"已通过唯一 Bitfinex 记录自动恢复 {len(auto_resolved)} 个未知写入。")
         if start_websocket:
             self.hub.start()
         self.start_income_history_sync()
@@ -266,36 +191,31 @@ class LendingRuntimeV3:
 
     def sync_income_history_once(self, now_ms=None, page_limit=2500):
         """Fetch one historical page or one incremental page; safe to resume."""
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
         limit = min(2500, max(1, int(page_limit)))
         state = self.store.income_sync_state("USD")
         if state["status"] == "COMPLETE":
             start = max(0, int(state.get("last_success_ms") or now) - 60_000)
-            rows = self.client.ledgers(
-                "USD", start=start, end=now, limit=limit, wallet="funding", category=28
-            )
+            rows = self.client.ledgers("USD", start=start, end=now, limit=limit, wallet="funding", category=28)
             parsed = [
-                row for row in parse_ledger_rows_v3(rows)
-                if row["currency"] == "USD" and row["wallet"] == "funding"
+                row for row in parse_ledger_rows_v3(rows) if row["currency"] == "USD" and row["wallet"] == "funding"
             ]
             self.store.upsert_income_ledgers(parsed, category=28)
             earliest = state.get("earliest_mts")
             if parsed:
                 earliest = min([row["mts"] for row in parsed] + ([earliest] if earliest is not None else []))
             return self.store.update_income_sync_state(
-                "USD", status="COMPLETE", earliest_mts=earliest,
-                last_success_ms=now, error=None,
+                "USD",
+                status="COMPLETE",
+                earliest_mts=earliest,
+                last_success_ms=now,
+                error=None,
             )
 
         end = int(state.get("next_end_ms") or now)
         self.store.update_income_sync_state("USD", status="BACKFILLING", error=None)
-        rows = self.client.ledgers(
-            "USD", end=end, limit=limit, wallet="funding", category=28
-        )
-        parsed = [
-            row for row in parse_ledger_rows_v3(rows)
-            if row["currency"] == "USD" and row["wallet"] == "funding"
-        ]
+        rows = self.client.ledgers("USD", end=end, limit=limit, wallet="funding", category=28)
+        parsed = [row for row in parse_ledger_rows_v3(rows) if row["currency"] == "USD" and row["wallet"] == "funding"]
         self.store.upsert_income_ledgers(parsed, category=28)
         earliest = state.get("earliest_mts")
         if parsed:
@@ -304,9 +224,13 @@ class LendingRuntimeV3:
         completed = len(rows or []) < limit
         if completed:
             return self.store.update_income_sync_state(
-                "USD", status="COMPLETE", next_end_ms=None,
-                earliest_mts=earliest, last_success_ms=now,
-                completed_at_ms=now, error=None,
+                "USD",
+                status="COMPLETE",
+                next_end_ms=None,
+                earliest_mts=earliest,
+                last_success_ms=now,
+                completed_at_ms=now,
+                error=None,
             )
         if not parsed:
             raise BitfinexApiError("income history page contained no usable USD funding ledgers")
@@ -315,12 +239,16 @@ class LendingRuntimeV3:
         if previous_end is not None and next_end >= int(previous_end):
             raise BitfinexApiError("income history cursor did not move backwards")
         return self.store.update_income_sync_state(
-            "USD", status="BACKFILLING", next_end_ms=next_end,
-            earliest_mts=earliest, last_success_ms=now, error=None,
+            "USD",
+            status="BACKFILLING",
+            next_end_ms=next_end,
+            earliest_mts=earliest,
+            last_success_ms=now,
+            error=None,
         )
 
     def sync_rest(self, include_history=False, now_ms=None):
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
         symbol = currency_to_symbol("USD")
         raw_book = self.client.funding_book(symbol, 250)
         raw_trades = self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=1)
@@ -331,17 +259,23 @@ class LendingRuntimeV3:
             for wallet in parse_wallet_rows_v3(raw_wallets):
                 if wallet["wallet_type"] not in self.auto_transfer_wallets or wallet["available"] <= 0:
                     continue
-                try:
-                    response = self.client.transfer_between_wallets(
-                        wallet["wallet_type"], "funding", "USD", format(wallet["available"], "f")
-                    )
+                result = _write_result(
+                    self.client,
+                    "transfer_between_wallets_result",
+                    "transfer_between_wallets",
+                    wallet["wallet_type"],
+                    "funding",
+                    "USD",
+                    format(wallet["available"], "f"),
+                )
+                if result.outcome == WriteOutcome.CONFIRMED:
                     transferred = True
-                    self._log(f"USD 已从 {wallet['wallet_type']} 钱包自动转入 funding：{response}")
-                except BitfinexAmbiguousWriteError as exc:
+                    self._log(f"USD 已从 {wallet['wallet_type']} 钱包自动转入 funding：{result.response}")
+                elif result.outcome == WriteOutcome.UNKNOWN:
                     self.store.enter_safe("AMBIGUOUS_WALLET_TRANSFER", manual=True)
-                    raise exc
-                except BitfinexApiError as exc:
-                    self._log(f"USD 自动转入被明确拒绝：{exc}")
+                    raise BitfinexAmbiguousWriteError(result.error)
+                else:
+                    self._log(f"USD 自动转入被明确拒绝：{result.error}")
             if transferred:
                 raw_wallets = self.client.wallets()
         raw_offers = self.client.active_funding_offers(symbol)
@@ -349,7 +283,6 @@ class LendingRuntimeV3:
         book = parse_book_v3(raw_book)
         trades = parse_funding_trades(raw_trades)
         self._stats = parse_funding_stats(raw_stats)
-        wallets = parse_wallet_rows_v3(raw_wallets)
         offers = parse_offer_rows_v3(raw_offers)
         credits = parse_credit_rows_v3(raw_credits)
         managed_ids = {int(row["offer_id"]) for row in self.store.offers() if row["managed"]}
@@ -370,6 +303,8 @@ class LendingRuntimeV3:
                 credit["layer"] = stored.get("layer")
                 credit["display_type"] = stored.get("display_type")
         self.store.upsert_market_trades(trades)
+        self.store.upsert_funding_stats(self._stats)
+        self.store.record_book_snapshot(book, source="REST", now_ms=now)
         self.hub.apply_rest_snapshot(
             book=book,
             trades=trades,
@@ -387,7 +322,7 @@ class LendingRuntimeV3:
         return self.hub.snapshot(now)
 
     def sync_history(self, now_ms=None):
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
         symbol = currency_to_symbol("USD")
         start = now - 90 * 86_400_000
         try:
@@ -397,16 +332,24 @@ class LendingRuntimeV3:
         parsed_funding = parse_funding_trade_rows_v3(funding_rows)
         with self.store.transaction(immediate=True) as connection:
             for row in parsed_funding:
-                managed = connection.execute(
-                    "SELECT 1 FROM order_intents WHERE exchange_offer_id = ?", (row["offer_id"],)
-                ).fetchone() is not None
+                managed = (
+                    connection.execute(
+                        "SELECT 1 FROM order_intents WHERE exchange_offer_id = ?", (row["offer_id"],)
+                    ).fetchone()
+                    is not None
+                )
                 connection.execute(
                     """INSERT OR REPLACE INTO funding_trades(
                         trade_id, currency, offer_id, amount, rate, period, mts, managed
                     ) VALUES(?, 'USD', ?, ?, ?, ?, ?, ?)""",
                     (
-                        row["id"], row["offer_id"], format(row["amount"], "f"), format(row["rate"], "f"),
-                        row["period"], row["mts"], int(managed),
+                        row["id"],
+                        row["offer_id"],
+                        format(row["amount"], "f"),
+                        format(row["rate"], "f"),
+                        row["period"],
+                        row["mts"],
+                        int(managed),
                     ),
                 )
         try:
@@ -424,7 +367,14 @@ class LendingRuntimeV3:
 
     @staticmethod
     def _account(snapshot):
-        wallet = sum((D(row["available"]) for row in snapshot["wallets"] if row.get("wallet_type") == "funding" and row.get("currency") == "USD"), D("0"))
+        wallet = sum(
+            (
+                D(row["available"])
+                for row in snapshot["wallets"]
+                if row.get("wallet_type") == "funding" and row.get("currency") == "USD"
+            ),
+            D("0"),
+        )
         offer_total = sum((D(row["amount"]) for row in snapshot["offers"] if row.get("currency") == "USD"), D("0"))
         credit_total = sum((D(row["amount"]) for row in snapshot["credits"] if row.get("currency") == "USD"), D("0"))
         exposure = {pool: D("0") for pool in POOLS}
@@ -478,7 +428,11 @@ class LendingRuntimeV3:
     def _record_variable_floor_violations(self, now_ms):
         violations = []
         for credit in self.store.credits(active_only=True):
-            if not credit["managed"] or str(credit.get("rate_type") or "").upper() not in {"VAR", "VARIABLE", "FRRDELTAVAR"}:
+            if not credit["managed"] or str(credit.get("rate_type") or "").upper() not in {
+                "VAR",
+                "VARIABLE",
+                "FRRDELTAVAR",
+            }:
                 continue
             pool = credit.get("pool") or pool_for_period(credit["period"])
             if pool not in POOLS or self.policy.floor_apr(pool) is None:
@@ -487,12 +441,14 @@ class LendingRuntimeV3:
             floor_rate = gross_daily_floor(self.policy.floor_apr(pool), fee)
             observed = D(credit.get("rate_real") or credit["rate"])
             if observed < floor_rate:
-                violations.append({
-                    "credit_id": credit["credit_id"],
-                    "pool": pool,
-                    "floor_rate": floor_rate,
-                    "observed_rate": observed,
-                })
+                violations.append(
+                    {
+                        "credit_id": credit["credit_id"],
+                        "pool": pool,
+                        "floor_rate": floor_rate,
+                        "observed_rate": observed,
+                    }
+                )
         self.store.record_rate_floor_violations(violations, now_ms)
 
     def _strategy_status(self, snapshot, signals, result=None):
@@ -504,7 +460,11 @@ class LendingRuntimeV3:
             "schemaVersion": 3,
             "operationMode": runtime["mode"],
             "runtime": runtime,
-            "marketData": {key: value for key, value in snapshot.items() if key not in {"book", "trades", "wallets", "offers", "credits", "fundingTrades"}},
+            "marketData": {
+                key: value
+                for key, value in snapshot.items()
+                if key not in {"book", "trades", "wallets", "offers", "credits", "fundingTrades"}
+            },
             "market": json_decimal(signals),
             "account": json_decimal(account),
             "openOffers": json_decimal(snapshot["offers"]),
@@ -555,15 +515,19 @@ class LendingRuntimeV3:
             if not created:
                 continue
             self.store.mark_submitting(intent["id"])
-            try:
-                response = self.client.submit_funding_offer(
-                    "fUSD",
-                    format(row["amount"], "f"),
-                    format(row["submitted_rate"], "f"),
-                    row["period"],
-                    row["offer_type"],
-                    flags=row["flags"],
-                )
+            result = _write_result(
+                self.client,
+                "submit_funding_offer_result",
+                "submit_funding_offer",
+                "fUSD",
+                format(row["amount"], "f"),
+                format(row["submitted_rate"], "f"),
+                row["period"],
+                row["offer_type"],
+                flags=row["flags"],
+            )
+            if result.outcome == WriteOutcome.CONFIRMED:
+                response = result.response
                 offer_id = extract_submitted_offer_id(response)
                 if offer_id is None:
                     self.store.mark_ambiguous(intent["id"], "successful notification omitted offer id")
@@ -571,16 +535,16 @@ class LendingRuntimeV3:
                 self.store.confirm_intent(intent["id"], offer_id)
                 remaining -= row["amount"]
                 submitted.append({"intentId": intent["id"], "offerId": offer_id, **row})
-            except BitfinexAmbiguousWriteError as exc:
-                self.store.mark_ambiguous(intent["id"], exc)
+            elif result.outcome == WriteOutcome.UNKNOWN:
+                self.store.mark_ambiguous(intent["id"], result.error)
                 break
-            except BitfinexApiError as exc:
-                self.store.reject_intent(intent["id"], exc)
-                self._log(f"USD v3 挂单被明确拒绝：{exc}")
+            else:
+                self.store.reject_intent(intent["id"], result.error)
+                self._log(f"USD v3 挂单被明确拒绝：{result.error}")
         return submitted
 
     def _cancel_reprice_candidates(self, snapshot, plan_result, now_ms=None, strategy_version=None):
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
         if self.store.reprice_count_since(now - 3_600_000) >= self.policy.max_reprices_per_hour:
             return []
         target_by_key = {}
@@ -594,7 +558,10 @@ class LendingRuntimeV3:
             if age < self.policy.minimum_offer_minutes * 60_000:
                 continue
             last_family_reprice = self.store.last_reprice_for_family(offer.get("pool"), offer.get("layer"))
-            if last_family_reprice is not None and now - int(last_family_reprice) < self.policy.reprice_cooldown_minutes * 60_000:
+            if (
+                last_family_reprice is not None
+                and now - int(last_family_reprice) < self.policy.reprice_cooldown_minutes * 60_000
+            ):
                 continue
             target = target_by_key.get((offer.get("pool"), offer.get("layer")))
             if target is None:
@@ -608,14 +575,19 @@ class LendingRuntimeV3:
             )
             if compatible_shape and abs(old_rate - target["effective_rate"]) < threshold:
                 continue
-            try:
-                self.client.cancel_funding_offer(offer["offer_id"])
-            except BitfinexAmbiguousWriteError as exc:
+            write = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer["offer_id"])
+            if write.outcome == WriteOutcome.UNKNOWN:
                 self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer['offer_id']}", manual=True)
-                self._log(str(exc))
+                self._log(write.error)
                 break
+            if write.outcome == WriteOutcome.DEFINITE_REJECT:
+                self._log(f"撤销 Offer {offer['offer_id']} 被明确拒绝：{write.error}")
+                continue
             self.store.record_reprice(
-                offer["offer_id"], "market_change", old_rate, target["effective_rate"],
+                offer["offer_id"],
+                "market_change",
+                old_rate,
+                target["effective_rate"],
                 strategy_version=strategy_version,
                 plan_hash=plan_result.get("plan_hash"),
                 display_type=target.get("display_type"),
@@ -633,8 +605,7 @@ class LendingRuntimeV3:
         """
         adjustments = []
         managed_offers = [
-            row for row in self.store.offers(active_only=True)
-            if row["managed"] and row["currency"] == "USD"
+            row for row in self.store.offers(active_only=True) if row["managed"] and row["currency"] == "USD"
         ]
         cap_excess = max(
             D("0"),
@@ -672,19 +643,25 @@ class LendingRuntimeV3:
         return adjustments
 
     def _cancel_hard_adjustments(
-        self, adjustments, now_ms, reason_prefix="policy",
-        strategy_version=None, plan_hash=None,
+        self,
+        adjustments,
+        now_ms,
+        reason_prefix="policy",
+        strategy_version=None,
+        plan_hash=None,
     ):
         canceled = []
         for offer, target, reason in adjustments[:10]:
             offer_id = int(offer["offer_id"])
             if offer_id in self._pending_cancel_requested:
                 continue
-            try:
-                self.client.cancel_funding_offer(offer_id)
-            except BitfinexAmbiguousWriteError:
+            write = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
+            if write.outcome == WriteOutcome.UNKNOWN:
                 self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
                 break
+            if write.outcome == WriteOutcome.DEFINITE_REJECT:
+                self._log(f"撤销 Offer {offer_id} 被明确拒绝：{write.error}")
+                continue
             self.store.record_reprice(
                 offer_id,
                 f"{reason_prefix}:{reason}",
@@ -724,7 +701,9 @@ class LendingRuntimeV3:
             self._log(f"v3 策略 {pending['version_id']} 已完成调整并生效。")
             return {"activated": pending["version_id"], "pending": False}
         canceled = self._cancel_hard_adjustments(
-            adjustments, now_ms, "pending_strategy",
+            adjustments,
+            now_ms,
+            "pending_strategy",
             strategy_version=pending["version_id"],
             plan_hash=pending_result.get("plan_hash"),
         )
@@ -736,7 +715,7 @@ class LendingRuntimeV3:
         }
 
     def cycle(self, now_ms=None):
-        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
         if not self._bootstrapped:
             self.bootstrap(start_websocket=True)
         if now - self._last_rest_sync_ms >= self.policy.rest_stale_seconds * 1000:
@@ -782,7 +761,9 @@ class LendingRuntimeV3:
                 result = self._build_plan(account, self.policy, signals, version)
                 hard_adjustments = self._pending_adjustments(snapshot, account, self.policy, result, now)
                 canceled = self._cancel_hard_adjustments(
-                    hard_adjustments, now, "active_policy",
+                    hard_adjustments,
+                    now,
+                    "active_policy",
                     strategy_version=version,
                     plan_hash=result.get("plan_hash"),
                 )
@@ -801,7 +782,9 @@ class LendingRuntimeV3:
                     result["submitted"] = []
             result["canceledForReprice"] = canceled
         elif runtime["mode"] == "REPLAY":
-            result = replay_strategy_v3(self.policy, snapshot["trades"], self._stats, account["total"], snapshot["book"], now)
+            result = replay_strategy_v3(
+                self.policy, snapshot["trades"], self._stats, account["total"], snapshot["book"], now
+            )
         else:
             strategy = self.store.strategy("ACTIVE")
             version = strategy["version_id"] if strategy else "3"

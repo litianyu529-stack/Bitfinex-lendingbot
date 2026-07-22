@@ -235,7 +235,13 @@ def test_replay_advances_fills_returns_interest_and_idle_time_without_exchange()
     now = 1_900_000_000_000
     replay_policy = limit_policy(short_share=D("100"), medium_share=D("0"), long_share=D("0"))
     trades = [
-        {"id": index, "mts": now - 3 * 86_400_000 + index * 900_000, "rate": D("0.001"), "amount": D("1000"), "period": 2}
+        {
+            "id": index,
+            "mts": now - 3 * 86_400_000 + index * 900_000,
+            "rate": D("0.001"),
+            "amount": D("1000"),
+            "period": 2,
+        }
         for index in range(3 * 96)
     ]
     result = replay_strategy_v3(replay_policy, trades, [], D("900"), [], now)
@@ -279,14 +285,24 @@ def test_saving_identical_active_policy_as_draft_is_a_noop():
 def test_amount_percent_and_existing_account_exposure_caps_new_plan():
     capped = limit_policy(max_lend_amount=D("3000"), max_lend_percent=D("50"))
     result = build_strategy_plan_v3(
-        D("10000"), D("4000"), {}, capped, signals(), "cap",
+        D("10000"),
+        D("4000"),
+        {},
+        capped,
+        signals(),
+        "cap",
         existing_exposure={"total": D("2500"), "variable": D("0"), "hidden": D("0")},
     )
     assert result["funding_cap"] == D("3000")
     assert result["cap_remaining"] == D("500")
     assert result["planned_amount"] <= D("500")
     over = build_strategy_plan_v3(
-        D("10000"), D("1000"), {}, capped, signals(), "over-cap",
+        D("10000"),
+        D("1000"),
+        {},
+        capped,
+        signals(),
+        "over-cap",
         existing_exposure={"total": D("3500"), "variable": D("0"), "hidden": D("0")},
     )
     assert over["over_cap"] is True
@@ -302,7 +318,12 @@ def test_existing_variable_and_hidden_exposure_count_against_account_caps():
         variable_max_share=D("10"),
     )
     result = build_strategy_plan_v3(
-        D("10000"), D("1000"), {}, variable_only, signals(), "existing-variable",
+        D("10000"),
+        D("1000"),
+        {},
+        variable_only,
+        signals(),
+        "existing-variable",
         existing_exposure={"total": D("1000"), "variable": D("1000"), "hidden": D("0")},
     )
     assert result["plan"] == []
@@ -327,25 +348,40 @@ def test_pending_limit_switch_never_submits_old_frr_plan_and_waits_for_confirmat
         rest_stale_ms = 60_000
 
         def __init__(self):
-            self.offers = [{
-                "id": 99, "currency": "USD", "amount": D("200"),
-                "amount_original": D("200"), "rate": D("0"),
-                "rate_real": D("0.00035"), "period": 2,
-                "offer_type": "FRRDELTAVAR", "display_type": "FRR",
-                "flags": 0, "status": "ACTIVE", "managed": True,
-                "pool": "short", "layer": "quick", "mts_created": now - 60_000,
-            }]
+            self.offers = [
+                {
+                    "id": 99,
+                    "currency": "USD",
+                    "amount": D("200"),
+                    "amount_original": D("200"),
+                    "rate": D("0"),
+                    "rate_real": D("0.00035"),
+                    "period": 2,
+                    "offer_type": "FRRDELTAVAR",
+                    "display_type": "FRR",
+                    "flags": 0,
+                    "status": "ACTIVE",
+                    "managed": True,
+                    "pool": "short",
+                    "layer": "quick",
+                    "mts_created": now - 60_000,
+                }
+            ]
 
         def snapshot(self, at):
             return {
-                "as_of": at, "source": "WEBSOCKET", "safeRequired": False,
+                "as_of": at,
+                "source": "WEBSOCKET",
+                "safeRequired": False,
                 "book": [
                     {"rate": D("0.0004"), "period": 2, "count": 1, "amount": D("5000")},
                     {"rate": D("0.0003"), "period": 2, "count": 1, "amount": D("-5000")},
                 ],
                 "trades": [{"id": 1, "mts": at, "rate": D("0.0004"), "amount": D("1000"), "period": 2}],
                 "wallets": [{"wallet_type": "funding", "currency": "USD", "available": D("800")}],
-                "offers": list(self.offers), "credits": [], "fundingTrades": [],
+                "offers": list(self.offers),
+                "credits": [],
+                "fundingTrades": [],
             }
 
         def stop(self):
@@ -358,20 +394,37 @@ def test_pending_limit_switch_never_submits_old_frr_plan_and_waits_for_confirmat
         old_id = store.save_strategy(json_decimal(old.__dict__), "ACTIVE")
         new_id = store.save_strategy(json_decimal(new.__dict__), "PENDING")
         order = {
-            **intent_order(amount="200"), "offer_type": "FRRDELTAVAR",
-            "display_type": "FRR", "submitted_rate": D("0"),
-            "effective_rate": D("0.00035"), "strategy_version": old_id,
+            **intent_order(amount="200"),
+            "offer_type": "FRRDELTAVAR",
+            "display_type": "FRR",
+            "submitted_rate": D("0"),
+            "effective_rate": D("0.00035"),
+            "strategy_version": old_id,
         }
         _, intent = store.reserve_intent(order, D("1000"))
         store.confirm_intent(intent["id"], 99)
-        store.reconcile_offers([{
-            "id": 99, "currency": "USD", "amount": D("200"),
-            "amount_original": D("200"), "rate": D("0"),
-            "rate_real": D("0.00035"), "period": 2,
-            "offer_type": "FRRDELTAVAR", "display_type": "FRR",
-            "flags": 0, "status": "ACTIVE", "managed": True,
-            "pool": "short", "layer": "quick", "mts_created": now - 60_000,
-        }], now)
+        store.reconcile_offers(
+            [
+                {
+                    "id": 99,
+                    "currency": "USD",
+                    "amount": D("200"),
+                    "amount_original": D("200"),
+                    "rate": D("0"),
+                    "rate_real": D("0.00035"),
+                    "period": 2,
+                    "offer_type": "FRRDELTAVAR",
+                    "display_type": "FRR",
+                    "flags": 0,
+                    "status": "ACTIVE",
+                    "managed": True,
+                    "pool": "short",
+                    "layer": "quick",
+                    "mts_created": now - 60_000,
+                }
+            ],
+            now,
+        )
         store.set_mode("LIVE", "test")
         client = Client()
         hub = Hub()
@@ -379,9 +432,9 @@ def test_pending_limit_switch_never_submits_old_frr_plan_and_waits_for_confirmat
         runtime._bootstrapped = True
         runtime._last_rest_sync_ms = now
         submitted_types = []
-        runtime._submit_plan = lambda result, wallet, version: submitted_types.extend(
-            row["display_type"] for row in result["plan"]
-        ) or []
+        runtime._submit_plan = lambda result, wallet, version: (
+            submitted_types.extend(row["display_type"] for row in result["plan"]) or []
+        )
 
         first = runtime.cycle(now)
         assert client.canceled == [99]
@@ -463,15 +516,19 @@ def test_websocket_snapshot_increment_and_five_minute_safe_boundary():
 
 def test_market_trade_snapshots_merge_by_id_and_keep_newest_records():
     hub = BitfinexMarketDataHub(max_trades=3)
-    hub.apply_rest_snapshot(trades=[
-        {"id": "1", "mts": 1000, "amount": "10", "rate": "0.0001", "period": 2},
-        {"id": "2", "mts": 2000, "amount": "20", "rate": "0.0002", "period": 2},
-    ])
-    hub.apply_rest_snapshot(trades=[
-        {"id": "2", "mts": 2000, "amount": "25", "rate": "0.00025", "period": 2},
-        {"id": "3", "mts": 3000, "amount": "30", "rate": "0.0003", "period": 2},
-        {"id": "4", "mts": 4000, "amount": "40", "rate": "0.0004", "period": 2},
-    ])
+    hub.apply_rest_snapshot(
+        trades=[
+            {"id": "1", "mts": 1000, "amount": "10", "rate": "0.0001", "period": 2},
+            {"id": "2", "mts": 2000, "amount": "20", "rate": "0.0002", "period": 2},
+        ]
+    )
+    hub.apply_rest_snapshot(
+        trades=[
+            {"id": "2", "mts": 2000, "amount": "25", "rate": "0.00025", "period": 2},
+            {"id": "3", "mts": 3000, "amount": "30", "rate": "0.0003", "period": 2},
+            {"id": "4", "mts": 4000, "amount": "40", "rate": "0.0004", "period": 2},
+        ]
+    )
     trades = hub.snapshot(4000)["trades"]
     assert [row["id"] for row in trades] == ["2", "3", "4"]
     assert trades[0]["amount"] == D("25")
@@ -479,9 +536,11 @@ def test_market_trade_snapshots_merge_by_id_and_keep_newest_records():
 
 def test_websocket_and_rest_trade_overlap_is_not_double_counted():
     hub = BitfinexMarketDataHub(max_trades=10)
-    hub.apply_rest_snapshot(trades=[
-        {"id": "9", "mts": 9000, "amount": "9", "rate": "0.0009", "period": 2},
-    ])
+    hub.apply_rest_snapshot(
+        trades=[
+            {"id": "9", "mts": 9000, "amount": "9", "rate": "0.0009", "period": 2},
+        ]
+    )
     hub.handle_public_message({"event": "subscribed", "chanId": 8, "channel": "trades"})
     hub.handle_public_message([8, "fte", [9, 9000, 10, "0.0010", 2]])
     trades = hub.snapshot(9000)["trades"]
@@ -508,11 +567,19 @@ def test_statistics_include_idle_principal_and_external_attribution():
         start = 1_000_000_000
         store.record_account_sample("1000", "500", "0", "500", "0", start)
         store.record_account_sample("1000", "500", "0", "500", "1", start + 86_400_000)
-        store.upsert_income_ledgers([{
-            "id": 1, "currency": "USD", "wallet": "funding",
-            "amount": D("1"), "balance": D("1001"),
-            "description": "Margin Funding Payment", "mts": start + 86_400_000,
-        }])
+        store.upsert_income_ledgers(
+            [
+                {
+                    "id": 1,
+                    "currency": "USD",
+                    "wallet": "funding",
+                    "amount": D("1"),
+                    "balance": D("1001"),
+                    "description": "Margin Funding Payment",
+                    "mts": start + 86_400_000,
+                }
+            ]
+        )
         stats = store.statistics(None, start + 86_400_000)
         assert stats["utilizationPercent"] == "50.0"
         assert stats["actualNetAprPercent"] == "36.500"
@@ -523,14 +590,37 @@ def test_realized_income_counts_all_positive_category_28_and_excludes_transfers(
     with tempfile.TemporaryDirectory() as directory:
         store = LendingStateStore(f"{directory}/state.sqlite3")
         now = int(time.time() * 1000)
-        store.upsert_income_ledgers([
-            {"id": 1, "currency": "USD", "wallet": "funding", "amount": D("1.25"),
-             "balance": None, "description": "robot loan interest", "mts": now - 1000},
-            {"id": 2, "currency": "USD", "wallet": "funding", "amount": D("2.75"),
-             "balance": None, "description": "external loan interest", "mts": now - 500},
-            {"id": 3, "currency": "USD", "wallet": "funding", "amount": D("-0.10"),
-             "balance": None, "description": "negative adjustment", "mts": now},
-        ])
+        store.upsert_income_ledgers(
+            [
+                {
+                    "id": 1,
+                    "currency": "USD",
+                    "wallet": "funding",
+                    "amount": D("1.25"),
+                    "balance": None,
+                    "description": "robot loan interest",
+                    "mts": now - 1000,
+                },
+                {
+                    "id": 2,
+                    "currency": "USD",
+                    "wallet": "funding",
+                    "amount": D("2.75"),
+                    "balance": None,
+                    "description": "external loan interest",
+                    "mts": now - 500,
+                },
+                {
+                    "id": 3,
+                    "currency": "USD",
+                    "wallet": "funding",
+                    "amount": D("-0.10"),
+                    "balance": None,
+                    "description": "negative adjustment",
+                    "mts": now,
+                },
+            ]
+        )
         with store.transaction(immediate=True) as connection:
             connection.execute(
                 """INSERT INTO ledger_entries(
@@ -590,10 +680,19 @@ def test_income_sync_failure_is_reporting_only_and_keeps_existing_income():
 
     with tempfile.TemporaryDirectory() as directory:
         store = LendingStateStore(f"{directory}/state.sqlite3")
-        store.upsert_income_ledgers([{
-            "id": 1, "currency": "USD", "wallet": "funding", "amount": D("2"),
-            "balance": None, "description": "interest", "mts": 1000,
-        }])
+        store.upsert_income_ledgers(
+            [
+                {
+                    "id": 1,
+                    "currency": "USD",
+                    "wallet": "funding",
+                    "amount": D("2"),
+                    "balance": None,
+                    "description": "interest",
+                    "mts": 1000,
+                }
+            ]
+        )
         runtime = LendingRuntimeV3(FailingClient(), limit_policy(), store, hub=object())
         with pytest.raises(RuntimeError):
             runtime.sync_income_history_once(now_ms=2000)
@@ -671,15 +770,17 @@ def test_logger_redacts_credentials_from_logs_and_nested_status():
 def test_ledger_parser_uses_official_amount_balance_and_description_columns():
     rows = [[42, "USD", "funding", 1_900_000_000_000, None, "1.25", "101.25", None, "Margin Funding Payment"]]
     parsed = parse_ledger_rows_v3(rows)
-    assert parsed == [{
-        "id": 42,
-        "currency": "USD",
-        "wallet": "funding",
-        "mts": 1_900_000_000_000,
-        "amount": D("1.25"),
-        "balance": D("101.25"),
-        "description": "Margin Funding Payment",
-    }]
+    assert parsed == [
+        {
+            "id": 42,
+            "currency": "USD",
+            "wallet": "funding",
+            "mts": 1_900_000_000_000,
+            "amount": D("1.25"),
+            "balance": D("101.25"),
+            "description": "Margin Funding Payment",
+        }
+    ]
 
 
 def test_credit_is_attributed_to_managed_offer_through_funding_trade():
@@ -694,15 +795,20 @@ def test_credit_is_attributed_to_managed_offer_through_funding_trade():
                    VALUES(1, 'USD', 9001, '150', '0.0002', 2, ?, 1)""",
                 (opening,),
             )
-        store.reconcile_credits([{
-            "id": 8001,
-            "currency": "USD",
-            "amount": D("150"),
-            "rate": D("0.0002"),
-            "period": 2,
-            "status": "ACTIVE",
-            "mts_opening": opening,
-        }], opening)
+        store.reconcile_credits(
+            [
+                {
+                    "id": 8001,
+                    "currency": "USD",
+                    "amount": D("150"),
+                    "rate": D("0.0002"),
+                    "period": 2,
+                    "status": "ACTIVE",
+                    "mts_opening": opening,
+                }
+            ],
+            opening,
+        )
         with store.read_connection() as connection:
             credit = dict(connection.execute("SELECT * FROM credits WHERE credit_id=8001").fetchone())
         assert credit["managed"] == 1

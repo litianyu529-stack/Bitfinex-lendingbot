@@ -1,11 +1,17 @@
 import hashlib
 import hmac
+import http.client
 import json
 import socket
 import threading
 import time
 from decimal import Decimal
 from urllib import error, parse, request
+
+from DomainTypes import WriteOutcome, WriteResult
+
+
+APP_VERSION = "0.3.0"
 
 
 class BitfinexApiError(Exception):
@@ -44,10 +50,7 @@ class Bitfinex:
         return lowered in {"yourapikey", "yoursecret", "yourbitfinexapikey", "yourbitfinexsecret"}
 
     def has_credentials(self):
-        return not (
-            self.is_placeholder_credential(self.api_key)
-            or self.is_placeholder_credential(self.api_secret)
-        )
+        return not (self.is_placeholder_credential(self.api_key) or self.is_placeholder_credential(self.api_secret))
 
     def _nonce(self):
         nonce = int(time.time() * 1000000)
@@ -78,12 +81,12 @@ class Bitfinex:
         body = self._body(payload)
         return self._headers(path, nonce, body)
 
-    def _request_json(self, url, method="GET", data=None, headers=None):
+    def _request_json(self, url, method="GET", data=None, headers=None, ambiguous_on_failure=False):
         data_bytes = None
         if data is not None:
             data_bytes = data.encode("utf-8")
         request_headers = {
-            "User-Agent": "MikaLendingBot/0.5 Python",
+            "User-Agent": f"MikaLendingBot/{APP_VERSION} Python",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})
@@ -98,18 +101,33 @@ class Bitfinex:
             except ValueError:
                 content = raw
             raise BitfinexApiError(f"HTTP {exc.code} {exc.reason}: {content}") from exc
-        except (error.URLError, TimeoutError, socket.timeout) as exc:
+        except (
+            error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+            OSError,
+            UnicodeError,
+        ) as exc:
+            if ambiguous_on_failure:
+                raise BitfinexAmbiguousWriteError("Bitfinex write result is unknown after a transport failure") from exc
             raise BitfinexApiError(str(exc)) from exc
 
         try:
             payload = json.loads(raw)
         except ValueError as exc:
+            if ambiguous_on_failure:
+                raise BitfinexAmbiguousWriteError(
+                    "Bitfinex write result is unknown because the response was not valid JSON"
+                ) from exc
             raise BitfinexApiError(f"Invalid JSON response: {raw[:200]}") from exc
         if isinstance(payload, list) and payload and payload[0] == "error":
             raise BitfinexApiError(str(payload))
         return payload
 
-    def _auth_post(self, path, payload=None):
+    def _auth_post(self, path, payload=None, ambiguous_on_failure=False):
         if not self.has_credentials():
             raise BitfinexApiError("Bitfinex API key/secret are not configured")
         with self._auth_lock:
@@ -121,22 +139,28 @@ class Bitfinex:
                 method="POST",
                 data=body,
                 headers=headers,
+                ambiguous_on_failure=ambiguous_on_failure,
             )
 
     def _auth_write(self, path, payload=None):
-        try:
-            response = self._auth_post(path, payload)
-        except BitfinexApiError as exc:
-            if isinstance(exc.__cause__, (error.URLError, TimeoutError, socket.timeout)):
-                raise BitfinexAmbiguousWriteError("Bitfinex write result is unknown after a network failure") from exc
-            raise
+        response = self._auth_post(path, payload, ambiguous_on_failure=True)
         if not isinstance(response, list) or len(response) < 8:
-            raise BitfinexApiError(f"Invalid write notification: {response}")
+            raise BitfinexAmbiguousWriteError(
+                f"Bitfinex write result is unknown because the notification was incomplete: {response}"
+            )
         status = str(response[6] or "").upper()
         if status != "SUCCESS":
             message = response[7] or response
             raise BitfinexApiError(f"Bitfinex write failed ({status or 'UNKNOWN'}): {message}")
         return response
+
+    def _auth_write_result(self, path, payload=None):
+        try:
+            return WriteResult(WriteOutcome.CONFIRMED, response=self._auth_write(path, payload))
+        except BitfinexAmbiguousWriteError as exc:
+            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+        except BitfinexApiError as exc:
+            return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
 
     def _public_get(self, path, query=None):
         url = f"{self.PUBLIC_BASE_URL}/{path}"
@@ -207,6 +231,15 @@ class Bitfinex:
             },
         )
 
+    def submit_funding_offer_result(self, *args, **kwargs):
+        try:
+            response = self.submit_funding_offer(*args, **kwargs)
+            return WriteResult(WriteOutcome.CONFIRMED, response=response)
+        except BitfinexAmbiguousWriteError as exc:
+            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+        except BitfinexApiError as exc:
+            return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
+
     def cancel_all_funding_offers(self, currency):
         return self._auth_write(
             "v2/auth/w/funding/offer/cancel/all",
@@ -215,6 +248,12 @@ class Bitfinex:
 
     def cancel_funding_offer(self, offer_id):
         return self._auth_write(
+            "v2/auth/w/funding/offer/cancel",
+            {"id": int(offer_id)},
+        )
+
+    def cancel_funding_offer_result(self, offer_id):
+        return self._auth_write_result(
             "v2/auth/w/funding/offer/cancel",
             {"id": int(offer_id)},
         )
@@ -277,6 +316,18 @@ class Bitfinex:
 
     def transfer_between_wallets(self, from_wallet, to_wallet, currency, amount):
         return self._auth_write(
+            "v2/auth/w/transfer",
+            {
+                "from": from_wallet,
+                "to": to_wallet,
+                "currency": currency,
+                "currency_to": currency,
+                "amount": str(amount),
+            },
+        )
+
+    def transfer_between_wallets_result(self, from_wallet, to_wallet, currency, amount):
+        return self._auth_write_result(
             "v2/auth/w/transfer",
             {
                 "from": from_wallet,

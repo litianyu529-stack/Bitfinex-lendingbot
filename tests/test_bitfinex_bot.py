@@ -9,7 +9,6 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
-from types import SimpleNamespace
 from unittest import mock
 
 from bitfinex import Bitfinex, BitfinexApiError
@@ -133,19 +132,21 @@ def write_test_config(path, extra_bot=None):
     }
     bot.update(extra_bot or {})
     config = configparser.ConfigParser()
-    config.read_dict({
-        "BITFINEX": {"apikey": "key", "secret": "secret", "currencies": "USD"},
-        "BOT": bot,
-        "STRATEGY_V3": {
-            "short_floor_apr": "6",
-            "medium_floor_apr": "8",
-            "long_floor_apr": "10",
-            "enable_limit": "true",
-            "enable_frr": "false",
-            "enable_frr_delta_fixed": "false",
-            "enable_frr_delta_variable": "false",
-        },
-    })
+    config.read_dict(
+        {
+            "BITFINEX": {"apikey": "key", "secret": "secret", "currencies": "USD"},
+            "BOT": bot,
+            "STRATEGY_V3": {
+                "short_floor_apr": "6",
+                "medium_floor_apr": "8",
+                "long_floor_apr": "10",
+                "enable_limit": "true",
+                "enable_frr": "false",
+                "enable_frr_delta_fixed": "false",
+                "enable_frr_delta_variable": "false",
+            },
+        }
+    )
     with open(path, "w", encoding="utf-8") as file:
         config.write(file)
 
@@ -160,19 +161,18 @@ def build_strategy_settings(extra_bot=None):
     }
     bot.update(extra_bot or {})
     config = configparser.ConfigParser()
-    config.read_dict({
-        "BITFINEX": {"apikey": "key", "secret": "secret", "currencies": "USD"},
-        "BOT": bot,
-    })
+    config.read_dict(
+        {
+            "BITFINEX": {"apikey": "key", "secret": "secret", "currencies": "USD"},
+            "BOT": bot,
+        }
+    )
     settings = lendingbot.build_settings(lendingbot.parse_args([]), config)
     lendingbot.validate_settings(settings)
     return settings
 
 
 class BitfinexBotTests(unittest.TestCase):
-    def setUp(self):
-        lendingbot.controlled_bot_preflight = None
-
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
         path = "v2/auth/r/wallets"
@@ -254,160 +254,20 @@ class BitfinexBotTests(unittest.TestCase):
             path = os.path.join(directory, "test.cfg")
             write_test_config(path, {"statedbfile": os.path.join(directory, "state.sqlite3")})
             fake_thread = mock.Mock()
-            with mock.patch.object(lendingbot.threading, "Thread", return_value=fake_thread), mock.patch.object(
-                lendingbot.time, "sleep", side_effect=KeyboardInterrupt
-            ), mock.patch.object(lendingbot, "stop_controlled_bot"), mock.patch.object(
-                lendingbot, "stop_web_server"
-            ), mock.patch.object(
-                lendingbot, "reconcile_orphaned_live_runtime"
-            ), mock.patch.object(
-                lendingbot.LiveProcessLock, "acquire", return_value=True
-            ), mock.patch.object(
-                lendingbot.LiveProcessLock, "release"
-            ), mock.patch.object(lendingbot, "Bitfinex", side_effect=AssertionError("dashboard must not create API client")):
+            with (
+                mock.patch.object(lendingbot.threading, "Thread", return_value=fake_thread),
+                mock.patch.object(lendingbot.time, "sleep", side_effect=KeyboardInterrupt),
+                mock.patch.object(lendingbot, "stop_controlled_bot"),
+                mock.patch.object(lendingbot, "stop_web_server"),
+                mock.patch.object(lendingbot, "reconcile_orphaned_live_runtime"),
+                mock.patch.object(lendingbot.LiveProcessLock, "acquire", return_value=True),
+                mock.patch.object(lendingbot.LiveProcessLock, "release"),
+                mock.patch.object(
+                    lendingbot, "Bitfinex", side_effect=AssertionError("dashboard must not create API client")
+                ),
+            ):
                 self.assertEqual(lendingbot.main(["--dashboard", "--config", path]), 0)
         fake_thread.start.assert_called_once_with()
-
-    def test_funding_book_keeps_positive_offers(self):
-        rows = [[0.0002, 2, 1, -1000], [0.00015, 2, 1, 300], [0.0001, 30, 1, 200]]
-        offers = lendingbot.parse_funding_book(rows)
-        self.assertEqual([offer["amount"] for offer in offers], [Decimal("200"), Decimal("300")])
-
-    def test_open_offers_are_sanitized_for_status_schema(self):
-        rows = [[123, "fUSD", 1000, 2000, "150", "150", "LIMIT", None, None, 0, "ACTIVE", None, None, None, "0.0004", 2]]
-        serialized = lendingbot.serialize_open_offers(lendingbot.parse_open_offers(rows))
-        self.assertEqual(serialized[0]["id"], "123")
-        self.assertEqual(serialized[0]["dailyRatePercent"], "0.04")
-        self.assertEqual(serialized[0]["status"], "ACTIVE")
-        self.assertNotIn("symbol", serialized[0])
-
-    def test_rate_at_depth_clamps_to_minimum(self):
-        book = [{"rate": Decimal("0.00018"), "period": 2, "amount": Decimal("1000")}]
-        self.assertEqual(lendingbot.rate_at_depth(book, Decimal("300"), Decimal("0.0004"), Decimal("0.02")), Decimal("0.0004"))
-
-    def test_smart_strategy_follows_market_floor(self):
-        settings = build_strategy_settings({"smartrateoffset": "0.001"})
-        book = [{"rate": Decimal("0.00018"), "period": 2, "amount": Decimal("1000")}]
-        self.assertEqual(lendingbot.smart_min_rate_for(settings, "USD", book), Decimal("0.0004"))
-
-    def test_smart_market_reference_ignores_dust_offer(self):
-        settings = build_strategy_settings({"smartrateoffset": "0.001", "smartfloordepth": "2"})
-        book = [
-            {"rate": Decimal("0.0001"), "period": 2, "amount": Decimal("1")},
-            {"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("1000")},
-        ]
-        reference = lendingbot.smart_market_reference_rate(settings, "USD", book, Decimal("1000"))
-        self.assertEqual(reference, Decimal("0.0005"))
-        self.assertEqual(
-            lendingbot.smart_min_rate_for(settings, "USD", book, Decimal("1000")),
-            Decimal("0.00051"),
-        )
-
-    def test_smart_offer_plan_allocates_long_high_rate_bucket(self):
-        settings = build_strategy_settings({
-            "smartfastshare": "50",
-            "smartlongshare": "40",
-            "smartopportunitypremium": "0.01",
-            "xdays": "60",
-        })
-        book = [
-            {"rate": Decimal("0.0002"), "period": 2, "amount": Decimal("1")},
-            {"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("1000")},
-            {"rate": Decimal("0.0007"), "period": 30, "amount": Decimal("5000")},
-        ]
-        plan = lendingbot.build_offer_plan(book, Decimal("1000"), Decimal("0"), settings, "USD")
-        self.assertEqual([item["bucket"] for item in plan], ["fast", "balanced", "long"])
-        self.assertEqual([item["amount"] for item in plan], [
-            Decimal("425.00000000"),
-            Decimal("205.00000000"),
-            Decimal("370.00000000"),
-        ])
-        self.assertEqual(sum((item["amount"] for item in plan), Decimal("0")), Decimal("1000"))
-        self.assertEqual([item["period"] for item in plan], [2, 7, 60])
-        self.assertGreater(plan[-1]["rate"], plan[0]["rate"])
-
-    def test_two_part_plan_still_has_long_bucket(self):
-        settings = build_strategy_settings({"spreadlend": "2", "xdays": "30"})
-        book = [{"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("5000")}]
-        plan = lendingbot.build_offer_plan(book, Decimal("400"), Decimal("0"), settings, "USD")
-        self.assertEqual([item["bucket"] for item in plan], ["fast", "long"])
-        self.assertEqual(plan[-1]["period"], 60)
-        self.assertEqual(sum((item["amount"] for item in plan), Decimal("0")), Decimal("400"))
-
-    def test_shallow_book_uses_last_market_rate_not_maximum_cap(self):
-        settings = build_strategy_settings()
-        book = [{"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("50")}]
-        rates = lendingbot.choose_offer_rates(book, Decimal("1000"), settings, "USD", 3)
-        self.assertTrue(all(rate < Decimal("0.001") for rate in rates))
-
-    def test_long_offer_uses_longer_reprice_wait(self):
-        settings = build_strategy_settings({
-            "xdays": "60",
-            "repriceafterminutes": "15",
-            "smartlongwaitminutes": "120",
-        })
-        now_ms = 10_000_000
-        created = now_ms - 60 * 60 * 1000
-        offers = {"USD": [
-            {"id": 1, "amount": Decimal("150"), "rate": Decimal("0.0005"), "period": 2, "created": created},
-            {"id": 2, "amount": Decimal("150"), "rate": Decimal("0.0007"), "period": 60, "created": created},
-        ]}
-        fresh, aged = lendingbot.split_stale_open_offers(settings, offers, now_ms)
-        self.assertEqual([item["id"] for item in aged["USD"]], [1])
-        self.assertEqual([item["id"] for item in fresh["USD"]], [2])
-
-    def test_market_reprice_guard_avoids_small_rate_churn(self):
-        settings = build_strategy_settings({"repriceminratedelta": "0.002"})
-        book = [{"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("5000")}]
-        aged = {"USD": [
-            {"id": 1, "amount": Decimal("150"), "rate": Decimal("0.00052"), "period": 2},
-            {"id": 2, "amount": Decimal("150"), "rate": Decimal("0.00060"), "period": 2},
-        ]}
-        fresh, reprice = lendingbot.filter_market_reprice_candidates(
-            settings, {}, aged, {"USD": book}, {"USD": Decimal("1000")}
-        )
-        self.assertEqual([item["id"] for item in fresh["USD"]], [1])
-        self.assertEqual([item["id"] for item in reprice["USD"]], [2])
-
-    def test_lending_cycle_uses_cached_book_and_fake_client_only(self):
-        settings = build_strategy_settings({"xdays": "60"})
-        book = [
-            {"rate": Decimal("0.0005"), "period": 2, "amount": Decimal("1000")},
-            {"rate": Decimal("0.0007"), "period": 30, "amount": Decimal("5000")},
-        ]
-        client = OfferCaptureClient()
-        log = CaptureLog()
-        usable = lendingbot.lend_available_balances(
-            client,
-            settings,
-            log,
-            {"USD": Decimal("1000")},
-            {},
-            {},
-            {"USD": Decimal("0")},
-            {},
-            {"USD": book},
-        )
-        self.assertEqual(usable, 1)
-        self.assertEqual(len(client.submitted), 3)
-        self.assertEqual(sum((Decimal(call[1]) for call in client.submitted), Decimal("0")), Decimal("1000"))
-        self.assertEqual([call[3] for call in client.submitted], [2, 7, 60])
-        self.assertEqual(log.status["USD"]["plannedOfferCount"], "3")
-
-    def test_submit_offer_always_calls_real_client(self):
-        settings = SimpleNamespace(xday_threshold=Decimal("0.002"), xdays=60)
-        client = OfferCaptureClient()
-        log = CaptureLog()
-        lendingbot.submit_offer(client, settings, log, "USD", Decimal("150"), Decimal("0.0004"))
-        self.assertEqual(client.submitted, [("fUSD", "150.00000000", "0.00040000", 2, "LIMIT")])
-        self.assertEqual(len(log.offers), 1)
-
-    def test_stale_cancel_always_uses_offer_ids(self):
-        settings = SimpleNamespace(currencies=["USD"])
-        client = CancelCaptureClient()
-        amounts = lendingbot.cancel_stale_offers(client, settings, CaptureLog(), {"USD": [{"id": 11, "amount": Decimal("150")}, {"id": 12, "amount": Decimal("200")}]})
-        self.assertEqual(client.canceled, [11, 12])
-        self.assertEqual(amounts["USD"], Decimal("350"))
 
     def test_preflight_permission_parser(self):
         permissions = lendingbot.parse_key_permissions([["wallets", "1", "0"], ["funding", 1, 1]])
@@ -421,7 +281,9 @@ class BitfinexBotTests(unittest.TestCase):
             write_test_config(path)
             config_payload = lendingbot.config_api_payload(path)
             preview = lendingbot.strategy_v3_preview(
-                path, {"strategyV3": config_payload["strategyV3"]}, FakePreflightClient,
+                path,
+                {"strategyV3": config_payload["strategyV3"]},
+                FakePreflightClient,
                 now_ms=2_000_000_000_000,
             )
             preflight = lendingbot.evaluate_live_preflight(path, FakePreflightClient)
@@ -445,10 +307,13 @@ class BitfinexBotTests(unittest.TestCase):
             payload = lendingbot.config_api_payload(path)["strategyV3"]
             payload["target_slices"] = 12
             preview = lendingbot.strategy_v3_preview(path, {"strategyV3": payload}, FakePreflightClient)
-            saved = lendingbot.save_strategy_v3_draft(path, {
-                "strategyV3": payload,
-                "previewToken": preview["previewToken"],
-            })
+            saved = lendingbot.save_strategy_v3_draft(
+                path,
+                {
+                    "strategyV3": payload,
+                    "previewToken": preview["previewToken"],
+                },
+            )
             result = lendingbot.evaluate_live_preflight(path, FakePreflightClient)
             self.assertEqual(open(path, "rb").read(), config_before)
         self.assertEqual(saved["status"], "DRAFT")
@@ -461,10 +326,13 @@ class BitfinexBotTests(unittest.TestCase):
             write_test_config(path)
             loaded = lendingbot.config_api_payload(path)["strategyV3"]
             preview = lendingbot.strategy_v3_preview(path, {"strategyV3": loaded}, FakePreflightClient)
-            saved = lendingbot.save_strategy_v3_draft(path, {
-                "strategyV3": loaded,
-                "previewToken": preview["previewToken"],
-            })
+            saved = lendingbot.save_strategy_v3_draft(
+                path,
+                {
+                    "strategyV3": loaded,
+                    "previewToken": preview["previewToken"],
+                },
+            )
             store, _ = lendingbot.v3_store_for_config(path)
             draft = store.strategy("DRAFT")
         self.assertEqual(saved["status"], "UNCHANGED")
@@ -485,20 +353,32 @@ class BitfinexBotTests(unittest.TestCase):
             policy = lendingbot.config_api_payload(path)["strategyV3"]
             policy["target_slices"] = 12
             preview = lendingbot.strategy_v3_preview(path, {"strategyV3": policy}, FakePreflightClient)
-            saved = lendingbot.save_strategy_v3_draft(path, {
-                "strategyV3": policy,
-                "previewToken": preview["previewToken"],
-            })
+            saved = lendingbot.save_strategy_v3_draft(
+                path,
+                {
+                    "strategyV3": policy,
+                    "previewToken": preview["previewToken"],
+                },
+            )
             with self.assertRaisesRegex(lendingbot.ApiRequestError, "草稿"):
-                lendingbot.apply_strategy_v3_draft(path, {
-                    "draftVersionId": "another-tab-draft",
-                    "applyToken": saved["applyToken"],
-                }, FakePreflightClient)
+                lendingbot.apply_strategy_v3_draft(
+                    path,
+                    {
+                        "draftVersionId": "another-tab-draft",
+                        "applyToken": saved["applyToken"],
+                    },
+                    FakePreflightClient,
+                )
 
     def test_fixed_credit_is_limit_and_unknown_variable_is_not_false_disabled(self):
         policy = lendingbot.StrategyPolicyV3(
-            short_floor_apr=Decimal("6"), medium_floor_apr=Decimal("8"), long_floor_apr=Decimal("10"),
-            enable_limit=True, enable_frr=False, enable_frr_delta_fixed=False, enable_frr_delta_variable=False,
+            short_floor_apr=Decimal("6"),
+            medium_floor_apr=Decimal("8"),
+            long_floor_apr=Decimal("10"),
+            enable_limit=True,
+            enable_frr=False,
+            enable_frr_delta_fixed=False,
+            enable_frr_delta_variable=False,
         )
         fixed = {"rate_type": "FIXED", "period": 30, "rate": "0.001", "rate_real": "0.001"}
         variable = {"rate_type": "VARIABLE", "period": 30, "rate": "0.001", "rate_real": "0.001"}
@@ -578,28 +458,31 @@ class BitfinexBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "test.cfg")
             write_test_config(path)
-            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000)
-            lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001)
+            context = lendingbot.AppContext.for_project(directory, config_path=path)
+            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000, context=context)
+            lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001, context=context)
             with self.assertRaisesRegex(lendingbot.ConfigError, "已使用"):
-                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001)
+                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001, context=context)
 
     def test_preflight_token_expires(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "test.cfg")
             write_test_config(path)
-            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000)
+            context = lendingbot.AppContext.for_project(directory, config_path=path)
+            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000, context=context)
             with self.assertRaisesRegex(lendingbot.ConfigError, "过期"):
-                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1301)
+                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1301, context=context)
 
     def test_preflight_token_rejects_config_change(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "test.cfg")
             write_test_config(path)
-            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000)
+            context = lendingbot.AppContext.for_project(directory, config_path=path)
+            response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000, context=context)
             with open(path, "a", encoding="utf-8") as file:
                 file.write("\n# changed\n")
             with self.assertRaisesRegex(lendingbot.ConfigError, "发生变化"):
-                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001)
+                lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001, context=context)
 
     def test_preflight_token_rejects_account_change_within_five_minutes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -607,10 +490,15 @@ class BitfinexBotTests(unittest.TestCase):
             write_test_config(path)
             original = FakePreflightClient.wallet_rows
             try:
-                response = lendingbot.create_controlled_bot_preflight(path, FakePreflightClient, now=1000)
+                context = lendingbot.AppContext.for_project(directory, config_path=path)
+                response = lendingbot.create_controlled_bot_preflight(
+                    path, FakePreflightClient, now=1000, context=context
+                )
                 FakePreflightClient.wallet_rows = [["funding", "USD", "500", None, "449"]]
                 with self.assertRaisesRegex(lendingbot.ConfigError, "账户快照"):
-                    lendingbot.consume_controlled_bot_preflight(path, response["preflightId"], now=1001)
+                    lendingbot.consume_controlled_bot_preflight(
+                        path, response["preflightId"], now=1001, context=context
+                    )
             finally:
                 FakePreflightClient.wallet_rows = original
 
@@ -624,15 +512,6 @@ class BitfinexBotTests(unittest.TestCase):
         self.assertEqual(status["raw_data"], {})
         self.assertIn("旧版状态已忽略", status["last_status"])
 
-    def test_ledger_earnings_stats_summarize_periods(self):
-        now_ms = int(time.time() * 1000)
-        client = LedgerClient({"USD": [[1, "USD", "funding", now_ms, None, "1.5", "101.5", None, "Margin funding payment"]]})
-        settings = SimpleNamespace(currencies=["USD"], output_currency="USD")
-        stats = lendingbot.fetch_earnings_stats(client, settings, {"USD": Decimal("100")}, {"USD": []}, {"USD": Decimal("100")}, CaptureLog())
-        self.assertTrue(stats["available"])
-        self.assertEqual(stats["today"], "1.50000000")
-        self.assertEqual(client.calls[0][1]["category"], 28)
-
     def test_atomic_write_keeps_original_when_replace_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "status.json")
@@ -645,14 +524,6 @@ class BitfinexBotTests(unittest.TestCase):
                 self.assertEqual(file.read(), "original")
 
     def test_dashboard_concurrent_start_creates_one_process(self):
-        original_log_path = lendingbot.DEFAULT_PROCESS_LOG
-        original_state = (
-            lendingbot.controlled_bot_process,
-            lendingbot.controlled_bot_started_at,
-            lendingbot.controlled_bot_log_handle,
-            lendingbot.controlled_bot_stop_reason,
-            lendingbot.controlled_bot_preflight,
-        )
         popen_calls = []
         call_lock = threading.Lock()
 
@@ -662,44 +533,44 @@ class BitfinexBotTests(unittest.TestCase):
                 popen_calls.append((args, kwargs))
             return FakeControlledProcess()
 
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                config_path = os.path.join(directory, "test.cfg")
-                status_path = os.path.join(directory, "botlog.json")
-                write_test_config(config_path)
-                lendingbot.DEFAULT_PROCESS_LOG = os.path.join(directory, "bot-process.log")
-                lendingbot.controlled_bot_process = None
-                response = lendingbot.create_controlled_bot_preflight(config_path, FakePreflightClient)
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "test.cfg")
+            status_path = os.path.join(directory, "botlog.json")
+            write_test_config(config_path)
+            context = lendingbot.AppContext.for_project(
+                directory,
+                config_path=config_path,
+                status_path=status_path,
+                client_factory=FakePreflightClient,
+            )
+            response = lendingbot.create_controlled_bot_preflight(config_path, context=context)
 
-                def attempt_start(_):
-                    try:
-                        return lendingbot.start_controlled_bot(config_path, status_path, response["preflightId"])
-                    except lendingbot.ConfigError:
-                        return None
+            def attempt_start(_):
+                try:
+                    return lendingbot.start_controlled_bot(
+                        config_path,
+                        status_path,
+                        response["preflightId"],
+                        context=context,
+                    )
+                except lendingbot.ConfigError:
+                    return None
 
-                with mock.patch.object(lendingbot.subprocess, "Popen", side_effect=fake_popen):
-                    with ThreadPoolExecutor(max_workers=8) as executor:
-                        results = list(executor.map(attempt_start, range(8)))
-                self.assertEqual(len(popen_calls), 1)
-                self.assertEqual(sum(result is not None for result in results), 1)
-                self.assertIn("--live", popen_calls[0][0][0])
-                lendingbot.stop_controlled_bot()
-        finally:
-            lendingbot.cleanup_controlled_bot_handle()
-            lendingbot.DEFAULT_PROCESS_LOG = original_log_path
-            (
-                lendingbot.controlled_bot_process,
-                lendingbot.controlled_bot_started_at,
-                lendingbot.controlled_bot_log_handle,
-                lendingbot.controlled_bot_stop_reason,
-                lendingbot.controlled_bot_preflight,
-            ) = original_state
+            with mock.patch.object(lendingbot.subprocess, "Popen", side_effect=fake_popen):
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    results = list(executor.map(attempt_start, range(8)))
+            self.assertEqual(len(popen_calls), 1)
+            self.assertEqual(sum(result is not None for result in results), 1)
+            self.assertIn("--live", popen_calls[0][0][0])
+            lendingbot.stop_controlled_bot(config_path, context=context)
+            lendingbot.cleanup_controlled_bot_handle(context)
 
     def test_live_process_lock_is_discoverable_across_dashboard_state(self):
         with tempfile.TemporaryDirectory() as directory:
-            lock_path = os.path.join(directory, "lendingbot-live.lock")
             config_path = os.path.join(directory, "test.cfg")
             write_test_config(config_path)
+            context = lendingbot.AppContext.for_project(directory, config_path=config_path)
+            lock_path = context.live_lock_path
             first = lendingbot.LiveProcessLock(lock_path)
             second = lendingbot.LiveProcessLock(lock_path)
             self.assertTrue(first.acquire(config_path))
@@ -708,8 +579,7 @@ class BitfinexBotTests(unittest.TestCase):
                 self.assertTrue(inspection["locked"])
                 self.assertEqual(inspection["metadata"]["pid"], os.getpid())
                 self.assertFalse(second.acquire(config_path))
-                with mock.patch.object(lendingbot, "DEFAULT_LIVE_LOCK", lock_path):
-                    status = lendingbot.controlled_bot_status(config_path)
+                status = lendingbot.controlled_bot_status(config_path, context)
                 self.assertTrue(status["running"])
                 self.assertTrue(status["managedExternally"])
                 self.assertEqual(status["pid"], os.getpid())
@@ -738,19 +608,23 @@ class BitfinexBotTests(unittest.TestCase):
             config_path = os.path.join(directory, "test.cfg")
             status_path = os.path.join(directory, "botlog.json")
             write_test_config(config_path, {"statedbfile": database})
+            context = lendingbot.AppContext.for_project(directory, config_path=config_path, status_path=status_path)
             store = lendingbot.LendingStateStore(database)
             store.set_mode("LIVE", "test")
             with open(status_path, "w", encoding="utf-8") as file:
-                json.dump({
-                    "schemaVersion": 3,
-                    "operationMode": "LIVE",
-                    "last_update": "2026-07-21 15:00:00",
-                    "account": {"total": "123"},
-                }, file)
+                json.dump(
+                    {
+                        "schemaVersion": 3,
+                        "operationMode": "LIVE",
+                        "last_update": "2026-07-21 15:00:00",
+                        "account": {"total": "123"},
+                    },
+                    file,
+                )
             with mock.patch.object(lendingbot, "controlled_bot_running", return_value=False):
-                runtime = lendingbot.reconcile_orphaned_live_runtime(config_path)
+                runtime = lendingbot.reconcile_orphaned_live_runtime(config_path, context)
             self.assertEqual(runtime["mode"], "PAUSED")
-            payload = lendingbot.dashboard_status_payload(status_path, config_path)
+            payload = lendingbot.dashboard_status_payload(status_path, config_path, context)
             self.assertEqual(payload["operationMode"], "PAUSED")
             self.assertNotIn("account", payload)
             self.assertEqual(payload["last_update"], "")

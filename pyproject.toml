@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["artifacts", ".state"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+
+[tool.coverage.run]
+branch = true
+source = ["WriteRecovery"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90

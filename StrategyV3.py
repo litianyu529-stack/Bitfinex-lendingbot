@@ -3,7 +3,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 
@@ -20,6 +20,19 @@ WINDOWS_MS = {
     "6h": 21_600_000,
     "24h": 86_400_000,
     "7d": 604_800_000,
+}
+SCORE_MODEL_VERSION = "v3-score-2026-07-22"
+V3_RESEARCH_SCORE_WEIGHTS = {
+    "net_yield": D("45"),
+    "fill_probability": D("15"),
+    "wait_time": D("8"),
+    "book_depth": D("5"),
+    "trade_speed": D("4"),
+    "utilization": D("3"),
+    "trend_volatility": D("5"),
+    "term_opportunity": D("5"),
+    "hidden_cost": D("5"),
+    "variable_risk": D("5"),
 }
 
 
@@ -84,16 +97,6 @@ class StrategyPolicyV3:
     ws_fallback_seconds: int = 300
     rest_stale_seconds: int = 60
     market_retention_days: int = 90
-    score_net_yield: D = D("45")
-    score_fill_probability: D = D("15")
-    score_wait_time: D = D("8")
-    score_book_depth: D = D("5")
-    score_trade_speed: D = D("4")
-    score_utilization: D = D("3")
-    score_trend_volatility: D = D("5")
-    score_term_opportunity: D = D("5")
-    score_hidden_cost: D = D("5")
-    score_variable_risk: D = D("5")
 
     def floor_apr(self, pool):
         return getattr(self, f"{pool}_floor_apr")
@@ -106,20 +109,6 @@ class StrategyPolicyV3:
 
     def layer_shares(self):
         return {layer: getattr(self, f"{layer}_share") for layer in LAYERS}
-
-    def score_weights(self):
-        return {
-            "net_yield": self.score_net_yield,
-            "fill_probability": self.score_fill_probability,
-            "wait_time": self.score_wait_time,
-            "book_depth": self.score_book_depth,
-            "trade_speed": self.score_trade_speed,
-            "utilization": self.score_utilization,
-            "trend_volatility": self.score_trend_volatility,
-            "term_opportunity": self.score_term_opportunity,
-            "hidden_cost": self.score_hidden_cost,
-            "variable_risk": self.score_variable_risk,
-        }
 
 
 V3_FIELD_CONVERTERS = {
@@ -163,8 +152,6 @@ V3_FIELD_CONVERTERS = {
     "rest_stale_seconds": int,
     "market_retention_days": int,
 }
-for _score_name in StrategyPolicyV3().score_weights():
-    V3_FIELD_CONVERTERS[f"score_{_score_name}"] = _d
 
 
 def policy_v3_with_overrides(base, values):
@@ -224,9 +211,11 @@ def validate_policy_v3(policy, require_live_floors=False):
         raise ValueError("hidden_max_share must be positive when Hidden is enabled")
     if policy.hidden_max_share is not None and not 0 <= policy.hidden_max_share <= 100:
         raise ValueError("hidden_max_share must be 0-100")
-    if not any((policy.enable_limit, policy.enable_frr, policy.enable_frr_delta_fixed, policy.enable_frr_delta_variable)):
+    if not any(
+        (policy.enable_limit, policy.enable_frr, policy.enable_frr_delta_fixed, policy.enable_frr_delta_variable)
+    ):
         raise ValueError("at least one funding offer type must be enabled")
-    if sum(policy.score_weights().values(), D("0")) != D("100"):
+    if sum(V3_RESEARCH_SCORE_WEIGHTS.values(), D("0")) != D("100"):
         raise ValueError("candidate score weights must total 100")
     if policy.minimum_offer_minutes < 1 or policy.reprice_cooldown_minutes < 1:
         raise ValueError("offer and reprice cooldown minutes must be positive")
@@ -244,9 +233,13 @@ def policy_v3_to_json(policy):
             payload[key] = list(value)
         else:
             payload[key] = value
-    payload["floorsConfigured"] = all(policy.floor_apr(pool) is not None and policy.floor_apr(pool) > 0 for pool in POOLS)
+    payload["floorsConfigured"] = all(
+        policy.floor_apr(pool) is not None and policy.floor_apr(pool) > 0 for pool in POOLS
+    )
     payload["gross_daily_floors"] = {
-        pool: None if policy.floor_apr(pool) is None else format(gross_daily_floor(policy.floor_apr(pool), policy.normal_fee_rate), "f")
+        pool: None
+        if policy.floor_apr(pool) is None
+        else format(gross_daily_floor(policy.floor_apr(pool), policy.normal_fee_rate), "f")
         for pool in POOLS
     }
     return payload
@@ -365,11 +358,17 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
     frr = _d(latest_stat.get("frr_daily_rate"))
     utilization = latest_stat.get("utilization")
     utilization = None if utilization is None else _d(utilization)
-    anchor_values = [value for value in (best_offer, best_bid, windows["1h"]["median"], windows["24h"]["median"], frr) if value > 0]
+    anchor_values = [
+        value for value in (best_offer, best_bid, windows["1h"]["median"], windows["24h"]["median"], frr) if value > 0
+    ]
     anchor = sorted(anchor_values)[len(anchor_values) // 2] if anchor_values else D("0")
     iqr = max(D("0"), windows["24h"]["q75"] - windows["24h"]["q25"])
     threshold = max(policy.minimum_rate_change, iqr * policy.iqr_change_fraction)
-    trend = windows["5m"]["median"] - windows["1h"]["median"] if windows["5m"]["median"] and windows["1h"]["median"] else D("0")
+    trend = (
+        windows["5m"]["median"] - windows["1h"]["median"]
+        if windows["5m"]["median"] and windows["1h"]["median"]
+        else D("0")
+    )
     hourly_baseline_5m = windows["1h"]["volume"] / D("12") if windows["1h"]["volume"] > 0 else D("0")
     volume_ratio = windows["5m"]["volume"] / hourly_baseline_5m if hourly_baseline_5m > 0 else D("0")
     spike = bool(
@@ -388,7 +387,10 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
     else:
         regime = "neutral"
     depth = {}
-    for side, rows in (("offer", sorted(asks, key=lambda row: D(row["rate"]))), ("bid", sorted(bids, key=lambda row: D(row["rate"]), reverse=True))):
+    for side, rows in (
+        ("offer", sorted(asks, key=lambda row: D(row["rate"]))),
+        ("bid", sorted(bids, key=lambda row: D(row["rate"]), reverse=True)),
+    ):
         cumulative = D("0")
         levels = []
         for row in rows:
@@ -424,7 +426,9 @@ def dynamic_pool_shares(policy, signals):
             long = 100 - short - medium
             if long < 0 or abs(D(long) - base["long"]) > policy.max_pool_shift:
                 continue
-            if signals.get("regime") == "spike" and (short > base["short"] or medium < base["medium"] or long < base["long"]):
+            if signals.get("regime") == "spike" and (
+                short > base["short"] or medium < base["medium"] or long < base["long"]
+            ):
                 continue
             if signals.get("regime") == "low" and short < base["short"]:
                 continue
@@ -436,7 +440,13 @@ def dynamic_pool_shares(policy, signals):
             elif signals.get("regime") == "rising":
                 utility = D(medium) * D("0.4") + D(long) * D("0.6")
             else:
-                utility = -sum((abs(D(value) - base[name]) for name, value in (("short", short), ("medium", medium), ("long", long))), D("0"))
+                utility = -sum(
+                    (
+                        abs(D(value) - base[name])
+                        for name, value in (("short", short), ("medium", medium), ("long", long))
+                    ),
+                    D("0"),
+                )
             candidates.append((utility, -abs(D(short) - base["short"]), short, medium, long))
     if not candidates:
         return base
@@ -466,7 +476,6 @@ def deterministic_amounts(total, count, minimum, jitter, seed):
     count = min(int(count), int(total // minimum))
     if count <= 0:
         return []
-    base = total / D(count)
     rng = random.Random(int(hashlib.sha256(str(seed).encode("utf-8")).hexdigest()[:16], 16))
     factors = [D(str(1 + rng.uniform(-float(jitter), float(jitter)))) for _ in range(count)]
     factor_sum = sum(factors, D("0"))
@@ -490,8 +499,7 @@ def deterministic_amounts(total, count, minimum, jitter, seed):
 
 def _pool_deficits(total_principal, shares, exposure):
     return {
-        pool: max(D("0"), D(total_principal) * shares[pool] / D("100") - D(exposure.get(pool, 0)))
-        for pool in POOLS
+        pool: max(D("0"), D(total_principal) * shares[pool] / D("100") - D(exposure.get(pool, 0))) for pool in POOLS
     }
 
 
@@ -508,14 +516,27 @@ def allocate_slices_v3(
     total_principal, available = max(D("0"), D(total_principal)), max(D("0"), D(available))
     possible_slices = min(policy.target_slices, int(total_principal // policy.min_order_amount))
     if possible_slices <= 0 or available < policy.min_order_amount:
-        return {"target_slice_count": possible_slices, "target_slice_amount": D("0"), "shares": dynamic_pool_shares(policy, signals), "slices": []}
+        return {
+            "target_slice_count": possible_slices,
+            "target_slice_amount": D("0"),
+            "shares": dynamic_pool_shares(policy, signals),
+            "slices": [],
+        }
     target_amount = (total_principal / D(possible_slices)).quantize(SATOSHI, rounding=ROUND_DOWN)
     shares = dynamic_pool_shares(policy, signals)
     deficits = _pool_deficits(total_principal, shares, exposure_by_pool or {})
     allocatable = min(available, sum(deficits.values(), D("0")))
     if allocatable < policy.min_order_amount:
-        return {"target_slice_count": possible_slices, "target_slice_amount": target_amount, "shares": shares, "slices": []}
-    new_count = min(int(allocatable // policy.min_order_amount), max(1, int((allocatable / target_amount).to_integral_value(rounding=ROUND_HALF_UP))))
+        return {
+            "target_slice_count": possible_slices,
+            "target_slice_amount": target_amount,
+            "shares": shares,
+            "slices": [],
+        }
+    new_count = min(
+        int(allocatable // policy.min_order_amount),
+        max(1, int((allocatable / target_amount).to_integral_value(rounding=ROUND_HALF_UP))),
+    )
     pool_counts = _largest_remainder_counts(new_count, deficits)
     active_pools = [pool for pool in POOLS if pool_counts[pool] > 0]
     while active_pools and any(deficits[pool] < policy.min_order_amount * pool_counts[pool] for pool in active_pools):
@@ -524,7 +545,12 @@ def allocate_slices_v3(
         new_count -= 1
         active_pools = [pool for pool in POOLS if pool_counts[pool] > 0]
     if new_count <= 0:
-        return {"target_slice_count": possible_slices, "target_slice_amount": target_amount, "shares": shares, "slices": []}
+        return {
+            "target_slice_count": possible_slices,
+            "target_slice_amount": target_amount,
+            "shares": shares,
+            "slices": [],
+        }
     layer_exposure = exposure_by_layer or {}
     layer_deficits = {
         layer: max(
@@ -544,26 +570,37 @@ def allocate_slices_v3(
     slices = []
     for pool_index, pool in enumerate(active_pools):
         count = pool_counts[pool]
-        minimum_for_rest = sum((policy.min_order_amount * pool_counts[other] for other in active_pools[pool_index + 1:]), D("0"))
+        minimum_for_rest = sum(
+            (policy.min_order_amount * pool_counts[other] for other in active_pools[pool_index + 1 :]), D("0")
+        )
         if pool_index == len(active_pools) - 1:
             pool_amount = remaining_amount
         else:
             pool_amount = min(deficits[pool], allocatable * pool_amount_weights[pool] / total_deficit)
             pool_amount = max(policy.min_order_amount * count, min(pool_amount, remaining_amount - minimum_for_rest))
-        amounts = deterministic_amounts(pool_amount, count, policy.min_order_amount, policy.amount_jitter, f"{strategy_version}:USD:{pool}")
+        amounts = deterministic_amounts(
+            pool_amount, count, policy.min_order_amount, policy.amount_jitter, f"{strategy_version}:USD:{pool}"
+        )
         periods = policy.periods(pool)
         for index, amount in enumerate(amounts):
             layer = layer_sequence[layer_cursor] if layer_cursor < len(layer_sequence) else "balanced"
             layer_cursor += 1
-            slices.append({
-                "slice_index": len(slices),
-                "pool": pool,
-                "layer": layer,
-                "amount": amount,
-                "period": periods[(index + pool_index) % len(periods)],
-            })
+            slices.append(
+                {
+                    "slice_index": len(slices),
+                    "pool": pool,
+                    "layer": layer,
+                    "amount": amount,
+                    "period": periods[(index + pool_index) % len(periods)],
+                }
+            )
         remaining_amount -= sum(amounts, D("0"))
-    return {"target_slice_count": possible_slices, "target_slice_amount": target_amount, "shares": shares, "slices": slices}
+    return {
+        "target_slice_count": possible_slices,
+        "target_slice_amount": target_amount,
+        "shares": shares,
+        "slices": slices,
+    }
 
 
 def _candidate_target_rate(item, signals, floor_rate):
@@ -583,7 +620,7 @@ def _candidate_target_rate(item, signals, floor_rate):
 
 
 def _score_candidate(candidate, item, signals, policy, floor_apr):
-    weights = policy.score_weights()
+    weights = V3_RESEARCH_SCORE_WEIGHTS
     fee = policy.hidden_fee_rate if candidate["hidden"] else policy.normal_fee_rate
     net_apr = net_apr_from_daily(candidate["effective_rate"], fee)
     floor_apr = max(D("0.00000001"), floor_apr)
@@ -598,7 +635,11 @@ def _score_candidate(candidate, item, signals, policy, floor_apr):
     utilization = signals.get("utilization")
     utilization_score = D("0.5") if utilization is None else max(D("0"), min(D("1"), D(utilization)))
     regime = signals.get("regime")
-    trend_score = D("1") if (regime == "spike" and item["pool"] in {"medium", "long"}) or (regime == "low" and item["pool"] == "short") else D("0.6")
+    trend_score = (
+        D("1")
+        if (regime == "spike" and item["pool"] in {"medium", "long"}) or (regime == "low" and item["pool"] == "short")
+        else D("0.6")
+    )
     term_score = {"short": D("0.7"), "medium": D("0.75"), "long": D("0.8")}[item["pool"]]
     if regime == "spike":
         term_score += D("0.2") if item["pool"] in {"medium", "long"} else D("0")
@@ -647,9 +688,7 @@ def _plan_hash(strategy_version, total_principal, available, exposure_by_pool, e
         "totalPrincipal": format(D(total_principal), "f"),
         "available": format(D(available), "f"),
         "exposureByPool": {key: format(D(value), "f") for key, value in sorted((exposure_by_pool or {}).items())},
-        "existingExposure": {
-            key: format(D(value), "f") for key, value in sorted((existing_exposure or {}).items())
-        },
+        "existingExposure": {key: format(D(value), "f") for key, value in sorted((existing_exposure or {}).items())},
         "orders": [
             {
                 "sliceKey": str(row.get("slice_key") or row.get("slice_index")),
@@ -704,7 +743,9 @@ def build_strategy_plan_v3(
     variable_used = max(D("0"), D(existing_exposure.get("variable", 0)))
     hidden_used = max(D("0"), D(existing_exposure.get("hidden", 0)))
     variable_limit = D(total_principal) * policy.variable_max_share / D("100")
-    hidden_limit = D("0") if policy.hidden_max_share is None else D(total_principal) * policy.hidden_max_share / D("100")
+    hidden_limit = (
+        D("0") if policy.hidden_max_share is None else D(total_principal) * policy.hidden_max_share / D("100")
+    )
     frr = D(signals.get("frr_daily_rate") or 0)
     for item in allocation["slices"]:
         floor_apr = policy.floor_apr(item["pool"])
@@ -732,7 +773,7 @@ def build_strategy_plan_v3(
             is_variable = offer_type == "FRRDELTAVAR"
             if is_variable and variable_used + item["amount"] > variable_limit:
                 continue
-            for is_hidden in ((False, True) if policy.enable_hidden else (False,)):
+            for is_hidden in (False, True) if policy.enable_hidden else (False,):
                 if is_hidden and hidden_used + item["amount"] > hidden_limit:
                     continue
                 fee = policy.hidden_fee_rate if is_hidden else policy.normal_fee_rate
@@ -755,9 +796,19 @@ def build_strategy_plan_v3(
                 (hidden if is_hidden else visible).append(candidate)
         if not visible and not hidden:
             continue
-        best_visible = max(visible, key=lambda row: (row["score"], row["effective_rate"], row["display_type"])) if visible else None
-        best_hidden = max(hidden, key=lambda row: (row["score"], row["effective_rate"], row["display_type"])) if hidden else None
-        chosen = best_hidden if best_hidden and (best_visible is None or best_hidden["score"] > best_visible["score"]) else best_visible
+        best_visible = (
+            max(visible, key=lambda row: (row["score"], row["effective_rate"], row["display_type"]))
+            if visible
+            else None
+        )
+        best_hidden = (
+            max(hidden, key=lambda row: (row["score"], row["effective_rate"], row["display_type"])) if hidden else None
+        )
+        chosen = (
+            best_hidden
+            if best_hidden and (best_visible is None or best_hidden["score"] > best_visible["score"])
+            else best_visible
+        )
         if chosen is None:
             continue
         if chosen["offer_type"] == "FRRDELTAVAR":
@@ -796,12 +847,15 @@ def json_decimal(value):
     return value
 
 
-def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None):
+def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None, window_ms=None):
     validate_policy_v3(policy)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
+    window = int(window_ms if window_ms is not None else WINDOWS_MS["7d"])
+    if window <= 0:
+        raise ValueError("replay window must be positive")
     principal = D(principal)
     selected = sorted(
-        [row for row in trades or [] if int(row.get("mts", 0)) >= now - WINDOWS_MS["7d"]],
+        [row for row in trades or [] if now - window <= int(row.get("mts", 0)) < now],
         key=lambda row: int(row["mts"]),
     )
     if not selected:
@@ -817,7 +871,7 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
             "idlePrincipalTime": "0",
         }
     step_ms = 15 * 60_000
-    start = max(now - WINDOWS_MS["7d"], int(selected[0]["mts"]))
+    start = max(now - window, int(selected[0]["mts"]))
     cursor = start - (start % step_ms)
     available = principal
     active = []
@@ -827,6 +881,14 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
     utilized_time = D("0")
     idle_time = D("0")
     last_signals = None
+    trade_index = 0
+    signal_history = []
+    stat_rows = sorted(
+        [row for row in stats or [] if int(row.get("mts", row.get("timestamp", 0)) or 0) <= now],
+        key=lambda row: int(row.get("mts", row.get("timestamp", 0)) or 0),
+    )
+    stat_index = 0
+    latest_stat = None
 
     def replay_book(history):
         if book and cursor + step_ms >= now:
@@ -841,6 +903,28 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
             {"rate": median, "period": 2, "count": len(recent), "amount": volume},
             {"rate": q25 or median, "period": 2, "count": len(recent), "amount": -volume},
         ]
+
+    def aggregate_signal_trade(rows, mts):
+        weighted_rate = D("0")
+        total_volume = D("0")
+        for row in rows:
+            try:
+                volume = abs(D(row["amount"]))
+                rate = D(row["rate"])
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                continue
+            if volume <= 0 or rate <= 0:
+                continue
+            weighted_rate += rate * volume
+            total_volume += volume
+        if total_volume <= 0:
+            return None
+        return {
+            "mts": int(mts),
+            "rate": weighted_rate / total_volume,
+            "amount": total_volume,
+            "period": 2,
+        }
 
     while cursor < now:
         interval_end = min(now, cursor + step_ms)
@@ -862,24 +946,39 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
         utilized_time += active_amount * duration_days
         idle_time += max(D("0"), principal - active_amount) * duration_days
 
-        history = [row for row in selected if int(row["mts"]) < cursor]
-        interval_trades = [row for row in selected if cursor <= int(row["mts"]) < interval_end]
-        if available >= policy.min_order_amount and history and interval_trades:
-            synthetic_book = replay_book(history)
-            last_signals = build_market_signals_v3(synthetic_book, history, stats or [], policy, cursor)
+        interval_start = trade_index
+        while trade_index < len(selected) and int(selected[trade_index]["mts"]) < interval_end:
+            trade_index += 1
+        interval_trades = selected[interval_start:trade_index]
+        signal_history = [row for row in signal_history if int(row["mts"]) >= cursor - WINDOWS_MS["7d"]]
+        while stat_index < len(stat_rows):
+            stat_mts = int(stat_rows[stat_index].get("mts", stat_rows[stat_index].get("timestamp", 0)) or 0)
+            if stat_mts > cursor:
+                break
+            latest_stat = stat_rows[stat_index]
+            stat_index += 1
+        if available >= policy.min_order_amount and signal_history and interval_trades:
+            synthetic_book = replay_book(signal_history)
+            replay_stats = [] if latest_stat is None else [latest_stat]
+            last_signals = build_market_signals_v3(
+                synthetic_book,
+                signal_history,
+                replay_stats,
+                policy,
+                cursor,
+            )
             exposure = {pool: D("0") for pool in POOLS}
             for credit in active:
                 exposure[credit["pool"]] += credit["amount"]
-            plan = build_strategy_plan_v3(
-                principal, available, exposure, policy, last_signals, f"replay:{cursor}"
-            )
+            plan = build_strategy_plan_v3(principal, available, exposure, policy, last_signals, f"replay:{cursor}")
             remaining_volume = {}
             for trade in interval_trades:
                 key = (int(trade.get("period", 2)), D(trade["rate"]))
                 remaining_volume[key] = remaining_volume.get(key, D("0")) + abs(D(trade["amount"]))
             for order in plan["plan"]:
                 eligible = [
-                    key for key, volume in remaining_volume.items()
+                    key
+                    for key, volume in remaining_volume.items()
                     if volume > 0 and key[0] == int(order["period"]) and key[1] >= order["effective_rate"]
                 ]
                 if not eligible or available < policy.min_order_amount:
@@ -905,6 +1004,9 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
                 active.append(credit)
                 fills.append(credit)
                 available -= fill_amount
+        aggregate = aggregate_signal_trade(interval_trades, interval_end - 1)
+        if aggregate is not None:
+            signal_history.append(aggregate)
         cursor = interval_end
 
     for credit in active:
@@ -915,16 +1017,19 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None)
     principal_time = principal * elapsed_days
     utilization = D("0") if principal_time <= 0 else utilized_time / principal_time
     apr = D("0") if principal_time <= 0 else interest / principal_time * D("365")
-    return json_decimal({
-        "mode": "REPLAY",
-        "sampleCount": len(selected),
-        "estimatedUtilizationPercent": utilization * D("100"),
-        "netInterest": interest,
-        "actualNetAprPercent": apr * D("100"),
-        "orders": fills,
-        "fills": fills,
-        "returns": returns,
-        "activeCredits": active,
-        "idlePrincipalTime": idle_time,
-        "signals": last_signals or build_market_signals_v3(book or [], selected, stats or [], policy, now),
-    })
+    return json_decimal(
+        {
+            "mode": "REPLAY",
+            "sampleCount": len(selected),
+            "replayAggregationMinutes": step_ms // 60_000,
+            "estimatedUtilizationPercent": utilization * D("100"),
+            "netInterest": interest,
+            "actualNetAprPercent": apr * D("100"),
+            "orders": fills,
+            "fills": fills,
+            "returns": returns,
+            "activeCredits": active,
+            "idlePrincipalTime": idle_time,
+            "signals": last_signals or build_market_signals_v3(book or [], selected, stats or [], policy, now),
+        }
+    )

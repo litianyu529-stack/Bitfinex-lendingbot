@@ -1,0 +1,549 @@
+{
+  "baselines": [
+    "current_v3",
+    "frr_only",
+    "limit_near_fill"
+  ],
+  "data": {
+    "bookSnapshots": {
+      "count": 0,
+      "earliestMs": null,
+      "latestMs": null
+    },
+    "historicalBookBackfillable": false,
+    "stats": {
+      "count": 2160,
+      "earliestMs": 1776963900000,
+      "latestMs": 1784736300000
+    },
+    "trades": {
+      "count": 296856,
+      "earliestMs": 1776961832263,
+      "latestMs": 1784737778000
+    }
+  },
+  "generatedAtMs": 1784737780265,
+  "methodology": {
+    "promotionGate": "positive validation and test gain plus paired bootstrap 95% lower bound above zero",
+    "replayIntervalMinutes": 15,
+    "scoreModelVersion": "v3-score-2026-07-22",
+    "scoreWeights": {
+      "book_depth": "5",
+      "fill_probability": "15",
+      "hidden_cost": "5",
+      "net_yield": "45",
+      "term_opportunity": "5",
+      "trade_speed": "4",
+      "trend_volatility": "5",
+      "utilization": "3",
+      "variable_risk": "5",
+      "wait_time": "8"
+    },
+    "selectionUses": "training split only",
+    "signalAggregation": "volume-weighted trade rate per replay interval",
+    "split": "chronological 60-day train / 15-day validation / 15-day test"
+  },
+  "principal": "10000",
+  "schemaVersion": 1,
+  "selection": {
+    "candidate": "candidate_term_capture",
+    "candidateVersionId": "c881c2e2ba4f177f",
+    "eligibleForLiveCandidate": false,
+    "minimumDaysPerStage": 7,
+    "pairedBootstrap95": {
+      "lower": "-0.00000624996165809399330019827538",
+      "median": "-0.0000001514920614025527225302828413",
+      "samples": 15,
+      "upper": "0.00000403281870799982394081598597"
+    },
+    "requiresManualPromotion": true,
+    "rolloutStagesPercent": [
+      10,
+      25,
+      50,
+      100
+    ],
+    "safetyInvariants": {
+      "floorsConfigured": true,
+      "hardBoundariesUnchanged": true,
+      "periodsWithinExchangeRange": true
+    },
+    "testGain": "0.0000172327335076886376066523976",
+    "trainingRule": "highest train return on principal-time among candidate variants",
+    "validationGain": "0"
+  },
+  "split": {
+    "test": {
+      "days": 15,
+      "endMs": 1784737780265,
+      "startMs": 1783441780265
+    },
+    "train": {
+      "days": 60,
+      "endMs": 1782145780265,
+      "startMs": 1776961780265
+    },
+    "validation": {
+      "days": 15,
+      "endMs": 1783441780265,
+      "startMs": 1782145780265
+    }
+  },
+  "symbol": "fUSD",
+  "variants": {
+    "candidate_short_cycle": {
+      "metrics": {
+        "test": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 125,
+          "longOccupancyPercent": "11.2",
+          "netAprPercent": "6.693019834332367997158563680",
+          "netInterest": "16.73157893241221378142269647",
+          "returnOnPrincipalTime": "0.0001115438595494147585428179765",
+          "sampleCount": 127018,
+          "utilizationPercent": "75.89776691380908704308715700"
+        },
+        "train": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 92,
+          "longOccupancyPercent": "20.65217391304347826086956522",
+          "netAprPercent": "2.907277951706997562875098718",
+          "netInterest": "47.79039107372571824418200588",
+          "returnOnPrincipalTime": "0.00007965065178954286374030334313",
+          "sampleCount": 169838,
+          "utilizationPercent": "33.12990773231651606785085544"
+        },
+        "validation": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 0,
+          "utilizationPercent": "0"
+        }
+      },
+      "policy": {
+        "amount_jitter": "0.03",
+        "balanced_share": "35",
+        "currency": "USD",
+        "enable_frr": false,
+        "enable_frr_delta_fixed": false,
+        "enable_frr_delta_variable": false,
+        "enable_hidden": false,
+        "enable_limit": true,
+        "hidden_fee_rate": "0.18",
+        "hidden_max_share": null,
+        "high_share": "10",
+        "iqr_change_fraction": "0.25",
+        "long_floor_apr": "0.1",
+        "long_periods": [
+          120
+        ],
+        "long_share": "10",
+        "market_retention_days": 90,
+        "max_lend_amount": null,
+        "max_lend_percent": "100",
+        "max_pool_shift": "10",
+        "max_reprices_per_hour": 6,
+        "medium_floor_apr": "0.08",
+        "medium_periods": [
+          8,
+          14,
+          21,
+          30
+        ],
+        "medium_share": "30",
+        "min_order_amount": "150",
+        "minimum_offer_minutes": 10,
+        "minimum_rate_change": "0.00002",
+        "normal_fee_rate": "0.15",
+        "outlier_min_volume_share": "0.005",
+        "quick_share": "55",
+        "reprice_cooldown_minutes": 15,
+        "rest_stale_seconds": 60,
+        "short_floor_apr": "0.06",
+        "short_periods": [
+          2,
+          3,
+          5
+        ],
+        "short_share": "60",
+        "spike_volume_ratio": "1.5",
+        "target_slices": 60,
+        "variable_max_share": "10",
+        "version": 3,
+        "ws_fallback_seconds": 300
+      },
+      "versionId": "ec4872cd507767e9"
+    },
+    "candidate_term_capture": {
+      "metrics": {
+        "test": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 102,
+          "longOccupancyPercent": "24.50980392156862745098039216",
+          "netAprPercent": "7.933448388210268337656089979",
+          "netInterest": "19.83247042428634183404882876",
+          "returnOnPrincipalTime": "0.0001322164694952422788936588584",
+          "sampleCount": 127018,
+          "utilizationPercent": "85.56567066513667630457879309"
+        },
+        "train": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 77,
+          "longOccupancyPercent": "38.96103896103896103896103896",
+          "netAprPercent": "4.450507920656561092314604125",
+          "netInterest": "73.15830049204957636572561397",
+          "returnOnPrincipalTime": "0.0001219305008200826272762093566",
+          "sampleCount": 169838,
+          "utilizationPercent": "48.47577265023094785547316815"
+        },
+        "validation": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 0,
+          "utilizationPercent": "0"
+        }
+      },
+      "policy": {
+        "amount_jitter": "0.03",
+        "balanced_share": "45",
+        "currency": "USD",
+        "enable_frr": false,
+        "enable_frr_delta_fixed": false,
+        "enable_frr_delta_variable": false,
+        "enable_hidden": false,
+        "enable_limit": true,
+        "hidden_fee_rate": "0.18",
+        "hidden_max_share": null,
+        "high_share": "25",
+        "iqr_change_fraction": "0.25",
+        "long_floor_apr": "0.1",
+        "long_periods": [
+          120
+        ],
+        "long_share": "25",
+        "market_retention_days": 90,
+        "max_lend_amount": null,
+        "max_lend_percent": "100",
+        "max_pool_shift": "10",
+        "max_reprices_per_hour": 6,
+        "medium_floor_apr": "0.08",
+        "medium_periods": [
+          8,
+          14,
+          21,
+          30
+        ],
+        "medium_share": "35",
+        "min_order_amount": "150",
+        "minimum_offer_minutes": 10,
+        "minimum_rate_change": "0.00002",
+        "normal_fee_rate": "0.15",
+        "outlier_min_volume_share": "0.005",
+        "quick_share": "30",
+        "reprice_cooldown_minutes": 15,
+        "rest_stale_seconds": 60,
+        "short_floor_apr": "0.06",
+        "short_periods": [
+          2,
+          3,
+          5,
+          7
+        ],
+        "short_share": "40",
+        "spike_volume_ratio": "1.5",
+        "target_slices": 60,
+        "variable_max_share": "10",
+        "version": 3,
+        "ws_fallback_seconds": 300
+      },
+      "versionId": "c881c2e2ba4f177f"
+    },
+    "current_v3": {
+      "metrics": {
+        "test": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 118,
+          "longOccupancyPercent": "11.01694915254237288135593220",
+          "netAprPercent": "6.899424394127223307963652131",
+          "netInterest": "17.24756039813304619305096912",
+          "returnOnPrincipalTime": "0.0001149837359875536412870064608",
+          "sampleCount": 127018,
+          "utilizationPercent": "77.67357872831974627890426828"
+        },
+        "train": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 84,
+          "longOccupancyPercent": "22.61904761904761904761904762",
+          "netAprPercent": "2.961696632043266532297017951",
+          "netInterest": "48.68493575028799060646434132",
+          "returnOnPrincipalTime": "0.00008114155958381331767744056887",
+          "sampleCount": 169838,
+          "utilizationPercent": "34.04692758239945486262693368"
+        },
+        "validation": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 0,
+          "utilizationPercent": "0"
+        }
+      },
+      "policy": {
+        "amount_jitter": "0.03",
+        "balanced_share": "40",
+        "currency": "USD",
+        "enable_frr": false,
+        "enable_frr_delta_fixed": false,
+        "enable_frr_delta_variable": false,
+        "enable_hidden": false,
+        "enable_limit": true,
+        "hidden_fee_rate": "0.18",
+        "hidden_max_share": null,
+        "high_share": "20",
+        "iqr_change_fraction": "0.25",
+        "long_floor_apr": "0.1",
+        "long_periods": [
+          120
+        ],
+        "long_share": "10",
+        "market_retention_days": 90,
+        "max_lend_amount": null,
+        "max_lend_percent": "100",
+        "max_pool_shift": "10",
+        "max_reprices_per_hour": 6,
+        "medium_floor_apr": "0.08",
+        "medium_periods": [
+          8,
+          14,
+          21,
+          30
+        ],
+        "medium_share": "30",
+        "min_order_amount": "150",
+        "minimum_offer_minutes": 10,
+        "minimum_rate_change": "0.00002",
+        "normal_fee_rate": "0.15",
+        "outlier_min_volume_share": "0.005",
+        "quick_share": "40",
+        "reprice_cooldown_minutes": 15,
+        "rest_stale_seconds": 60,
+        "short_floor_apr": "0.06",
+        "short_periods": [
+          2,
+          3,
+          5,
+          7
+        ],
+        "short_share": "60",
+        "spike_volume_ratio": "1.5",
+        "target_slices": 60,
+        "variable_max_share": "10",
+        "version": 3,
+        "ws_fallback_seconds": 300
+      },
+      "versionId": "29cb3ab5752cdf13"
+    },
+    "frr_only": {
+      "metrics": {
+        "test": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 127018,
+          "utilizationPercent": "0.000000"
+        },
+        "train": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 14,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0.1807049199792280052341466368",
+          "netInterest": "2.970462039820804475",
+          "returnOnPrincipalTime": "0.000004950770066368007458333333333",
+          "sampleCount": 169838,
+          "utilizationPercent": "1.366309754274950383655487921"
+        },
+        "validation": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 0,
+          "utilizationPercent": "0"
+        }
+      },
+      "policy": {
+        "amount_jitter": "0.03",
+        "balanced_share": "40",
+        "currency": "USD",
+        "enable_frr": true,
+        "enable_frr_delta_fixed": false,
+        "enable_frr_delta_variable": false,
+        "enable_hidden": false,
+        "enable_limit": false,
+        "hidden_fee_rate": "0.18",
+        "hidden_max_share": null,
+        "high_share": "20",
+        "iqr_change_fraction": "0.25",
+        "long_floor_apr": "0.1",
+        "long_periods": [
+          120
+        ],
+        "long_share": "10",
+        "market_retention_days": 90,
+        "max_lend_amount": null,
+        "max_lend_percent": "100",
+        "max_pool_shift": "10",
+        "max_reprices_per_hour": 6,
+        "medium_floor_apr": "0.08",
+        "medium_periods": [
+          8,
+          14,
+          21,
+          30
+        ],
+        "medium_share": "30",
+        "min_order_amount": "150",
+        "minimum_offer_minutes": 10,
+        "minimum_rate_change": "0.00002",
+        "normal_fee_rate": "0.15",
+        "outlier_min_volume_share": "0.005",
+        "quick_share": "40",
+        "reprice_cooldown_minutes": 15,
+        "rest_stale_seconds": 60,
+        "short_floor_apr": "0.06",
+        "short_periods": [
+          2,
+          3,
+          5,
+          7
+        ],
+        "short_share": "60",
+        "spike_volume_ratio": "1.5",
+        "target_slices": 60,
+        "variable_max_share": "10",
+        "version": 3,
+        "ws_fallback_seconds": 300
+      },
+      "versionId": "e66c7587be95d76c"
+    },
+    "limit_near_fill": {
+      "metrics": {
+        "test": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 116,
+          "longOccupancyPercent": "12.93103448275862068965517241",
+          "netAprPercent": "7.171974266660711923811495251",
+          "netInterest": "17.92889555299410056149526680",
+          "returnOnPrincipalTime": "0.0001195259703532940037433017787",
+          "sampleCount": 127018,
+          "utilizationPercent": "79.76570813619939792926172127"
+        },
+        "train": {
+          "averageWaitMinutes": "0",
+          "cancellationRatePercent": "0",
+          "fillCount": 84,
+          "longOccupancyPercent": "22.61904761904761904761904762",
+          "netAprPercent": "2.970042022664050311752836652",
+          "netInterest": "48.82211887761714336262872488",
+          "returnOnPrincipalTime": "0.00008137019812936190560438120813",
+          "sampleCount": 169838,
+          "utilizationPercent": "34.18591680946122738539846936"
+        },
+        "validation": {
+          "averageWaitMinutes": "21600",
+          "cancellationRatePercent": "0",
+          "fillCount": 0,
+          "longOccupancyPercent": "0",
+          "netAprPercent": "0",
+          "netInterest": "0",
+          "returnOnPrincipalTime": "0",
+          "sampleCount": 0,
+          "utilizationPercent": "0"
+        }
+      },
+      "policy": {
+        "amount_jitter": "0.03",
+        "balanced_share": "30",
+        "currency": "USD",
+        "enable_frr": false,
+        "enable_frr_delta_fixed": false,
+        "enable_frr_delta_variable": false,
+        "enable_hidden": false,
+        "enable_limit": true,
+        "hidden_fee_rate": "0.18",
+        "hidden_max_share": null,
+        "high_share": "10",
+        "iqr_change_fraction": "0.25",
+        "long_floor_apr": "0.1",
+        "long_periods": [
+          120
+        ],
+        "long_share": "10",
+        "market_retention_days": 90,
+        "max_lend_amount": null,
+        "max_lend_percent": "100",
+        "max_pool_shift": "10",
+        "max_reprices_per_hour": 6,
+        "medium_floor_apr": "0.08",
+        "medium_periods": [
+          8,
+          14,
+          21,
+          30
+        ],
+        "medium_share": "30",
+        "min_order_amount": "150",
+        "minimum_offer_minutes": 10,
+        "minimum_rate_change": "0.00002",
+        "normal_fee_rate": "0.15",
+        "outlier_min_volume_share": "0.005",
+        "quick_share": "60",
+        "reprice_cooldown_minutes": 15,
+        "rest_stale_seconds": 60,
+        "short_floor_apr": "0.06",
+        "short_periods": [
+          2,
+          3,
+          5,
+          7
+        ],
+        "short_share": "60",
+        "spike_volume_ratio": "1.5",
+        "target_slices": 60,
+        "variable_max_share": "10",
+        "version": 3,
+        "ws_fallback_seconds": 300
+      },
+      "versionId": "762f16b36134cfb5"
+    }
+  }
+}

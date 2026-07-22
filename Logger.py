@@ -74,9 +74,7 @@ class JsonOutput(object):
 
 
 class Logger(object):
-    _SECRET_PATTERN = re.compile(
-        r"(?i)((?:api[_-]?key|api[_-]?secret|bfx-apikey|secret)\s*[:=]\s*)([^\s,;]+)"
-    )
+    _SECRET_PATTERN = re.compile(r"(?i)((?:api[_-]?key|api[_-]?secret|bfx-apikey|secret)\s*[:=]\s*)([^\s,;]+)")
 
     def __init__(self, jsonFile="", jsonLogSize=-1, sensitive_values=None):
         self._lended = ""
@@ -129,13 +127,7 @@ class Logger(object):
         self.refreshStatus()
 
     def cancelOrders(self, cur, msg):
-        line = (
-            self.timestamp()
-            + " 处理 "
-            + str(cur)
-            + " 挂单，"
-            + self.digestApiMsg(msg)
-        )
+        line = self.timestamp() + " 处理 " + str(cur) + " 挂单，" + self.digestApiMsg(msg)
         self.console.printline(line)
         self.refreshStatus()
 

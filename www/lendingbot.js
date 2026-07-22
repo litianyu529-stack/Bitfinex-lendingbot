@@ -19,7 +19,17 @@ window.mikaBuildReady = (async () => {
         const blocker = document.createElement("div");
         blocker.className = "build-blocker";
         blocker.setAttribute("role", "alert");
-        blocker.innerHTML = `<section><p>VERSION MISMATCH</p><h1>控制台版本不一致，所有操作已阻断</h1><div>请关闭此页面并重新双击桌面的“Bitfinex 自动放贷机器人”图标。程序不会在版本不一致时保存策略、预检或启动实盘。</div><small>${String(error.message || error)}</small></section>`;
+        const section = document.createElement("section");
+        const marker = document.createElement("p");
+        const heading = document.createElement("h1");
+        const detail = document.createElement("div");
+        const diagnostic = document.createElement("small");
+        marker.textContent = "VERSION MISMATCH";
+        heading.textContent = "控制台版本不一致，所有操作已阻断";
+        detail.textContent = "请关闭此页面并重新双击桌面的“Bitfinex 自动放贷机器人”图标。程序不会在版本不一致时保存策略、预检或启动实盘。";
+        diagnostic.textContent = String(error.message || error);
+        section.append(marker, heading, detail, diagnostic);
+        blocker.append(section);
         document.body.append(blocker);
         document.querySelectorAll("button, input, select, textarea").forEach((element) => { element.disabled = true; });
         return false;
@@ -27,6 +37,7 @@ window.mikaBuildReady = (async () => {
 })();
 
 const $ = (id) => document.getElementById(id);
+const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
 const state = {
     config: null,
     status: null,
@@ -64,7 +75,7 @@ async function getJson(url) {
 async function postJson(url, payload = {}) {
     const response = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Mika-CSRF": dashboardCsrf },
         body: JSON.stringify(payload),
     });
     return apiError(response, await response.json());
@@ -627,4 +638,3 @@ window.mikaBuildReady.then((compatible) => {
     window.setInterval(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false)), 30000);
     window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
 });
-

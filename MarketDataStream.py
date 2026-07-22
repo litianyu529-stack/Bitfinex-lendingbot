@@ -6,7 +6,12 @@ import time
 from collections import deque
 from decimal import Decimal
 
-from bitfinex import symbol_to_currency
+from ExchangeModels import (
+    parse_credit_rows,
+    parse_funding_trade_history,
+    parse_offer_rows,
+    parse_wallet_rows,
+)
 
 
 D = Decimal
@@ -53,6 +58,12 @@ class BitfinexMarketDataHub:
         self._stop = threading.Event()
         self._threads = []
         self._public_channels = {}
+        self._public_generation = 0
+        self._auth_generation = 0
+        self._book_snapshot_ready = False
+        self._wallet_snapshot_ready = False
+        self._offers_snapshot_ready = False
+        self._credits_snapshot_ready = False
         self._book = {}
         self._trades = deque(maxlen=self.max_trades)
         self._wallets = {}
@@ -122,8 +133,26 @@ class BitfinexMarketDataHub:
         self._run_forever("public", self._public_session)
 
     def _public_session(self):
-        with websocket_connect(PUBLIC_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20) as socket:
-            socket.send(json.dumps({"event": "subscribe", "channel": "book", "symbol": self.symbol, "prec": "P0", "freq": "F0", "len": "250"}))
+        with self._lock:
+            self._public_generation += 1
+            self._public_channels = {}
+            self._book_snapshot_ready = False
+            self._public_connected = False
+        with websocket_connect(
+            PUBLIC_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20
+        ) as socket:
+            socket.send(
+                json.dumps(
+                    {
+                        "event": "subscribe",
+                        "channel": "book",
+                        "symbol": self.symbol,
+                        "prec": "P0",
+                        "freq": "F0",
+                        "len": "250",
+                    }
+                )
+            )
             socket.send(json.dumps({"event": "subscribe", "channel": "trades", "symbol": self.symbol}))
             self._set_connected("public", True)
             while not self._stop.is_set():
@@ -134,6 +163,12 @@ class BitfinexMarketDataHub:
         self._run_forever("auth", self._auth_session)
 
     def _auth_session(self):
+        with self._lock:
+            self._auth_generation += 1
+            self._wallet_snapshot_ready = False
+            self._offers_snapshot_ready = False
+            self._credits_snapshot_ready = False
+            self._auth_connected = False
         nonce = str(int(time.time() * 1_000_000))
         payload = "AUTH" + nonce
         signature = hmac.new(self.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha384).hexdigest()
@@ -145,7 +180,9 @@ class BitfinexMarketDataHub:
             "authPayload": payload,
             "filter": [f"funding-{self.symbol}", "wallet"],
         }
-        with websocket_connect(AUTH_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20) as socket:
+        with websocket_connect(
+            AUTH_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20
+        ) as socket:
             socket.send(json.dumps(auth))
             while not self._stop.is_set():
                 message = socket.recv(timeout=30)
@@ -168,14 +205,24 @@ class BitfinexMarketDataHub:
                 return
             channel = self._public_channels.get(int(message[0]))
             if channel == "book":
-                entries = message[1] if isinstance(message[1], list) and message[1] and isinstance(message[1][0], list) else [message[1]]
+                is_snapshot = isinstance(message[1], list) and bool(message[1]) and isinstance(message[1][0], list)
+                if is_snapshot:
+                    # A reconnect snapshot is a replacement, not an increment.
+                    self._book = {}
+                entries = message[1] if is_snapshot else [message[1]]
                 for entry in entries:
                     self._apply_book_entry(entry)
+                if is_snapshot:
+                    self._book_snapshot_ready = True
             elif channel == "trades":
                 if len(message) >= 3 and message[1] in {"fte", "ftu", "te", "tu"}:
                     entries = [message[2]]
                 else:
-                    entries = message[1] if isinstance(message[1], list) and message[1] and isinstance(message[1][0], list) else [message[1]]
+                    entries = (
+                        message[1]
+                        if isinstance(message[1], list) and message[1] and isinstance(message[1][0], list)
+                        else [message[1]]
+                    )
                 for entry in entries:
                     self._apply_public_trade(entry)
 
@@ -250,6 +297,7 @@ class BitfinexMarketDataHub:
                 return
             if event == "fos":
                 self._offers = {int(row[0]): self._parse_offer(row) for row in payload or [] if len(row) >= 16}
+                self._offers_snapshot_ready = True
             elif event in {"fon", "fou"} and payload:
                 offer = self._parse_offer(payload)
                 self._offers[offer["id"]] = offer
@@ -257,13 +305,17 @@ class BitfinexMarketDataHub:
                 self._offers.pop(int(payload[0]), None)
             elif event == "fcs":
                 self._credits = {int(row[0]): self._parse_credit(row) for row in payload or [] if len(row) >= 13}
+                self._credits_snapshot_ready = True
             elif event in {"fcn", "fcu"} and payload:
                 credit = self._parse_credit(payload)
                 self._credits[credit["id"]] = credit
             elif event == "fcc" and payload:
                 self._credits.pop(int(payload[0]), None)
             elif event == "ws":
-                self._wallets = {self._wallet_key(row): self._parse_wallet(row) for row in payload or [] if len(row) >= 3}
+                self._wallets = {
+                    self._wallet_key(row): self._parse_wallet(row) for row in payload or [] if len(row) >= 3
+                }
+                self._wallet_snapshot_ready = True
             elif event == "wu" and payload:
                 self._wallets[self._wallet_key(payload)] = self._parse_wallet(payload)
             elif event in {"fte", "ftu"} and payload:
@@ -275,60 +327,23 @@ class BitfinexMarketDataHub:
 
     @staticmethod
     def _parse_wallet(row):
-        return {
-            "wallet_type": str(row[0]).lower(),
-            "currency": str(row[1]).upper(),
-            "balance": _as_decimal(row[2]),
-            "unsettled_interest": _as_decimal(row[3] or 0) if len(row) > 3 else D("0"),
-            "available": _as_decimal(row[4] if len(row) > 4 and row[4] is not None else row[2]),
-        }
+        parsed = parse_wallet_rows([row], currency="")
+        return parsed[0] if parsed else None
 
     @staticmethod
     def _parse_offer(row):
-        return {
-            "id": int(row[0]),
-            "currency": symbol_to_currency(str(row[1])).upper(),
-            "mts_created": int(row[2] or 0),
-            "mts_updated": int(row[3] or 0),
-            "amount": abs(_as_decimal(row[4])),
-            "amount_original": abs(_as_decimal(row[5])),
-            "offer_type": str(row[6]),
-            "flags": int(row[9] or 0),
-            "status": str(row[10]),
-            "rate": _as_decimal(row[14]),
-            "period": int(row[15]),
-            "hidden": bool(row[17]) if len(row) > 17 else bool(int(row[9] or 0) & 64),
-            "rate_real": _as_decimal(row[20]) if len(row) > 20 and row[20] is not None else None,
-        }
+        parsed = parse_offer_rows([row], currency="")
+        return parsed[0] if parsed else None
 
     @staticmethod
     def _parse_credit(row):
-        return {
-            "id": int(row[0]),
-            "currency": symbol_to_currency(str(row[1])).upper(),
-            "amount": abs(_as_decimal(row[5])),
-            "status": str(row[7]),
-            "rate_type": str(row[8]) if len(row) > 8 and row[8] is not None else None,
-            "rate": _as_decimal(row[11]),
-            "period": int(row[12]),
-            "mts_opening": int(row[13] or 0) if len(row) > 13 else 0,
-            "mts_updated": int(row[4] or 0),
-            "hidden": bool(row[16]) if len(row) > 16 else False,
-            "rate_real": _as_decimal(row[19]) if len(row) > 19 and row[19] is not None else None,
-        }
+        parsed = parse_credit_rows([row], currency="")
+        return parsed[0] if parsed else None
 
     @staticmethod
     def _parse_funding_trade(row):
-        return {
-            "id": int(row[0]),
-            "currency": symbol_to_currency(str(row[1])).upper(),
-            "mts": int(row[2]),
-            "offer_id": int(row[3]),
-            "amount": abs(_as_decimal(row[4])),
-            "rate": _as_decimal(row[5]),
-            "period": int(row[6]),
-            "maker": row[7] if len(row) > 7 else None,
-        }
+        parsed = parse_funding_trade_history([row], currency="")
+        return parsed[0] if parsed else None
 
     def apply_rest_snapshot(self, book=None, trades=None, wallets=None, offers=None, credits=None, synced_at_ms=None):
         now = int(synced_at_ms if synced_at_ms is not None else _now_ms())
@@ -339,7 +354,12 @@ class BitfinexMarketDataHub:
                     if isinstance(entry, dict):
                         rate, period, amount = D(entry["rate"]), int(entry["period"]), D(entry["amount"])
                         key = (format(rate, "f"), period, "offer" if amount > 0 else "bid")
-                        self._book[key] = {"rate": rate, "period": period, "count": int(entry.get("count", 1)), "amount": amount}
+                        self._book[key] = {
+                            "rate": rate,
+                            "period": period,
+                            "count": int(entry.get("count", 1)),
+                            "amount": amount,
+                        }
                     else:
                         self._apply_book_entry(entry)
             self._merge_trades(trades)
@@ -347,12 +367,16 @@ class BitfinexMarketDataHub:
                 self._wallets = {self._wallet_key(row): self._parse_wallet(row) for row in wallets}
             if offers is not None:
                 self._offers = {
-                    int(row["id"] if isinstance(row, dict) else row[0]): dict(row) if isinstance(row, dict) else self._parse_offer(row)
+                    int(row["id"] if isinstance(row, dict) else row[0]): dict(row)
+                    if isinstance(row, dict)
+                    else self._parse_offer(row)
                     for row in offers
                 }
             if credits is not None:
                 self._credits = {
-                    int(row["id"] if isinstance(row, dict) else row[0]): dict(row) if isinstance(row, dict) else self._parse_credit(row)
+                    int(row["id"] if isinstance(row, dict) else row[0]): dict(row)
+                    if isinstance(row, dict)
+                    else self._parse_credit(row)
                     for row in credits
                 }
             self._rest_last_sync_ms = now
@@ -365,7 +389,14 @@ class BitfinexMarketDataHub:
             public_age = None if self._public_last_message_ms is None else max(0, now - self._public_last_message_ms)
             auth_age = None if self._auth_last_message_ms is None else max(0, now - self._auth_last_message_ms)
             rest_age = None if self._rest_last_sync_ms is None else max(0, now - self._rest_last_sync_ms)
-            ws_healthy = self._public_connected and (not self.api_key or self._auth_connected)
+            public_ready = self._public_connected and self._book_snapshot_ready
+            auth_ready = not self.api_key or (
+                self._auth_connected
+                and self._wallet_snapshot_ready
+                and self._offers_snapshot_ready
+                and self._credits_snapshot_ready
+            )
+            ws_healthy = public_ready and auth_ready
             rest_fresh = rest_age is not None and rest_age <= self.rest_stale_ms
             if ws_healthy:
                 source = "WEBSOCKET"
@@ -373,13 +404,24 @@ class BitfinexMarketDataHub:
                 source = "REST_FALLBACK"
             else:
                 source = "STALE"
-            disconnected = [value for value in (self._public_disconnected_since_ms, self._auth_disconnected_since_ms if self.api_key else None) if value is not None]
+            disconnected = [
+                value
+                for value in (
+                    self._public_disconnected_since_ms,
+                    self._auth_disconnected_since_ms if self.api_key else None,
+                )
+                if value is not None
+            ]
             disconnected_for = 0 if not disconnected else now - min(disconnected)
             return {
                 "as_of": now,
                 "source": source,
                 "publicConnected": self._public_connected,
                 "authConnected": self._auth_connected if self.api_key else None,
+                "publicGeneration": self._public_generation,
+                "authGeneration": self._auth_generation if self.api_key else None,
+                "bookSnapshotReady": self._book_snapshot_ready,
+                "accountSnapshotsReady": auth_ready if self.api_key else None,
                 "publicAgeMs": public_age,
                 "authAgeMs": auth_age,
                 "restAgeMs": rest_age,
