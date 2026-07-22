@@ -1,6 +1,8 @@
 import hashlib
 import hmac
 import json
+import socket
+import threading
 import time
 from decimal import Decimal
 from urllib import error, parse, request
@@ -8,6 +10,16 @@ from urllib import error, parse, request
 
 class BitfinexApiError(Exception):
     pass
+
+
+class BitfinexAmbiguousWriteError(BitfinexApiError):
+    """The request may have reached Bitfinex but no authoritative result was received."""
+
+    pass
+
+
+FUNDING_OFFER_TYPES = {"LIMIT", "FRR", "FRRDELTAFIX", "FRRDELTAVAR"}
+HIDDEN_OFFER_FLAG = 64
 
 
 class Bitfinex:
@@ -19,6 +31,10 @@ class Bitfinex:
         self.api_secret = api_secret or ""
         self.timeout = timeout
         self._last_nonce = 0
+        # Bitfinex nonces are scoped to an API key.  Keep nonce creation and the
+        # corresponding authenticated request in one critical section so a
+        # background history reader cannot overtake a live trading request.
+        self._auth_lock = threading.RLock()
 
     @staticmethod
     def is_placeholder_credential(value):
@@ -67,7 +83,7 @@ class Bitfinex:
         if data is not None:
             data_bytes = data.encode("utf-8")
         request_headers = {
-            "User-Agent": "MikaLendingBot/0.4 Python",
+            "User-Agent": "MikaLendingBot/0.5 Python",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})
@@ -82,7 +98,7 @@ class Bitfinex:
             except ValueError:
                 content = raw
             raise BitfinexApiError(f"HTTP {exc.code} {exc.reason}: {content}") from exc
-        except error.URLError as exc:
+        except (error.URLError, TimeoutError, socket.timeout) as exc:
             raise BitfinexApiError(str(exc)) from exc
 
         try:
@@ -96,15 +112,31 @@ class Bitfinex:
     def _auth_post(self, path, payload=None):
         if not self.has_credentials():
             raise BitfinexApiError("Bitfinex API key/secret are not configured")
-        body = self._body(payload)
-        nonce = self._nonce()
-        headers = self._headers(path, nonce, body)
-        return self._request_json(
-            f"{self.AUTH_BASE_URL}/{path}",
-            method="POST",
-            data=body,
-            headers=headers,
-        )
+        with self._auth_lock:
+            body = self._body(payload)
+            nonce = self._nonce()
+            headers = self._headers(path, nonce, body)
+            return self._request_json(
+                f"{self.AUTH_BASE_URL}/{path}",
+                method="POST",
+                data=body,
+                headers=headers,
+            )
+
+    def _auth_write(self, path, payload=None):
+        try:
+            response = self._auth_post(path, payload)
+        except BitfinexApiError as exc:
+            if isinstance(exc.__cause__, (error.URLError, TimeoutError, socket.timeout)):
+                raise BitfinexAmbiguousWriteError("Bitfinex write result is unknown after a network failure") from exc
+            raise
+        if not isinstance(response, list) or len(response) < 8:
+            raise BitfinexApiError(f"Invalid write notification: {response}")
+        status = str(response[6] or "").upper()
+        if status != "SUCCESS":
+            message = response[7] or response
+            raise BitfinexApiError(f"Bitfinex write failed ({status or 'UNKNOWN'}): {message}")
+        return response
 
     def _public_get(self, path, query=None):
         url = f"{self.PUBLIC_BASE_URL}/{path}"
@@ -114,6 +146,9 @@ class Bitfinex:
 
     def wallets(self):
         return self._auth_post("v2/auth/r/wallets")
+
+    def key_permissions(self):
+        return self._auth_post("v2/auth/r/permissions")
 
     def active_funding_offers(self, symbol=None):
         path = "v2/auth/r/funding/offers"
@@ -133,27 +168,53 @@ class Bitfinex:
             path += f"/{symbol}"
         return self._auth_post(path)
 
-    def submit_funding_offer(self, symbol, amount, rate, period):
-        return self._auth_post(
+    def submit_funding_offer(
+        self,
+        symbol,
+        amount,
+        rate,
+        period,
+        offer_type="LIMIT",
+        flags=0,
+        hidden=False,
+    ):
+        normalized_type = str(offer_type or "LIMIT").upper()
+        if normalized_type not in FUNDING_OFFER_TYPES:
+            raise BitfinexApiError(f"Unsupported funding offer type: {offer_type}")
+        if normalized_type == "FRR":
+            normalized_type = "FRRDELTAVAR"
+            rate = "0"
+        numeric_rate = Decimal(str(rate))
+        if normalized_type == "FRRDELTAVAR" and numeric_rate < 0:
+            raise BitfinexApiError("FRRDELTAVAR rate offset cannot be negative")
+        numeric_period = int(period)
+        if numeric_period < 2 or numeric_period > 120:
+            raise BitfinexApiError("Funding offer period must be 2-120 days")
+        numeric_flags = int(flags or 0)
+        if hidden:
+            numeric_flags |= HIDDEN_OFFER_FLAG
+        if numeric_flags & ~HIDDEN_OFFER_FLAG:
+            raise BitfinexApiError("Unsupported funding offer flags")
+        return self._auth_write(
             "v2/auth/w/funding/offer/submit",
             {
-                "type": "LIMIT",
+                "type": normalized_type,
                 "symbol": symbol,
                 "amount": str(amount),
                 "rate": str(rate),
-                "period": int(period),
-                "flags": 0,
+                "period": numeric_period,
+                "flags": numeric_flags,
             },
         )
 
     def cancel_all_funding_offers(self, currency):
-        return self._auth_post(
+        return self._auth_write(
             "v2/auth/w/funding/offer/cancel/all",
             {"currency": currency},
         )
 
     def cancel_funding_offer(self, offer_id):
-        return self._auth_post(
+        return self._auth_write(
             "v2/auth/w/funding/offer/cancel",
             {"id": int(offer_id)},
         )
@@ -175,8 +236,47 @@ class Bitfinex:
                 payload[key] = value
         return self._auth_post(path, payload)
 
+    @staticmethod
+    def _history_payload(start=None, end=None, limit=None, sort=None):
+        payload = {}
+        for key, value in (("start", start), ("end", end), ("limit", limit), ("sort", sort)):
+            if value is not None:
+                payload[key] = int(value)
+        return payload
+
+    def funding_offers_history(self, symbol=None, start=None, end=None, limit=None):
+        path = "v2/auth/r/funding/offers"
+        if symbol:
+            path += f"/{symbol}"
+        path += "/hist"
+        return self._auth_post(path, self._history_payload(start, end, limit))
+
+    def funding_credits_history(self, symbol=None, start=None, end=None, limit=None):
+        path = "v2/auth/r/funding/credits"
+        if symbol:
+            path += f"/{symbol}"
+        path += "/hist"
+        return self._auth_post(path, self._history_payload(start, end, limit))
+
+    def funding_loans_history(self, symbol=None, start=None, end=None, limit=None):
+        path = "v2/auth/r/funding/loans"
+        if symbol:
+            path += f"/{symbol}"
+        path += "/hist"
+        return self._auth_post(path, self._history_payload(start, end, limit))
+
+    def funding_trades_history(self, symbol=None, start=None, end=None, limit=None, sort=None):
+        path = "v2/auth/r/funding/trades"
+        if symbol:
+            path += f"/{symbol}"
+        path += "/hist"
+        return self._auth_post(path, self._history_payload(start, end, limit, sort))
+
+    def funding_info(self, symbol):
+        return self._auth_post(f"v2/auth/r/info/funding/{symbol}")
+
     def transfer_between_wallets(self, from_wallet, to_wallet, currency, amount):
-        return self._auth_post(
+        return self._auth_write(
             "v2/auth/w/transfer",
             {
                 "from": from_wallet,
@@ -189,6 +289,22 @@ class Bitfinex:
 
     def funding_book(self, symbol, length=250):
         return self._public_get(f"v2/book/{symbol}/P0", {"len": int(length)})
+
+    def funding_trades(self, symbol, start=None, end=None, limit=10000, sort=-1):
+        query = {"limit": min(10000, max(1, int(limit))), "sort": int(sort)}
+        if start is not None:
+            query["start"] = int(start)
+        if end is not None:
+            query["end"] = int(end)
+        return self._public_get(f"v2/trades/{symbol}/hist", query)
+
+    def funding_stats(self, symbol, start=None, end=None, limit=250):
+        query = {"limit": min(250, max(1, int(limit)))}
+        if start is not None:
+            query["start"] = int(start)
+        if end is not None:
+            query["end"] = int(end)
+        return self._public_get(f"v2/funding/stats/{symbol}/hist", query)
 
     def ticker(self, symbol):
         return self._public_get(f"v2/ticker/{symbol}")

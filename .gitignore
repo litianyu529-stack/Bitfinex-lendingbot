@@ -5,7 +5,9 @@ tests/__pycache__/
 default.cfg
 www/botlog.json
 www/bot-process.log
+.state/
 nohup.out
 *.log
 *.idea
 *.lnk
+.*.tmp

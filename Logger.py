@@ -1,11 +1,11 @@
 import datetime
-import io
 import json
-import os
+import re
 import sys
 import time
 
 import ConsoleUtils
+from FileUtils import atomic_write_text
 from RingBuffer import RingBuffer
 
 
@@ -49,12 +49,11 @@ class JsonOutput(object):
         self.jsonOutputLog.append(line)
 
     def writeJsonFile(self):
-        directory = os.path.dirname(self.jsonOutputFile)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with io.open(self.jsonOutputFile, "w", encoding="utf-8") as f:
-            self.jsonOutput["log"] = self.jsonOutputLog.get()
-            f.write(json.dumps(self.jsonOutput, ensure_ascii=False, sort_keys=True))
+        self.jsonOutput["log"] = self.jsonOutputLog.get()
+        atomic_write_text(
+            self.jsonOutputFile,
+            json.dumps(self.jsonOutput, ensure_ascii=False, sort_keys=True),
+        )
 
     def statusValue(self, coin, key, value):
         if coin not in self.jsonOutputCoins:
@@ -75,20 +74,41 @@ class JsonOutput(object):
 
 
 class Logger(object):
-    def __init__(self, jsonFile="", jsonLogSize=-1):
+    _SECRET_PATTERN = re.compile(
+        r"(?i)((?:api[_-]?key|api[_-]?secret|bfx-apikey|secret)\s*[:=]\s*)([^\s,;]+)"
+    )
+
+    def __init__(self, jsonFile="", jsonLogSize=-1, sensitive_values=None):
         self._lended = ""
+        self._sensitive_values = tuple(
+            str(value) for value in (sensitive_values or ()) if value and len(str(value)) >= 4
+        )
         if jsonFile != "" and jsonLogSize != -1:
             self.console = JsonOutput(jsonFile, int(jsonLogSize))
         else:
             self.console = ConsoleOutput()
         self.refreshStatus()
 
+    def redact(self, value):
+        if isinstance(value, dict):
+            return {key: self.redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.redact(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.redact(item) for item in value)
+        if not isinstance(value, str):
+            return value
+        text = str(value)
+        for secret in self._sensitive_values:
+            text = text.replace(secret, "[REDACTED]")
+        return self._SECRET_PATTERN.sub(r"\1[REDACTED]", text)
+
     def timestamp(self):
         ts = time.time()
         return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
     def log(self, msg):
-        self.console.printline(self.timestamp() + " " + str(msg))
+        self.console.printline(self.timestamp() + " " + self.redact(msg))
         self.refreshStatus()
 
     def offer(self, amt, cur, rate, days, msg):
@@ -121,7 +141,7 @@ class Logger(object):
 
     def refreshStatus(self, lended=""):
         if lended != "":
-            self._lended = lended
+            self._lended = self.redact(lended)
         self.console.status(self._lended, self.timestamp())
 
     def updateStatusValue(self, coin, key, value):
@@ -134,7 +154,7 @@ class Logger(object):
 
     def updateMetaValue(self, key, value):
         if hasattr(self.console, "metaValue"):
-            self.console.metaValue(key, value)
+            self.console.metaValue(key, self.redact(value))
 
     def persistStatus(self):
         if hasattr(self.console, "writeJsonFile"):
@@ -154,10 +174,4 @@ class Logger(object):
         return self.translateMessage(str(msg))
 
     def translateMessage(self, message):
-        if message == "dry-run":
-            return "模拟运行"
-        if message.startswith("dry-run, would cancel "):
-            return "模拟运行，将取消 " + message.removeprefix("dry-run, would cancel ")
-        if message.startswith("dry-run, would reprice "):
-            return "模拟运行，将重定价 " + message.removeprefix("dry-run, would reprice ")
-        return message
+        return self.redact(message)

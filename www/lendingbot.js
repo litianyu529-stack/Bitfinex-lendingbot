@@ -1,608 +1,630 @@
+"use strict";
+
+const expectedDashboardBuild = document.querySelector('meta[name="mika-dashboard-build"]')?.content || "";
+window.mikaBuildCompatible = false;
+window.mikaBuildReady = (async () => {
+    try {
+        const response = await fetch("/api/health", { cache: "no-store" });
+        const health = await response.json();
+        const compatible = response.ok
+            && health.service === "mika-lending-dashboard-v3"
+            && health.buildId === expectedDashboardBuild
+            && expectedDashboardBuild
+            && !expectedDashboardBuild.includes("__MIKA_");
+        if (!compatible) throw new Error("页面与 Dashboard 后端版本不一致");
+        window.mikaBuildCompatible = true;
+        window.mikaDashboardHealth = health;
+        return true;
+    } catch (error) {
+        const blocker = document.createElement("div");
+        blocker.className = "build-blocker";
+        blocker.setAttribute("role", "alert");
+        blocker.innerHTML = `<section><p>VERSION MISMATCH</p><h1>控制台版本不一致，所有操作已阻断</h1><div>请关闭此页面并重新双击桌面的“Bitfinex 自动放贷机器人”图标。程序不会在版本不一致时保存策略、预检或启动实盘。</div><small>${String(error.message || error)}</small></section>`;
+        document.body.append(blocker);
+        document.querySelectorAll("button, input, select, textarea").forEach((element) => { element.disabled = true; });
+        return false;
+    }
+})();
+
+const $ = (id) => document.getElementById(id);
 const state = {
     config: null,
     status: null,
-    control: null,
-    mode: "dry",
-    localOnly: window.location.protocol === "file:",
+    control: { running: false, pid: null, startedAt: null, returnCode: null, stopReason: null },
+    preflight: null,
+    activeDialog: null,
+    previousFocus: null,
 };
 
-const formFieldNames = [
-    "currencies",
-    "mindailyrate",
-    "maxdailyrate",
-    "spreadlend",
-    "gapbottom",
-    "gaptop",
-    "smartstrategy",
-    "smartrateoffset",
-    "smartfastdepth",
-    "smartbalanceddepth",
-    "smartopportunitydepth",
-    "smartopportunitypremium",
-    "repricestaleoffers",
-    "repriceafterminutes",
-    "xdaythreshold",
-    "xdays",
-    "minloansize",
-    "sleeptimeactive",
-    "sleeptimeinactive",
-    "platformfeerate",
-    "outputcurrency",
-    "transferablecurrencies",
-];
-
-const fallbackConfig = {
-    configPath: "default.cfg",
-    credentialsConfigured: false,
-    bitfinex: { currencies: "USD,UST" },
-    bot: {
-        sleeptimeactive: "60",
-        sleeptimeinactive: "300",
-        mindailyrate: "0.04",
-        maxdailyrate: "2",
-        spreadlend: "3",
-        gapbottom: "10",
-        gaptop: "200",
-        smartstrategy: "true",
-        smartrateoffset: "0.001",
-        smartfastdepth: "5",
-        smartbalanceddepth: "150",
-        smartopportunitydepth: "300",
-        smartopportunitypremium: "0.01",
-        repricestaleoffers: "true",
-        repriceafterminutes: "15",
-        xdaythreshold: "0.2",
-        xdays: "60",
-        minloansize: "150",
-        dryrunbalance: "300",
-        platformfeerate: "15",
-        outputcurrency: "USD",
-        transferablecurrencies: "",
-        jsonfile: "www/botlog.json",
-        jsonlogsize: "200",
-        startwebserver: "true",
-    },
-};
-
-const fallbackStatus = {
-    last_status: "还没有 botlog.json",
-    last_update: "",
-    log: [],
-    outputCurrency: { currency: "USD", highestBid: "1" },
-    platformFeeRate: "15",
-    earnings: { available: false, summaryCurrency: "USD/UST" },
-    raw_data: {},
-};
-
-function $(id) {
-    return document.getElementById(id);
-}
-
-function showToast(message) {
-    const toast = $("toast");
-    toast.textContent = message;
-    toast.classList.add("visible");
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toast.classList.remove("visible"), 2600);
-}
-
-function setConnection(online, label) {
-    const chip = $("connectionChip");
-    chip.classList.toggle("offline", !online);
-    chip.querySelector("span:last-child").textContent = label;
-}
-
-function modeLabel(mode) {
-    if (mode === "live") return "实盘";
-    if (mode === "dry") return "模拟";
-    return "未知";
-}
-
-async function getJson(url) {
-    const response = await fetch(url, { cache: "no-store" });
-    const data = await response.json();
-    if (!response.ok || data.ok === false) {
-        throw new Error(data.error || response.statusText);
-    }
-    return data;
-}
-
-async function postJson(url, body) {
-    const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-    });
-    const data = await response.json();
-    if (!response.ok || data.ok === false) {
-        throw new Error(data.error || response.statusText);
-    }
-    return data;
-}
-
-async function loadConfig() {
-    if (state.localOnly) {
-        state.config = loadLocalConfig();
-        renderConfig();
-        return;
-    }
-    const config = await getJson("/api/config");
-    state.config = config;
-    saveLocalConfig(config);
-    renderConfig();
-}
-
-async function loadStatus() {
-    if (state.localOnly) {
-        state.status = fallbackStatus;
-        renderStatus();
-        return;
-    }
-    const status = await getJson("/api/status");
-    state.status = status;
-    renderStatus();
-}
-
-async function loadControl() {
-    if (state.localOnly) {
-        state.control = { running: false, mode: null, pid: null, command: "" };
-        renderControl();
-        return;
-    }
-    state.control = await getJson("/api/control/status");
-    renderControl();
-}
-
-function saveLocalConfig(config) {
-    try {
-        localStorage.setItem("lendingbot-config", JSON.stringify(config));
-    } catch (error) {
-        return;
-    }
-}
-
-function loadLocalConfig() {
-    try {
-        const saved = JSON.parse(localStorage.getItem("lendingbot-config") || "null");
-        return saved || fallbackConfig;
-    } catch (error) {
-        return fallbackConfig;
-    }
-}
-
-function renderConfig() {
-    const config = state.config || fallbackConfig;
-    $("configPath").textContent = config.configPath || "default.cfg";
-    $("credentialStatus").textContent = config.credentialsConfigured ? "已配置" : "未配置";
-    const bot = config.bot || {};
-    const bitfinex = config.bitfinex || {};
-    const form = $("strategyForm");
-    form.elements.currencies.value = bitfinex.currencies || "USD,UST";
-    for (const name of formFieldNames) {
-        if (name === "currencies") continue;
-        const element = form.elements[name];
-        if (element) {
-            if (element.type === "checkbox") {
-                element.checked = String(bot[name] ?? "false").toLowerCase() === "true";
-            } else {
-                element.value = bot[name] ?? "";
-            }
-        }
-    }
-    $("feeLabel").textContent = `${bot.platformfeerate || 15}% 平台费模型`;
-    updateCommand();
-}
-
-function renderStatus() {
-    const status = state.status || fallbackStatus;
-    const rawData = status.raw_data || {};
-    const currencies = Object.keys(rawData);
-    $("statusText").textContent = translateBotText(status.last_status || "等待机器人状态");
-    $("lastUpdate").textContent = status.last_update ? `最近更新 ${status.last_update}` : "暂无更新时间";
-    $("logCount").textContent = `${(status.log || []).length} 条记录`;
-
-    let totalCoins = 0;
-    let totalLent = 0;
-    let weightedRate = 0;
-    for (const currency of currencies) {
-        const item = rawData[currency] || {};
-        const total = numberValue(item.totalCoins);
-        const lent = numberValue(item.lentSum);
-        const rate = numberValue(item.averageLendingRate);
-        totalCoins += total;
-        totalLent += lent;
-        weightedRate += lent * rate;
-    }
-    const avgRate = totalLent > 0 ? weightedRate / totalLent : 0;
-    $("totalCoins").textContent = formatNumber(totalCoins, 4);
-    $("totalLent").textContent = formatNumber(totalLent, 4);
-    $("currencyCount").textContent = `${currencies.length} 个币种`;
-    $("lentRatio").textContent = `${formatNumber(totalCoins > 0 ? (totalLent / totalCoins) * 100 : 0, 2)}%`;
-    $("averageRate").textContent = `${formatNumber(avgRate, 5)}%`;
-    renderEarnings(status.earnings || fallbackStatus.earnings);
-    renderCoins(rawData);
-    renderLogs(status.log || []);
-}
-
-function renderEarnings(earnings) {
-    const available = Boolean(earnings?.available);
-    const currency = earnings?.summaryCurrency || "USD/UST";
-    $("earningsCurrency").textContent = `${currency} 已入账`;
-    if (!available) {
-        $("earningsToday").textContent = "暂无数据";
-        $("earningsSevenDays").textContent = "暂无数据";
-        $("earningsThirtyDays").textContent = "暂无数据";
-        $("earningsApy").textContent = "暂无数据";
-        $("idleRatio").textContent = "暂无数据";
-        return;
-    }
-    $("earningsToday").textContent = `${formatNumber(earnings.today, 8)} ${currency}`;
-    $("earningsSevenDays").textContent = `${formatNumber(earnings.sevenDays, 8)} ${currency}`;
-    $("earningsThirtyDays").textContent = `${formatNumber(earnings.thirtyDays, 8)} ${currency}`;
-    $("earningsApy").textContent = `${formatNumber(earnings.thirtyDayApy, 2)}%`;
-    $("idleRatio").textContent = `${formatNumber(earnings.idleRatio, 2)}%`;
-}
-
-function renderControl() {
-    const control = state.control || { running: false };
-    const button = $("startBotButton");
-    const label = button.querySelector("span");
-    const status = $("botProcessStatus");
-    button.classList.toggle("running", Boolean(control.running));
-    button.disabled = state.localOnly;
-    if (control.running) {
-        status.textContent = `运行中 ${modeLabel(control.mode)}，PID ${control.pid}`;
-        label.textContent = "停止机器人";
-        button.querySelector("svg path").setAttribute("d", "M7 7h10v10H7z");
-    } else {
-        status.textContent = control.stopReason === "stopped_by_dashboard"
-            ? "已由控制台停止"
-            : control.returnCode === null || control.returnCode === undefined
-            ? "已停止"
-            : `已停止，退出码 ${control.returnCode}`;
-        label.textContent = state.mode === "live" ? "启动实盘" : "启动模拟";
-        button.querySelector("svg path").setAttribute("d", "M8 5v14l11-7z");
-    }
-}
-
-function renderCoins(rawData) {
-    const list = $("coinList");
-    list.innerHTML = "";
-    const currencies = Object.keys(rawData || {});
-    if (!currencies.length) {
-        list.innerHTML = '<div class="empty-state">还没有资金钱包数据。</div>';
-        return;
-    }
-    for (const currency of currencies.sort()) {
-        const data = rawData[currency] || {};
-        const total = numberValue(data.totalCoins);
-        const lent = numberValue(data.lentSum);
-        const maxToLend = numberValue(data.maxToLend || total);
-        const avgRate = numberValue(data.averageLendingRate);
-        const marketRate = numberValue(data.marketDailyRate);
-        const smartRate = numberValue(data.smartDailyRate);
-        const strategyMode = data.strategyMode === "smart" ? "智能策略" : "固定策略";
-        const openOfferCount = numberValue(data.openOfferCount);
-        const staleOfferCount = numberValue(data.staleOfferCount);
-        const openOfferSum = numberValue(data.openOfferSum);
-        const progress = total > 0 ? Math.min(100, Math.max(0, (lent / total) * 100)) : 0;
-        const row = document.createElement("article");
-        row.className = "coin-row";
-        row.innerHTML = `
-            <div class="coin-code">${escapeHtml(currency)}</div>
-            <div>
-                <div class="coin-progress"><span style="width:${progress}%"></span></div>
-                <div class="coin-meta">已放贷 ${formatNumber(lent, 4)} / ${formatNumber(total, 4)}，可放贷上限 ${formatNumber(maxToLend, 4)}</div>
-                <div class="coin-meta">${strategyMode} · 市场 ${formatNumber(marketRate, 5)}% · 底价 ${formatNumber(smartRate, 5)}%</div>
-                <div class="coin-meta">等待挂单 ${formatNumber(openOfferSum, 4)}，新挂单 ${openOfferCount} 个，超时重定价 ${staleOfferCount} 个</div>
-            </div>
-            <div class="coin-stat"><span>日利率</span><strong>${formatNumber(avgRate, 5)}%</strong></div>
-            <div class="coin-stat"><span>已放贷</span><strong>${formatNumber(progress, 2)}%</strong></div>
-        `;
-        list.appendChild(row);
-    }
-}
-
-function renderLogs(logs) {
-    const stream = $("logStream");
-    const filter = $("logFilter").value.trim().toLowerCase();
-    const filtered = logs
-        .slice()
-        .reverse()
-        .filter((line) => !filter || String(line).toLowerCase().includes(filter))
-        .slice(0, 160);
-    stream.innerHTML = "";
-    if (!filtered.length) {
-        stream.innerHTML = '<div class="empty-state">没有匹配的日志。</div>';
-        return;
-    }
-    for (const line of filtered) {
-        const item = document.createElement("div");
-        item.className = "log-line";
-        item.textContent = translateBotText(line);
-        stream.appendChild(item);
-    }
-}
-
-function numberValue(value) {
+function safeNumber(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : 0;
 }
 
-function formatNumber(value, decimals) {
-    return numberValue(value).toLocaleString(undefined, {
-        minimumFractionDigits: decimals,
-        maximumFractionDigits: decimals,
+function formatAmount(value, digits = 2) {
+    const number = safeNumber(value);
+    return number.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function formatPercent(value, digits = 4) {
+    if (value === null || value === undefined || value === "") return "--";
+    return `${formatAmount(value, digits)}%`;
+}
+
+function apiError(response, data) {
+    if (!response.ok || data?.ok === false) throw new Error(data?.error || `请求失败（${response.status}）`);
+    return data;
+}
+
+async function getJson(url) {
+    const response = await fetch(url, { cache: "no-store" });
+    return apiError(response, await response.json());
+}
+
+async function postJson(url, payload = {}) {
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
     });
+    return apiError(response, await response.json());
 }
 
-function escapeHtml(value) {
-    return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;");
+function setConnection(connected) {
+    const chip = $("connectionChip");
+    chip.classList.toggle("offline", !connected);
+    chip.querySelector("span").textContent = connected ? "本地已连接" : "连接中断";
 }
 
-function translateBotText(value) {
-    let text = String(value || "");
-    const replacements = [
-        [/No botlog\.json yet/g, "还没有 botlog.json"],
-        [/Lended:/g, "已放贷："],
-        [/No Bitfinex API credentials configured; using simulated dry-run balances\./g, "没有配置 Bitfinex API 密钥，正在使用模拟余额运行。"],
-        [/dry-run mode: no Bitfinex write endpoints will be called/g, "模拟运行模式：不会调用 Bitfinex 写入接口"],
-        [/dashboard mode: bot will start only after pressing the web start button/g, "控制台模式：点击网页启动按钮后才会启动机器人"],
-        [/Welcome to Bitfinex Lending Bot \(DRY-RUN\)/g, "欢迎使用 Bitfinex 自动放贷机器人（模拟运行）"],
-        [/Welcome to Bitfinex Lending Bot \(LIVE\)/g, "欢迎使用 Bitfinex 自动放贷机器人（实盘运行）"],
-        [/Bitfinex API key\/secret are required for --live/g, "实盘模式需要配置 Bitfinex API key/secret"],
-        [/Started WebServer at/g, "网页控制台已启动："],
-        [/Failed to start WebServer:/g, "网页控制台启动失败："],
-        [/Stopping WebServer/g, "正在停止网页控制台"],
-        [/Failed to stop WebServer:/g, "停止网页控制台失败："],
-        [/ERROR:/g, "错误："],
-        [/\bbye\b/g, "已退出"],
-        [/dry-run: skipping configured wallet transfers/g, "模拟运行：跳过已配置的钱包自动转入。"],
-        [/The handshake operation timed out/g, "握手操作超时"],
-    ];
-    for (const [pattern, replacement] of replacements) {
-        text = text.replace(pattern, replacement);
+let toastTimer;
+function showToast(message) {
+    const toast = $("toast");
+    toast.textContent = message;
+    toast.classList.add("visible");
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
+}
+
+function activeRoute() {
+    const route = (location.hash || "#overview").slice(1);
+    return ["overview", "strategy", "logs"].includes(route) ? route : "overview";
+}
+
+function renderRoute() {
+    const route = activeRoute();
+    for (const name of ["overview", "strategy", "logs"]) {
+        const tab = $(`${name}Tab`);
+        const panel = $(`${name}Panel`);
+        const selected = name === route;
+        tab.setAttribute("aria-selected", String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+        panel.hidden = !selected;
     }
-    text = text.replace(
-        /Placing ([0-9.]+) ([A-Z]+) at ([0-9.]+)% for ([0-9]+) days\.\.\. dry-run/g,
-        "挂出 $1 $2，日利率 $3%，周期 $4 天，模拟运行"
-    );
-    text = text.replace(
-        /Canceling all ([A-Z]+) offers\.\.\. dry-run, would cancel ([0-9.]+)/g,
-        "取消所有 $1 挂单，模拟运行，将取消 $2"
-    );
-    text = text.replace(
-        /dry-run, would reprice ([0-9]+) stale offers totaling ([0-9.]+)/g,
-        "模拟运行，将重定价 $1 个超时挂单，合计 $2"
-    );
-    text = text.replace(
-        /The lower rate found on ([A-Z]+) is ([0-9.]+)% vs conditional rate ([0-9.]+)%\. Lending ([0-9.]+) of ([0-9.]+) available\./g,
-        "$1 当前低利率为 $2%，条件利率为 $3%。将在可用 $5 中放贷 $4。"
-    );
-    text = text.replace(
-        /Error fetching public funding book for ([A-Z]+):/g,
-        "读取 $1 公共资金盘口失败："
-    );
-    text = text.replace(
-        /Error fetching active funding offers for ([A-Z]+):/g,
-        "读取 $1 当前挂单失败："
-    );
-    text = text.replace(
-        /Error fetching active funding (loans|credits) for ([A-Z]+):/g,
-        "读取 $2 已放贷资金失败（$1）："
-    );
-    text = text.replace(
-        /([A-Z]+) disabled in coinconfig; skipping\./g,
-        "$1 已在 coinconfig 中禁用，跳过。"
-    );
-    text = text.replace(
-        /([A-Z]+): available ([0-9.]+) is below minimum offer ([0-9.]+); skipping\./g,
-        "$1：可放贷 $2 低于最小挂单金额 $3，跳过。"
-    );
-    return text;
+    if (route === "overview") window.requestAnimationFrame(drawDistribution);
 }
 
-function collectFormConfig() {
-    const form = $("strategyForm");
-    const bot = {};
-    for (const name of formFieldNames) {
-        if (name === "currencies") continue;
-        const element = form.elements[name];
-        if (element) {
-            bot[name] = element.type === "checkbox" ? String(element.checked) : element.value.trim();
-        }
-    }
-    bot.jsonfile = "www/botlog.json";
-    bot.jsonlogsize = "200";
-    bot.startwebserver = "true";
+function navigateTabs(event) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const tabs = [...document.querySelectorAll('.tabs [role="tab"]')];
+    const current = tabs.indexOf(document.activeElement);
+    if (current < 0) return;
+    event.preventDefault();
+    let target = current;
+    if (event.key === 'Home') target = 0;
+    else if (event.key === 'End') target = tabs.length - 1;
+    else if (event.key === 'ArrowLeft') target = (current - 1 + tabs.length) % tabs.length;
+    else target = (current + 1) % tabs.length;
+    tabs[target].focus();
+    tabs[target].click();
+}
+
+function statusMode(status = state.status || {}) {
+    return String(status.operationMode || status.runtime?.mode || "PAUSED").toUpperCase();
+}
+
+function statusAge(status = state.status || {}) {
+    if (!status.last_update) return Infinity;
+    const parsed = Date.parse(String(status.last_update).replace(" ", "T"));
+    return Number.isFinite(parsed) ? Math.max(0, Date.now() - parsed) : Infinity;
+}
+
+function statusIsStale(status = state.status || {}) {
+    return statusAge(status) > 180000;
+}
+
+function normalizedOffer(offer) {
+    const rate = offer.dailyRatePercent ?? (offer.rate == null ? null : safeNumber(offer.rate) * 100);
     return {
-        bitfinex: {
-            currencies: form.elements.currencies.value.trim().toUpperCase(),
-        },
-        bot,
+        ...offer,
+        dailyRatePercent: rate,
+        offerType: offer.offerType || offer.offer_type || offer.rate_type || "LIMIT",
+        managedByBot: offer.managedByBot ?? Boolean(offer.managed),
+        bucket: offer.bucket || [offer.pool, offer.layer].filter(Boolean).join(" · "),
+        created: offer.created || offer.mts_created,
     };
 }
 
-async function saveStrategy(event) {
-    event.preventDefault();
-    await persistStrategy(false);
+function distributionValues() {
+    const account = state.status?.account || {};
+    return [
+        { label: "已放贷", value: safeNumber(account.credits), color: "#069a91" },
+        { label: "活跃挂单", value: safeNumber(account.offers), color: "#83cdbf" },
+        { label: "可用余额", value: safeNumber(account.wallet), color: "#669aa4" },
+    ];
 }
 
-async function persistStrategy(silent) {
-    const message = $("formMessage");
-    message.classList.remove("error");
-    if (!silent) message.textContent = "正在保存...";
-    const payload = collectFormConfig();
-    try {
-        if (state.localOnly) {
-            state.config = { ...(state.config || fallbackConfig), ...payload };
-            saveLocalConfig(state.config);
-        } else {
-            const saved = await postJson("/api/config", payload);
-            state.config = saved.config;
-        }
-        renderConfig();
-        if (!silent) {
-            message.textContent = "已保存。";
-            showToast("策略已保存");
-        }
-        return true;
-    } catch (error) {
-        message.classList.add("error");
-        message.textContent = error.message;
-        showToast("保存失败");
-        return false;
-    }
-}
-
-async function toggleBotProcess() {
-    const button = $("startBotButton");
-    button.disabled = true;
-    try {
-        if (state.control?.running) {
-            const stopped = await postJson("/api/control/stop", {});
-            state.control = stopped.bot;
-            renderControl();
-            showToast("机器人已停止");
-            await loadStatus();
-            return;
-        }
-
-        if (state.mode === "live" && !$("ackLive").checked) {
-            showToast("请先确认 Bitfinex 权限");
-            return;
-        }
-        const saved = await persistStrategy(true);
-        if (!saved) return;
-        const started = await postJson("/api/control/start", {
-            mode: state.mode,
-            confirmLive: $("ackLive").checked,
-        });
-        state.control = started.bot;
-        renderControl();
-        showToast(state.mode === "live" ? "实盘机器人已启动" : "模拟机器人已启动");
-        await loadStatus();
-    } catch (error) {
-        showToast(error.message);
-    } finally {
-        button.disabled = state.localOnly;
-        renderControl();
-    }
-}
-
-function configSnippet() {
-    const payload = collectFormConfig();
-    const bot = payload.bot;
-    return `[BITFINEX]
-currencies = ${payload.bitfinex.currencies}
-
-[BOT]
-sleeptimeactive = ${bot.sleeptimeactive}
-sleeptimeinactive = ${bot.sleeptimeinactive}
-mindailyrate = ${bot.mindailyrate}
-maxdailyrate = ${bot.maxdailyrate}
-spreadlend = ${bot.spreadlend}
-gapbottom = ${bot.gapbottom}
-gaptop = ${bot.gaptop}
-smartstrategy = ${bot.smartstrategy}
-smartrateoffset = ${bot.smartrateoffset}
-smartfastdepth = ${bot.smartfastdepth}
-smartbalanceddepth = ${bot.smartbalanceddepth}
-smartopportunitydepth = ${bot.smartopportunitydepth}
-smartopportunitypremium = ${bot.smartopportunitypremium}
-repricestaleoffers = ${bot.repricestaleoffers}
-repriceafterminutes = ${bot.repriceafterminutes}
-xdaythreshold = ${bot.xdaythreshold}
-xdays = ${bot.xdays}
-minloansize = ${bot.minloansize}
-platformfeerate = ${bot.platformfeerate}
-outputCurrency = ${bot.outputcurrency}
-jsonfile = ${bot.jsonfile}
-jsonlogsize = ${bot.jsonlogsize}
-startWebServer = ${bot.startwebserver}`;
-}
-
-function updateCommand() {
-    const config = state.config || fallbackConfig;
-    const modeFlag = state.mode === "live" ? "--live" : "--dryrun";
-    const pieces = ["python", "lendingbot.py", modeFlag];
-    if ($("commandServer").checked) pieces.push("--server");
-    if ($("commandJson").checked) pieces.push("--json", config.bot?.jsonfile || "www/botlog.json", "--jsonsize", config.bot?.jsonlogsize || "200");
-    if ($("commandOnce").checked) pieces.push("--once");
-    $("commandOutput").textContent = pieces.join(" ");
-}
-
-async function copyText(text, label) {
-    try {
-        await navigator.clipboard.writeText(text);
-        showToast(`${label}已复制`);
+function drawDistribution() {
+    const canvas = $("distributionChart");
+    if (!canvas || canvas.offsetParent === null) return;
+    const size = canvas.clientWidth || 232;
+    const ratio = Math.max(1, window.devicePixelRatio || 1);
+    canvas.width = Math.round(size * ratio);
+    canvas.height = Math.round(size * ratio);
+    const context = canvas.getContext("2d");
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, size, size);
+    const values = distributionValues();
+    const total = values.reduce((sum, item) => sum + item.value, 0);
+    const radius = size * .39;
+    const lineWidth = size * .115;
+    context.lineWidth = lineWidth;
+    context.lineCap = "butt";
+    if (total <= 0) {
+        context.beginPath();
+        context.strokeStyle = "#dce6e4";
+        context.arc(size / 2, size / 2, radius, 0, Math.PI * 2);
+        context.stroke();
         return;
-    } catch (error) {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        textarea.select();
-        const copied = document.execCommand("copy");
-        document.body.removeChild(textarea);
-        showToast(copied ? `${label}已复制` : `请手动复制${label}`);
+    }
+    let start = -Math.PI / 2;
+    for (const item of values) {
+        if (item.value <= 0) continue;
+        const end = start + (item.value / total) * Math.PI * 2;
+        context.beginPath();
+        context.strokeStyle = item.color;
+        context.arc(size / 2, size / 2, radius, start, end);
+        context.stroke();
+        start = end;
     }
 }
 
-async function refreshAll() {
+function renderLegend(values, total) {
+    const container = $("distributionLegend");
+    container.replaceChildren();
+    for (const item of values) {
+        const row = document.createElement("div");
+        row.className = "legend-row";
+        const swatch = document.createElement("i");
+        swatch.className = "legend-swatch";
+        swatch.style.setProperty("--legend-color", item.color);
+        const label = document.createElement("span");
+        label.textContent = item.label;
+        const amount = document.createElement("strong");
+        const percent = total > 0 ? ` · ${formatAmount(item.value / total * 100, 1)}%` : "";
+        amount.textContent = `${formatAmount(item.value)}${percent}`;
+        row.append(swatch, label, amount);
+        container.append(row);
+    }
+}
+
+function ageLabel(created) {
+    const milliseconds = Date.now() - safeNumber(created);
+    if (!created || milliseconds < 0) return "--";
+    const minutes = Math.floor(milliseconds / 60000);
+    if (minutes < 60) return `${minutes} 分钟`;
+    const hours = Math.floor(minutes / 60);
+    return hours < 24 ? `${hours} 小时` : `${Math.floor(hours / 24)} 天`;
+}
+
+function appendCell(row, text, className = "") {
+    const cell = document.createElement("td");
+    if (className) {
+        const span = document.createElement("span");
+        span.className = className;
+        span.textContent = text;
+        cell.append(span);
+    } else {
+        cell.textContent = text;
+    }
+    row.append(cell);
+}
+
+function renderOffers() {
+    const offers = Array.isArray(state.status?.openOffers) ? state.status.openOffers.map(normalizedOffer) : [];
+    const table = $("offersTable");
+    const cards = $("offersCards");
+    table.replaceChildren();
+    cards.replaceChildren();
+    $("offersEmpty").hidden = offers.length > 0;
+    $("offersMeta").textContent = offers.length ? `${offers.length} 笔真实挂单` : "暂无挂单";
+    for (const offer of offers) {
+        const row = document.createElement("tr");
+        appendCell(row, offer.currency || "--", "currency-pill");
+        appendCell(row, formatAmount(offer.amount));
+        appendCell(row, formatPercent(offer.dailyRatePercent));
+        appendCell(row, `${offer.period || "--"} 天`);
+        appendCell(row, offer.offerType || "LIMIT");
+        appendCell(row, offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单");
+        appendCell(row, ageLabel(offer.created));
+        appendCell(row, offer.status || "ACTIVE", "status-pill");
+        table.append(row);
+
+        const card = document.createElement("article");
+        card.className = "offer-card";
+        const header = document.createElement("header");
+        const currency = document.createElement("span");
+        currency.className = "currency-pill";
+        currency.textContent = offer.currency || "--";
+        const status = document.createElement("span");
+        status.className = "status-pill";
+        status.textContent = offer.status || "ACTIVE";
+        header.append(currency, status);
+        const list = document.createElement("dl");
+        for (const [label, value] of [["金额", formatAmount(offer.amount)], ["日利率", formatPercent(offer.dailyRatePercent)], ["周期", `${offer.period || "--"} 天`], ["类型", offer.offerType || "LIMIT"], ["归属", offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单"], ["等待", ageLabel(offer.created)]]) {
+            const block = document.createElement("div");
+            const term = document.createElement("dt");
+            const detail = document.createElement("dd");
+            term.textContent = label;
+            detail.textContent = value;
+            block.append(term, detail);
+            list.append(block);
+        }
+        card.append(header, list);
+        cards.append(card);
+    }
+}
+
+function renderStatus() {
+    const status = state.status || {};
+    const valid = status.schemaVersion === 3 && !status.legacyIgnored && Boolean(status.last_update);
+    const stale = valid && statusIsStale(status);
+    const mode = statusMode(status);
+    const account = valid ? status.account || {} : {};
+    const total = safeNumber(account.total);
+    const lent = safeNumber(account.credits);
+    const offers = safeNumber(account.offers);
+    const available = safeNumber(account.wallet);
+    const statistics = valid ? status.statistics || {} : {};
+    const realized = valid ? status.realizedIncome || {} : {};
+    const incomeSync = valid ? status.incomeHistorySync || {} : {};
+    const currency = status.strategyV3?.currency || status.outputCurrency?.currency || "USD";
+
+    $("totalCoins").textContent = valid ? formatAmount(total) : "--";
+    $("totalLent").textContent = valid ? formatAmount(lent) : "--";
+    $("totalOffers").textContent = valid ? formatAmount(offers) : "--";
+    $("totalAvailable").textContent = valid ? formatAmount(available) : "--";
+    $("earningsToday").textContent = realized.today != null
+        ? formatAmount(realized.today)
+        : (statistics["1d"] ? formatAmount(statistics["1d"].netInterest) : "--");
+    $("earningsThirtyDays").textContent = realized.thirtyDays != null
+        ? formatAmount(realized.thirtyDays)
+        : (statistics["30d"] ? formatAmount(statistics["30d"].netInterest) : "--");
+    $("earningsLifetime").textContent = realized.lifetime != null ? formatAmount(realized.lifetime) : "--";
+    $("earningsApy").textContent = statistics["30d"] ? formatPercent(statistics["30d"].actualNetAprPercent, 2) : "--";
+    const earliestIncomeDate = incomeSync.earliestMts
+        ? new Date(Number(incomeSync.earliestMts)).toLocaleDateString("zh-CN")
+        : "尚无记录";
+    const incomeState = $("incomeHistoryState");
+    if (incomeSync.status === "COMPLETE") {
+        incomeState.textContent = "USD · 全部历史真实入账";
+        incomeState.title = earliestIncomeDate === "尚无记录" ? "未发现利息入账" : `已覆盖至 ${earliestIncomeDate}`;
+    } else if (incomeSync.status === "ERROR") {
+        incomeState.textContent = "USD · 同步警告 · 已保留结果";
+        incomeState.title = incomeSync.error || "历史收益将在后台自动重试";
+    } else {
+        incomeState.textContent = `USD · 同步中 · 已覆盖至 ${earliestIncomeDate}`;
+        incomeState.title = "正在后台向更早历史回填，不影响实盘交易";
+    }
+    incomeState.classList.toggle("income-warning", incomeSync.status === "ERROR");
+    $("totalCurrency").textContent = currency;
+    $("offerCount").textContent = `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
+    $("chartTotal").textContent = valid ? formatAmount(total) : "--";
+    const safeReason = status.runtime?.safe_reason;
+    $("statusHeadline").textContent = stale
+        ? "状态已过期，请检查实盘进程或网络。"
+        : (mode === "SAFE" ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}` : (status.last_status || "实盘状态已同步。"));
+    $("headerSync").textContent = status.last_update || "--";
+    $("railSync").textContent = status.last_update || "--";
+
+    const badge = $("statusSchemaBadge");
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3 · ${mode}`);
+    badge.classList.toggle("invalid", !valid || stale || mode === "SAFE");
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3 · 已过期" : `V3 · ${mode}`);
+
+    const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
+    const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
+    const plannedAmount = plan.reduce((sum, row) => sum + safeNumber(row.amount), 0);
+    const strategy = plannedAmount > 0
+        ? plan.reduce((sum, row) => sum + safeNumber(row.effective_rate) * safeNumber(row.amount), 0) / plannedAmount * 100
+        : null;
+    $("marketRate").textContent = market === null ? "--" : formatPercent(market);
+    $("strategyRate").textContent = strategy === null ? "--" : formatPercent(strategy);
+    $("rateSpread").textContent = market === null || strategy === null ? "--" : formatPercent(Math.max(0, strategy - market));
+
+    const values = distributionValues();
+    renderLegend(values, total);
+    renderOffers();
+    renderLogs(status.log || []);
+    drawDistribution();
+}
+
+function renderLogs(lines) {
+    const filter = ($("logFilter").value || "").trim().toLowerCase();
+    const visible = (Array.isArray(lines) ? lines : []).filter((line) => String(line).toLowerCase().includes(filter));
+    const stream = $("logStream");
+    stream.replaceChildren();
+    if (!visible.length) {
+        const empty = document.createElement("p");
+        empty.className = "log-empty";
+        empty.textContent = filter ? "没有匹配的日志" : "暂无运行日志";
+        stream.append(empty);
+        return;
+    }
+    for (const line of visible) {
+        const item = document.createElement("div");
+        item.className = "log-line";
+        item.textContent = String(line);
+        stream.append(item);
+    }
+}
+
+function renderControl() {
+    const control = state.control || {};
+    const running = Boolean(control.running);
+    const rail = document.querySelector(".control-rail");
+    rail.classList.toggle("running", running);
+    const mode = statusMode();
+    const stale = state.status?.last_update ? statusIsStale() : false;
+    $("controlTitle").textContent = running ? (mode === "SAFE" ? "SAFE 安全暂停" : (stale ? "进程运行 · 状态过期" : "运行中")) : "已停止";
+    $("controlDetail").textContent = running
+        ? `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`
+        : "普通启动不会下单。启动实盘前必须完成只读安全预检。";
+    $("primaryControlButton").textContent = running ? "停止机器人" : "启动实盘";
+    $("credentialState").textContent = state.config?.credentialsConfigured ? "已配置" : "未配置";
+    $("permissionState").textContent = running
+        ? "启动前已通过"
+        : (state.preflight ? (state.preflight.canStart ? "预检通过" : "存在阻断项") : "待预检");
+    $("preflightButton").disabled = running;
+}
+
+function renderConfig() {
+    renderControl();
+}
+
+async function loadConfig() {
+    state.config = await getJson("/api/config");
+    renderConfig();
+}
+
+async function loadStatus() {
+    state.status = await getJson("/api/status");
+    renderStatus();
+}
+
+async function loadControl() {
+    state.control = await getJson("/api/control/status");
+    renderControl();
+}
+
+async function refreshAll(showMessage = false) {
     try {
         await Promise.all([loadConfig(), loadStatus(), loadControl()]);
-        setConnection(!state.localOnly, state.localOnly ? "文件模式" : "已连接");
+        setConnection(true);
+        $("railError").textContent = "";
+        if (showMessage) showToast("控制台已刷新");
     } catch (error) {
-        setConnection(false, "离线");
-        showToast(error.message);
-        if (!state.config) {
-            state.config = fallbackConfig;
-            renderConfig();
-        }
-        if (!state.status) {
-            state.status = fallbackStatus;
-            renderStatus();
-        }
+        setConnection(false);
+        $("railError").textContent = error.message;
+        if (showMessage) showToast(error.message);
+    }
+}
+
+function focusableElements(dialog) {
+    return [...dialog.querySelectorAll("button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex='-1'])")].filter((element) => !element.hidden);
+}
+
+function openDialog(backdropId) {
+    const backdrop = $(backdropId);
+    state.previousFocus = document.activeElement;
+    state.activeDialog = backdrop;
+    backdrop.hidden = false;
+    document.body.style.overflow = "hidden";
+    window.requestAnimationFrame(() => focusableElements(backdrop)[0]?.focus());
+}
+
+function closeDialog(backdrop = state.activeDialog) {
+    if (!backdrop) return;
+    backdrop.hidden = true;
+    state.activeDialog = null;
+    document.body.style.overflow = "";
+    state.previousFocus?.focus();
+}
+
+function trapDialogKey(event) {
+    if (!state.activeDialog) return;
+    if (event.key === "Escape") {
+        event.preventDefault();
+        closeDialog();
+        return;
+    }
+    if (event.key !== "Tab") return;
+    const items = focusableElements(state.activeDialog);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+}
+
+function renderPreflight(data) {
+    $("preflightLoading").hidden = true;
+    $("preflightContent").hidden = false;
+    const checks = $("preflightChecks");
+    checks.replaceChildren();
+    for (const check of data.checks || []) {
+        const item = document.createElement("li");
+        item.className = check.status === "pass" ? "passed" : "failed";
+        const marker = document.createElement("b");
+        marker.textContent = check.status === "pass" ? "通过" : "阻断";
+        const copy = document.createElement("div");
+        const label = document.createElement("span");
+        const detail = document.createElement("small");
+        label.textContent = check.label;
+        detail.textContent = check.detail;
+        copy.append(label, detail);
+        item.append(marker, copy);
+        checks.append(item);
+    }
+    const warnings = $("preflightWarnings");
+    warnings.replaceChildren();
+    for (const warning of data.warnings || []) {
+        const item = document.createElement("li");
+        item.textContent = warning.message;
+        warnings.append(item);
+    }
+    $("warningSection").hidden = !warnings.childElementCount;
+
+    const summary = data.summary || {};
+    if (summary.strategyVersion !== 3) {
+        throw new Error("后端返回了非 V3 预检，已阻断启动");
+    }
+    const items = [
+        ["币种", "USD"],
+        ["策略来源", `SQLite ACTIVE · ${summary.activeStrategyVersion || "--"}`],
+        ["真实账户本金", `${formatAmount(summary.account?.total)} USD`],
+        ["真实可用余额", `${formatAmount(summary.account?.wallet)} USD`],
+        ["允许订单类型", (summary.enabledOrderTypes || []).join(" / ") || "--"],
+        ["期限资金池", Object.entries(summary.fundingPools || {}).map(([name, row]) => `${name} ${row.share}%`).join(" / ") || "--"],
+        ["成交层", Object.entries(summary.executionLayers || {}).map(([name, value]) => `${name} ${value}%`).join(" / ") || "--"],
+        ["资金上限", `${formatAmount(summary.fundingLimit?.effectiveCap)} USD · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
+        ["切片", `${summary.actualSlices ?? 0} / ${summary.targetSlices ?? 0} 笔`],
+        ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
+        ["启动后先撤销", `${(summary.pendingCancellations || []).length} 笔不兼容机器人挂单`],
+        ["无法撤销的贷款", `${(summary.nonChangeableCredits || []).length} 笔`],
+        ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
+    ];
+    const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
+    items.push(["实际 V3 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    if (data.preflightId) {
+        const expires = new Date(data.expiresAt);
+        items.push(["本地启动确认有效至", Number.isNaN(expires.getTime()) ? data.expiresAt : `${expires.toLocaleTimeString("zh-CN", { hour12: false })}（最长 5 分钟，不是 Bitfinex API 令牌）`]);
+    }
+    const container = $("preflightSummary");
+    container.replaceChildren();
+    for (const [label, value] of items) {
+        const block = document.createElement("div");
+        block.className = "summary-item";
+        const name = document.createElement("span");
+        const detail = document.createElement("strong");
+        name.textContent = label;
+        detail.textContent = value;
+        block.append(name, detail);
+        container.append(block);
+    }
+    $("confirmStartButton").disabled = !data.canStart;
+    $("goStrategyButton").hidden = data.canStart;
+    $("goStrategyButton").textContent = "前往策略设置";
+    $("goStrategyButton").dataset.action = "strategy";
+    $("permissionState").textContent = data.canStart ? "预检通过" : "存在阻断项";
+}
+
+async function runPreflight() {
+    if (state.control?.running) return;
+    state.preflight = null;
+    $("preflightError").hidden = true;
+    $("preflightError").textContent = "";
+    $("preflightLoading").hidden = false;
+    $("preflightContent").hidden = true;
+    $("confirmStartButton").disabled = true;
+    $("goStrategyButton").hidden = true;
+    openDialog("preflightDialog");
+    try {
+        const data = await postJson("/api/control/preflight", {});
+        state.preflight = data;
+        renderPreflight(data);
+    } catch (error) {
+        $("preflightLoading").hidden = true;
+        $("preflightError").hidden = false;
+        $("preflightError").textContent = error.message;
+    }
+}
+
+async function confirmStart() {
+    const button = $("confirmStartButton");
+    const errorBox = $("preflightError");
+    button.disabled = true;
+    errorBox.hidden = true;
+    try {
+        const data = await postJson("/api/control/start", { preflightId: state.preflight?.preflightId || "" });
+        state.control = data.bot;
+        closeDialog($("preflightDialog"));
+        renderControl();
+        await loadStatus();
+        showToast("实盘机器人已启动");
+    } catch (error) {
+        errorBox.hidden = false;
+        errorBox.textContent = `${error.message}。请修正后重新运行预检。`;
+        $("goStrategyButton").hidden = false;
+        $("goStrategyButton").textContent = "重新运行预检";
+        $("goStrategyButton").dataset.action = "retry";
+    }
+}
+
+async function confirmStop() {
+    const button = $("confirmStopButton");
+    const errorBox = $("stopError");
+    button.disabled = true;
+    errorBox.hidden = true;
+    try {
+        const data = await postJson("/api/control/stop", {});
+        state.control = data.bot;
+        closeDialog($("stopDialog"));
+        renderControl();
+        showToast("机器人进程已停止；账户已有挂单未撤销");
+    } catch (error) {
+        errorBox.hidden = false;
+        errorBox.textContent = error.message;
+    } finally {
+        button.disabled = false;
+    }
+}
+
+function primaryControl() {
+    if (state.control?.running) {
+        $("stopError").hidden = true;
+        openDialog("stopDialog");
+    } else {
+        runPreflight();
     }
 }
 
 function bindEvents() {
-    $("refreshButton").addEventListener("click", refreshAll);
-    $("reloadConfigButton").addEventListener("click", loadConfig);
-    $("strategyForm").addEventListener("submit", saveStrategy);
-    $("copyCommandButton").addEventListener("click", () => copyText($("commandOutput").textContent, "命令"));
-    $("copyConfigButton").addEventListener("click", () => copyText(configSnippet(), "配置"));
-    $("logFilter").addEventListener("input", () => renderLogs((state.status || fallbackStatus).log || []));
-    for (const id of ["commandServer", "commandJson", "commandOnce"]) {
-        $(id).addEventListener("change", updateCommand);
-    }
-    for (const button of document.querySelectorAll(".mode-option")) {
-        button.addEventListener("click", () => {
-            state.mode = button.dataset.mode;
-            document.querySelectorAll(".mode-option").forEach((item) => item.classList.toggle("active", item === button));
-            updateCommand();
-            renderControl();
-        });
-    }
-    $("startBotButton").addEventListener("click", toggleBotProcess);
-    $("ackLive").addEventListener("change", (event) => {
-        const liveButton = document.querySelector('.mode-option[data-mode="live"]');
-        liveButton.disabled = !event.target.checked;
-        if (state.mode === "live" && liveButton.disabled) {
-            document.querySelector('.mode-option[data-mode="dry"]').click();
-        }
+    window.addEventListener("hashchange", renderRoute);
+    window.addEventListener("resize", drawDistribution);
+    document.addEventListener("keydown", trapDialogKey);
+    document.querySelector(".tabs").addEventListener("keydown", navigateTabs);
+    $("refreshButton").addEventListener("click", () => refreshAll(true));
+    $("logFilter").addEventListener("input", () => renderLogs(state.status?.log || []));
+    $("primaryControlButton").addEventListener("click", primaryControl);
+    $("preflightButton").addEventListener("click", runPreflight);
+    $("confirmStartButton").addEventListener("click", confirmStart);
+    $("confirmStopButton").addEventListener("click", confirmStop);
+    $("goStrategyButton").addEventListener("click", () => {
+        const action = $("goStrategyButton").dataset.action;
+        closeDialog();
+        if (action === "retry") runPreflight();
+        else location.hash = "#strategy";
     });
-    document.querySelector('.mode-option[data-mode="live"]').disabled = true;
+    document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(button.closest(".dialog-backdrop"))));
+    document.querySelectorAll(".dialog-backdrop").forEach((backdrop) => backdrop.addEventListener("mousedown", (event) => { if (event.target === backdrop) closeDialog(backdrop); }));
 }
 
-bindEvents();
-refreshAll();
-window.setInterval(loadStatus, 30000);
-window.setInterval(loadControl, 5000);
+window.mikaBuildReady.then((compatible) => {
+    if (!compatible) return;
+    bindEvents();
+    renderRoute();
+    refreshAll();
+    window.setInterval(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false)), 30000);
+    window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
+});
+

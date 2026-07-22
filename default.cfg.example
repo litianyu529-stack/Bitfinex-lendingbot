@@ -3,10 +3,42 @@ apikey = YourBitfinexAPIKey
 secret = YourBitfinexSecret
 
 # Bitfinex funding currencies. UST is Bitfinex's USDT currency code.
-currencies = USD,UST
+currencies = USD
 
 [BOT]
-# The bot is dry-run by default. Use --live to place/cancel real offers.
+# The bot only runs when the command line explicitly includes --live.
+
+# Adaptive strategy v2. Existing configs without these fields use this profile in memory.
+strategyversion = 2
+strategyprofile = balanced_yield
+strategyautotypes = true
+strategyreplaywindow = 7d
+strategyfastshare = 50
+strategylongshare = 40
+strategyfastperiod = 2
+strategybalancedperiod = 7
+strategylongperiod = 60
+strategyfastwaitminutes = 10
+strategybalancedwaitminutes = 30
+strategylongwaitminutes = 120
+strategyrateoffset = 0.001
+strategylongpremium = 0.01
+strategyfastdepth = 5
+strategybalanceddepth = 150
+strategylongdepth = 300
+strategyfloordepth = 2
+strategytrendmindelta = 0.002
+strategyutilizationlow = 65
+strategyutilizationhigh = 85
+strategyrepriceminratedelta = 0.002
+strategyfastordertype = AUTO
+strategybalancedordertype = AUTO
+strategylongordertype = AUTO
+strategyfastfrroffset = 0
+strategybalancedfrroffset = 0
+strategylongfrroffset = 0
+managedofferstatefile = .state/managed-offers.json
+statedbfile = .state/lendingbot-v3.sqlite3
 
 # sleep between active iterations, time in seconds (1-3600)
 sleeptimeactive = 60
@@ -23,33 +55,12 @@ maxdailyrate = 2
 # number of offers to split the available funding balance across (1-20)
 spreadlend = 3
 
-# depth of funding offer book, as percent of lendable balance
-gapbottom = 10
-gaptop = 200
-
-# Smart strategy follows the live funding book instead of holding a fixed minimum rate.
-# It splits offers into quick-fill, balanced, and opportunistic repricing buckets.
-smartstrategy = true
-smartrateoffset = 0.001
-smartfastdepth = 5
-smartbalanceddepth = 150
-smartopportunitydepth = 300
-smartopportunitypremium = 0.01
-
-# Reprice stale active offers instead of canceling every offer each loop.
+# Strategy v2 reprices only robot-owned offers after each bucket's wait time.
 repricestaleoffers = true
-repriceafterminutes = 15
-
-# daily rate threshold after which offers use xdays instead of 2 days
-xdaythreshold = 0.2
-xdays = 60
 
 # Bitfinex minimum funding offer is about 150 USD equivalent.
 # For non-USD/UST currencies, set an explicit per-coin minloansize in coinconfig.
 minloansize = 150
-
-# Used only when dry-run has no real API credentials.
-dryrunbalance = 300
 
 # Standard Bitfinex funding provider fee. Hidden offers are higher.
 platformfeerate = 15
@@ -81,3 +92,61 @@ transferFromWallets = exchange,margin
 
 # Summary output currency for the web page.
 outputCurrency = USD
+
+[STRATEGY_V3]
+# USD-only strategy. These three values are net simple APR percentages.
+# They intentionally have no defaults; LIVE is blocked until all are positive.
+short_floor_apr =
+medium_floor_apr =
+long_floor_apr =
+
+# Portfolio pools and execution layers must each total 100.
+short_share = 50
+medium_share = 30
+long_share = 20
+quick_share = 40
+balanced_share = 40
+high_share = 20
+
+short_periods = 2,3,5,7
+medium_periods = 8,14,21,30
+long_periods = 120
+target_slices = 50
+min_order_amount = 150
+max_lend_amount =
+max_lend_percent = 100
+amount_jitter = 3
+max_pool_shift = 10
+
+# Official standard funding provider fees; adjust for account-specific discounts.
+normal_fee_rate = 15
+hidden_fee_rate = 18
+enable_limit = true
+enable_frr = true
+enable_frr_delta_fixed = true
+enable_frr_delta_variable = true
+variable_max_share = 10
+enable_hidden = false
+hidden_max_share =
+
+minimum_offer_minutes = 10
+reprice_cooldown_minutes = 15
+max_reprices_per_hour = 6
+minimum_rate_change = 0.002
+iqr_change_fraction = 0.25
+spike_volume_ratio = 1.5
+outlier_min_volume_share = 0.5
+ws_fallback_seconds = 300
+rest_stale_seconds = 60
+market_retention_days = 90
+
+score_net_yield = 45
+score_fill_probability = 15
+score_wait_time = 8
+score_book_depth = 5
+score_trade_speed = 4
+score_utilization = 3
+score_trend_volatility = 5
+score_term_opportunity = 5
+score_hidden_cost = 5
+score_variable_risk = 5
