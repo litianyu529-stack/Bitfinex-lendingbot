@@ -1,6 +1,22 @@
 # Bitfinex-lendingbot 0.3.0
 
+[![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
+[![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
+
 面向单台 Windows 电脑、单一 Bitfinex 账户的 USD Funding 自动放贷工具。项目只保留 V3 策略；Dashboard 默认 `PAUSED`，只有完成真实账户只读预检并人工确认后才会启动 LIVE Worker。
+
+> [!WARNING]
+> 本项目会在 Bitfinex 账户中执行真实资金操作，不承诺收益。首次使用请保持 Dashboard 为 `PAUSED`，核对 API 权限、资金上限和最低净 APR，并从小额资金开始。
+
+## 功能概览
+
+- 本地 Dashboard 管理策略、运行状态与人工确认，不向公网开放控制端口。
+- V3 短/中/长期限分层策略，提供资金上限、比例约束和最低净 APR 硬边界。
+- 对超时、断线和不确定交易结果执行停写、对账与安全恢复，避免盲目重复下单。
+- 使用 SQLite 保存归属、审计和恢复状态，并提供历史数据回填与离线策略评估。
+- Windows GitHub Actions 持续验证 Python、前端语法、安全流程和测试覆盖率。
 
 ## 安全边界
 
@@ -16,7 +32,9 @@
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
 
-## 安装
+## 快速开始
+
+运行环境：Windows、Python 3.12（CI 验证版本）和 Node.js 22（仅开发验证需要）。
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -80,7 +98,7 @@ python -m pip install -r requirements-dev.txt
 .\verify.ps1
 ```
 
-验证包括 Ruff、Python 编译、103+ 单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
+验证包括 Ruff、Python 编译、140 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
 
 ## 版本与文件
 
@@ -88,6 +106,7 @@ python -m pip install -r requirements-dev.txt
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`
+- 发布记录：[GitHub Releases](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
 - 运行架构：[docs/architecture.md](docs/architecture.md)
 - 异常处置：[docs/safety-recovery.md](docs/safety-recovery.md)
 - 策略证据标准：[docs/strategy-validation.md](docs/strategy-validation.md)
