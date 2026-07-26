@@ -4,12 +4,13 @@ import math
 import random
 import time
 from dataclasses import asdict, dataclass, replace
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 
 
 D = Decimal
 SATOSHI = D("0.00000001")
 RATE_TICK = D("0.0000001")
+RATE_COMPARISON_EPSILON = D("0.000000000000000001")
 POOLS = ("short", "medium", "long")
 LAYERS = ("quick", "balanced", "high")
 WINDOWS_MS = {
@@ -56,6 +57,18 @@ def _tuple_of_ints(value, fallback):
     return tuple(int(item) for item in value)
 
 
+def ceil_rate_tick(value):
+    value = D(value)
+    if value <= 0:
+        return D("0")
+    ticks = (value / RATE_TICK).to_integral_value(rounding=ROUND_CEILING)
+    return ticks * RATE_TICK
+
+
+def rate_below_floor(rate, floor):
+    return D(rate) + RATE_COMPARISON_EPSILON < D(floor)
+
+
 @dataclass(frozen=True)
 class StrategyPolicyV3:
     version: int = 3
@@ -86,11 +99,15 @@ class StrategyPolicyV3:
     enable_frr_delta_variable: bool = True
     variable_max_share: D = D("10")
     enable_hidden: bool = False
+    adopt_external_offers: bool = False
     hidden_max_share: D | None = None
     minimum_offer_minutes: int = 10
-    reprice_cooldown_minutes: int = 15
+    reprice_cooldown_minutes: int = 10
     max_reprices_per_hour: int = 6
     minimum_rate_change: D = D("0.00002")
+    short_reprice_stages_minutes: tuple[int, ...] = (10, 30, 60)
+    medium_reprice_stages_minutes: tuple[int, ...] = (20, 60, 120)
+    long_reprice_stages_minutes: tuple[int, ...] = (60, 180, 360)
     iqr_change_fraction: D = D("0.25")
     spike_volume_ratio: D = D("1.5")
     outlier_min_volume_share: D = D("0.005")
@@ -109,6 +126,9 @@ class StrategyPolicyV3:
 
     def layer_shares(self):
         return {layer: getattr(self, f"{layer}_share") for layer in LAYERS}
+
+    def reprice_stages(self, pool):
+        return getattr(self, f"{pool}_reprice_stages_minutes")
 
 
 V3_FIELD_CONVERTERS = {
@@ -140,11 +160,15 @@ V3_FIELD_CONVERTERS = {
     "enable_frr_delta_variable": _bool,
     "variable_max_share": _d,
     "enable_hidden": _bool,
+    "adopt_external_offers": _bool,
     "hidden_max_share": lambda value: None if value in (None, "") else _d(value),
     "minimum_offer_minutes": int,
     "reprice_cooldown_minutes": int,
     "max_reprices_per_hour": int,
     "minimum_rate_change": _d,
+    "short_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (10, 30, 60)),
+    "medium_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (20, 60, 120)),
+    "long_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (60, 180, 360)),
     "iqr_change_fraction": _d,
     "spike_volume_ratio": _d,
     "outlier_min_volume_share": _d,
@@ -221,6 +245,14 @@ def validate_policy_v3(policy, require_live_floors=False):
         raise ValueError("offer and reprice cooldown minutes must be positive")
     if policy.max_reprices_per_hour < 0 or policy.max_reprices_per_hour > 90:
         raise ValueError("max_reprices_per_hour must be 0-90")
+    for pool in POOLS:
+        stages = policy.reprice_stages(pool)
+        if (
+            len(stages) != 3
+            or any(value < 1 or value > 1440 for value in stages)
+            or not (stages[0] < stages[1] < stages[2])
+        ):
+            raise ValueError(f"{pool} reprice stages must contain three increasing minutes between 1 and 1440")
     return policy
 
 
@@ -511,27 +543,44 @@ def allocate_slices_v3(
     signals,
     strategy_version="3",
     exposure_by_layer=None,
+    offer_exposure_by_pool=None,
+    offer_exposure_by_layer=None,
 ):
     validate_policy_v3(policy)
     total_principal, available = max(D("0"), D(total_principal)), max(D("0"), D(available))
+    offer_exposure = {pool: D((offer_exposure_by_pool or exposure_by_pool or {}).get(pool, 0)) for pool in POOLS}
+    offer_budget = sum(offer_exposure.values(), D("0")) + available
+    shares = policy.pool_shares()
+    target_offer_amounts = {pool: offer_budget * shares[pool] / D("100") for pool in POOLS}
+    deviations = {pool: offer_exposure[pool] - target_offer_amounts[pool] for pool in POOLS}
+    tolerance = max(policy.min_order_amount, offer_budget * D("0.02"))
+    diagnostics = {
+        "allocation_basis": "MANAGED_OPEN_OFFERS",
+        "shares": shares,
+        "target_offer_amounts": target_offer_amounts,
+        "current_offer_amounts": offer_exposure,
+        "deviation_amounts": deviations,
+        "ratio_tolerance": tolerance,
+    }
     possible_slices = min(policy.target_slices, int(total_principal // policy.min_order_amount))
     if possible_slices <= 0 or available < policy.min_order_amount:
         return {
             "target_slice_count": possible_slices,
             "target_slice_amount": D("0"),
-            "shares": dynamic_pool_shares(policy, signals),
             "slices": [],
+            "empty_reason": "NO_AVAILABLE_BALANCE" if available <= 0 else "BELOW_MINIMUM",
+            **diagnostics,
         }
     target_amount = (total_principal / D(possible_slices)).quantize(SATOSHI, rounding=ROUND_DOWN)
-    shares = dynamic_pool_shares(policy, signals)
-    deficits = _pool_deficits(total_principal, shares, exposure_by_pool or {})
+    deficits = {pool: max(D("0"), target_offer_amounts[pool] - offer_exposure[pool]) for pool in POOLS}
     allocatable = min(available, sum(deficits.values(), D("0")))
     if allocatable < policy.min_order_amount:
         return {
             "target_slice_count": possible_slices,
             "target_slice_amount": target_amount,
-            "shares": shares,
             "slices": [],
+            "empty_reason": "OFFER_RATIOS_SATISFIED",
+            **diagnostics,
         }
     new_count = min(
         int(allocatable // policy.min_order_amount),
@@ -548,10 +597,11 @@ def allocate_slices_v3(
         return {
             "target_slice_count": possible_slices,
             "target_slice_amount": target_amount,
-            "shares": shares,
             "slices": [],
+            "empty_reason": "OFFER_RATIOS_SATISFIED",
+            **diagnostics,
         }
-    layer_exposure = exposure_by_layer or {}
+    layer_exposure = offer_exposure_by_layer or exposure_by_layer or {}
     layer_deficits = {
         layer: max(
             D("0"),
@@ -598,25 +648,33 @@ def allocate_slices_v3(
     return {
         "target_slice_count": possible_slices,
         "target_slice_amount": target_amount,
-        "shares": shares,
         "slices": slices,
+        "empty_reason": None,
+        **diagnostics,
     }
 
 
-def _candidate_target_rate(item, signals, floor_rate):
+def competitive_rate_for_layer(layer, signals, floor_rate):
     windows = signals.get("windows", {})
+    floor_rate = ceil_rate_tick(floor_rate)
     anchor = D(signals.get("anchor_rate") or floor_rate)
     best_bid = D(signals.get("best_bid") or anchor)
     q75 = D(windows.get("24h", {}).get("q75") or anchor)
     iqr = max(D("0"), q75 - D(windows.get("24h", {}).get("q25") or q75))
-    if item["layer"] == "quick":
+    if layer == "quick":
         target = max(floor_rate, best_bid - RATE_TICK)
-    elif item["layer"] == "balanced":
+    elif layer == "balanced":
         target = max(floor_rate, anchor, D(windows.get("1h", {}).get("median") or 0))
     else:
         target = max(floor_rate, q75, anchor + iqr * D("0.25"))
+    return ceil_rate_tick(max(floor_rate, target))
+
+
+def _candidate_target_rate(item, signals, floor_rate):
+    floor_rate = ceil_rate_tick(floor_rate)
+    target = competitive_rate_for_layer(item["layer"], signals, floor_rate)
     target += RATE_TICK * D((item["slice_index"] % 5) - 2)
-    return max(floor_rate, target)
+    return ceil_rate_tick(max(floor_rate, target))
 
 
 def _score_candidate(candidate, item, signals, policy, floor_apr):
@@ -674,10 +732,12 @@ def _candidate_types(policy, frr, target):
     if policy.enable_frr and frr > 0:
         candidates.append(("FRRDELTAVAR", D("0"), frr, "FRR"))
     if policy.enable_frr_delta_fixed and frr > 0:
-        offset = target - frr
+        # Bitfinex rejects negative FRR delta offsets as ``rate: invalid``.
+        # A target below FRR is represented by LIMIT instead.
+        offset = ceil_rate_tick(max(D("0"), target - frr))
         candidates.append(("FRRDELTAFIX", offset, frr + offset, "FRR_DELTA_FIXED"))
     if policy.enable_frr_delta_variable and frr > 0:
-        offset = max(D("0"), target - frr)
+        offset = ceil_rate_tick(max(D("0"), target - frr))
         candidates.append(("FRRDELTAVAR", offset, frr + offset, "FRR_DELTA_VARIABLE"))
     return candidates
 
@@ -718,6 +778,8 @@ def build_strategy_plan_v3(
     strategy_version="3",
     existing_exposure=None,
     exposure_by_layer=None,
+    offer_exposure_by_pool=None,
+    offer_exposure_by_layer=None,
 ):
     validate_policy_v3(policy)
     total_principal = max(D("0"), D(total_principal))
@@ -738,6 +800,8 @@ def build_strategy_plan_v3(
         signals,
         strategy_version,
         exposure_by_layer=exposure_by_layer,
+        offer_exposure_by_pool=offer_exposure_by_pool,
+        offer_exposure_by_layer=offer_exposure_by_layer,
     )
     plan = []
     variable_used = max(D("0"), D(existing_exposure.get("variable", 0)))
@@ -778,7 +842,7 @@ def build_strategy_plan_v3(
                     continue
                 fee = policy.hidden_fee_rate if is_hidden else policy.normal_fee_rate
                 floor_rate = gross_daily_floor(floor_apr, fee)
-                if effective_rate < floor_rate:
+                if rate_below_floor(effective_rate, floor_rate):
                     continue
                 candidate = {
                     **item,
@@ -819,9 +883,14 @@ def build_strategy_plan_v3(
     new_variable_amount = max(D("0"), variable_used - max(D("0"), D(existing_exposure.get("variable", 0))))
     new_hidden_amount = max(D("0"), hidden_used - max(D("0"), D(existing_exposure.get("hidden", 0))))
     plan_hash = _plan_hash(strategy_version, total_principal, available, exposure_by_pool, existing_exposure, plan)
+    empty_reason = allocation.get("empty_reason")
+    if not plan and allocation.get("slices") and empty_reason is None:
+        empty_reason = "MARKET_BELOW_FLOOR"
+    if requested_available > 0 and available <= 0:
+        empty_reason = "FUNDING_CAP_REACHED"
     for row in plan:
         row["plan_hash"] = plan_hash
-    return {
+    response = {
         **allocation,
         "plan": plan,
         "planned_amount": sum((row["amount"] for row in plan), D("0")),
@@ -834,7 +903,20 @@ def build_strategy_plan_v3(
         "cap_remaining": cap_remaining,
         "cap_limited_available": available,
         "over_cap": account_exposure > hard_cap,
+        "empty_reason": empty_reason,
+        "rebalance_cancellations": [],
     }
+    response.update(
+        {
+            "emptyReason": response["empty_reason"],
+            "allocationBasis": response.get("allocation_basis"),
+            "targetOfferAmounts": response.get("target_offer_amounts", {}),
+            "currentOfferAmounts": response.get("current_offer_amounts", {}),
+            "deviationAmounts": response.get("deviation_amounts", {}),
+            "rebalanceCancellations": response["rebalance_cancellations"],
+        }
+    )
+    return response
 
 
 def json_decimal(value):

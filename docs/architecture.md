@@ -12,7 +12,7 @@
 - `MarketDataStream.py`：WebSocket 连接代次、快照门槛及 REST 降级。
 - `StrategyV3.py`：纯策略信号、计划与无写入回放。
 - `RuntimeV3.py`：账户同步、安全状态机和执行编排。
-- `StateStore.py`：schema v4、订单意图、归属、恢复和研究数据。
+- `StateStore.py`：schema v5、订单意图、外部挂单接管、成交归属、恢复和研究数据。
 - `StrategyResearch.py`：90 天公开数据回填、60/15/15 评估和 Bootstrap 门槛。
 
 ## 数据流
@@ -35,4 +35,4 @@ flowchart LR
 
 订单写入从 `PLANNED → SUBMITTING → CONFIRMED/CLOSED/AMBIGUOUS`。`write_phase` 记录是否可能已经发往交易所，`resolution` 记录恢复结论，`strategy_variant` 记录基线或候选归属。只有确认绑定 `exchange_offer_id` 的订单才成为机器人托管订单。
 
-运行模式为 `PAUSED / LIVE / REPLAY / SAFE / APPLYING`。SAFE 的人工未知写入不会通过普通一致性快照自动解除；恢复只能唯一自动匹配或由操作者明确绑定/确认不存在，随后回到 PAUSED。
+运行模式为 `PAUSED / LIVE / REPLAY / SAFE / APPLYING`。SAFE 是可恢复的写入隔离状态：普通故障在两次完整 REST 同步后恢复；不确定撤单通过重复 Offers 快照对账；不确定提交通过请求时间附近的 Offers、Funding Trades 和历史 Offers 对账。唯一匹配或稳定确认不存在时恢复此前模式，只有多重候选才要求人工处理。

@@ -502,6 +502,55 @@ class BitfinexBotTests(unittest.TestCase):
             finally:
                 FakePreflightClient.wallet_rows = original
 
+    def test_preflight_confirmed_external_offer_is_adopted_once(self):
+        now_ms = 2_000_000_000_000
+
+        class ExternalOfferClient(FakePreflightClient):
+            offer_rows = [
+                [
+                    9001,
+                    "fUSD",
+                    now_ms - 600_000,
+                    now_ms - 600_000,
+                    "175",
+                    "175",
+                    "LIMIT",
+                    None,
+                    None,
+                    0,
+                    "ACTIVE",
+                    None,
+                    None,
+                    None,
+                    "0.0004",
+                    2,
+                ]
+            ]
+
+            def active_funding_offers(self, symbol):
+                return self.offer_rows
+
+            def active_funding_credits(self, symbol):
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "test.cfg")
+            write_test_config(path)
+            config = configparser.ConfigParser()
+            config.read(path, encoding="utf-8")
+            config.set("STRATEGY_V3", "adopt_external_offers", "true")
+            with open(path, "w", encoding="utf-8") as target:
+                config.write(target)
+            context = lendingbot.AppContext.for_project(directory, config_path=path, client_factory=ExternalOfferClient)
+            response = lendingbot.create_controlled_bot_preflight(path, now=2000, context=context)
+            assert [row["id"] for row in response["summary"]["externalAdoptionCandidates"]] == [9001]
+            consumed = lendingbot.consume_controlled_bot_preflight(
+                path, response["preflightId"], now=2001, context=context
+            )
+            store, _ = lendingbot.v3_store_for_config(path)
+            assert consumed["adoptedOfferIds"] == [9001]
+            assert store.offers(active_only=True)[0]["managed"] == 1
+
     def test_legacy_status_never_exposes_balance(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "botlog.json")

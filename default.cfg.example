@@ -52,10 +52,14 @@ enable_frr_delta_fixed = true
 enable_frr_delta_variable = true
 variable_max_share = 10
 enable_hidden = false
+adopt_external_offers = false
 hidden_max_share =
 
 minimum_offer_minutes = 10
-reprice_cooldown_minutes = 15
+short_reprice_stages_minutes = 10,30,60
+medium_reprice_stages_minutes = 20,60,120
+long_reprice_stages_minutes = 60,180,360
+reprice_cooldown_minutes = 10
 max_reprices_per_hour = 6
 minimum_rate_change = 0.002
 iqr_change_fraction = 0.25

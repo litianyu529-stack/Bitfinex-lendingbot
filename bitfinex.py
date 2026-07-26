@@ -86,7 +86,7 @@ class Bitfinex:
         if data is not None:
             data_bytes = data.encode("utf-8")
         request_headers = {
-            "User-Agent": f"MikaLendingBot/{APP_VERSION} Python",
+            "User-Agent": f"Bitfinex-lendingbot/{APP_VERSION} Python",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})
@@ -209,8 +209,8 @@ class Bitfinex:
             normalized_type = "FRRDELTAVAR"
             rate = "0"
         numeric_rate = Decimal(str(rate))
-        if normalized_type == "FRRDELTAVAR" and numeric_rate < 0:
-            raise BitfinexApiError("FRRDELTAVAR rate offset cannot be negative")
+        if normalized_type in {"FRRDELTAFIX", "FRRDELTAVAR"} and numeric_rate < 0:
+            raise BitfinexApiError(f"{normalized_type} rate offset cannot be negative")
         numeric_period = int(period)
         if numeric_period < 2 or numeric_period > 120:
             raise BitfinexApiError("Funding offer period must be 2-120 days")

@@ -18,15 +18,17 @@ from StrategyV3 import (
     _candidate_types,
     build_market_signals_v3,
     build_strategy_plan_v3,
+    ceil_rate_tick,
     deterministic_amounts,
     dynamic_pool_shares,
     filter_supported_trades,
     gross_daily_floor,
     json_decimal,
+    rate_below_floor,
     replay_strategy_v3,
     validate_policy_v3,
 )
-from bitfinex import Bitfinex
+from bitfinex import Bitfinex, BitfinexApiError
 
 
 D = Decimal
@@ -119,6 +121,76 @@ def test_pool_and_layer_splits_and_period_ladders_are_diverse():
     assert len({row["effective_rate"] for row in result["plan"]}) > 1
 
 
+def test_open_offer_ratios_ignore_credit_exposure():
+    configured = limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10"))
+    result = build_strategy_plan_v3(
+        D("10000"),
+        D("1000"),
+        {"long": D("9000")},
+        configured,
+        signals(),
+        "offers-only",
+        existing_exposure={"total": D("9000")},
+        offer_exposure_by_pool={"short": D("0"), "medium": D("0"), "long": D("0")},
+    )
+    amounts = {
+        pool: sum((row["amount"] for row in result["plan"] if row["pool"] == pool), D("0"))
+        for pool in ("short", "medium", "long")
+    }
+    assert result["allocationBasis"] == "MANAGED_OPEN_OFFERS"
+    assert amounts["short"] > amounts["medium"] > amounts["long"]
+    assert sum(amounts.values(), D("0")) == D("1000.00000000")
+
+
+def test_offer_ratio_diagnostics_include_existing_offers_and_new_balance():
+    result = build_strategy_plan_v3(
+        D("3000"),
+        D("1000"),
+        {},
+        limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10")),
+        signals(),
+        "diagnostics",
+        existing_exposure={"total": D("1000")},
+        offer_exposure_by_pool={"short": D("600"), "medium": D("300"), "long": D("100")},
+    )
+    assert result["targetOfferAmounts"] == {"short": D("1200"), "medium": D("600"), "long": D("200")}
+    assert result["currentOfferAmounts"]["short"] == D("600")
+    assert result["ratio_tolerance"] == D("150")
+
+
+def test_ratio_rebalance_selects_lowest_yield_from_overweight_pool():
+    now = 2_000_000_000_000
+    configured = limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10"))
+    plan = {
+        "ratio_tolerance": D("150"),
+        "deviation_amounts": {"short": D("400"), "medium": D("-300"), "long": D("-100")},
+    }
+    offers = [
+        {
+            "offer_id": 1,
+            "currency": "USD",
+            "managed": 1,
+            "pool": "short",
+            "period": 2,
+            "amount": D("200"),
+            "rate": D("0.0003"),
+            "mts_created": now - 700_000,
+        },
+        {
+            "offer_id": 2,
+            "currency": "USD",
+            "managed": 1,
+            "pool": "short",
+            "period": 3,
+            "amount": D("200"),
+            "rate": D("0.0002"),
+            "mts_created": now - 700_000,
+        },
+    ]
+    candidates = LendingRuntimeV3.ratio_rebalance_candidates(offers, plan, configured, now)
+    assert [row["offer_id"] for row in candidates] == [2, 1]
+
+
 def test_dynamic_pool_shift_respects_direction_and_ten_point_limit():
     base = policy()
     spike = dynamic_pool_shares(base, {"regime": "spike"})
@@ -138,6 +210,25 @@ def test_net_apr_floors_and_fee_difference_are_enforced():
         assert row["effective_rate"] >= gross_daily_floor(result_floor(row["pool"]), D("0.15"))
 
 
+def test_floor_comparison_tolerates_exchange_float_tail_but_rejects_real_shortfall():
+    floor = gross_daily_floor(D("0.0897"), D("0.15"))
+    observed = D("0.00028912167606768733")
+    assert rate_below_floor(observed, floor) is False
+    assert rate_below_floor(floor - D("0.000000000000000002"), floor) is True
+    assert ceil_rate_tick(floor) >= floor
+    offer = {
+        "period": 8,
+        "pool": "medium",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "rate": observed,
+    }
+    assert "below_new_floor" not in lendingbot.v3_offer_violations(
+        offer,
+        limit_policy(medium_floor_apr=D("0.0897")),
+    )
+
+
 def test_live_requires_all_three_positive_floors_but_paused_does_not():
     validate_policy_v3(StrategyPolicyV3())
     with pytest.raises(ValueError):
@@ -151,6 +242,21 @@ def test_empty_max_lend_amount_config_means_unlimited_amount():
     parsed = lendingbot.strategy_v3_from_config(config)
     assert parsed.max_lend_amount is None
     assert parsed.max_lend_percent == D("100")
+
+
+def test_tiered_reprice_stages_default_parse_and_validate():
+    parsed = lendingbot.strategy_v3_from_api_payload(
+        {
+            "short_reprice_stages_minutes": [10, 30, 60],
+            "medium_reprice_stages_minutes": "20,60,120",
+            "long_reprice_stages_minutes": [60, 180, 360],
+        }
+    )
+    assert parsed.reprice_stages("short") == (10, 30, 60)
+    assert parsed.reprice_stages("medium") == (20, 60, 120)
+    assert parsed.reprice_stages("long") == (60, 180, 360)
+    with pytest.raises(Exception):
+        lendingbot.strategy_v3_from_api_payload({"short_reprice_stages_minutes": [10, 10, 60]})
 
 
 def result_floor(pool_name):
@@ -173,6 +279,12 @@ def test_all_offer_types_are_generated_and_plain_frr_is_zero_variable_delta():
     assert plain[:3] == ("FRRDELTAVAR", D("0"), D("0.00035"))
 
 
+def test_frr_delta_fixed_never_generates_bitfinex_rejected_negative_offset():
+    generated = _candidate_types(policy(), D("0.00042"), D("0.00035"))
+    fixed = next(row for row in generated if row[3] == "FRR_DELTA_FIXED")
+    assert fixed[:3] == ("FRRDELTAFIX", D("0"), D("0.00042"))
+
+
 def test_bitfinex_offer_payload_maps_frr_and_hidden_flag():
     client = Bitfinex("key", "secret")
     writes = []
@@ -184,6 +296,13 @@ def test_bitfinex_offer_payload_maps_frr_and_hidden_flag():
     assert writes[0][1]["rate"] == "0"
     assert writes[0][1]["flags"] == 64
     assert [row[1]["type"] for row in writes[1:]] == ["FRRDELTAFIX", "FRRDELTAVAR"]
+
+
+def test_bitfinex_rejects_negative_frr_delta_before_network_write():
+    client = Bitfinex("key", "secret")
+    client._auth_write = lambda *_args, **_kwargs: pytest.fail("invalid delta must not reach Bitfinex")
+    with pytest.raises(BitfinexApiError, match="cannot be negative"):
+        client.submit_funding_offer("fUSD", "150", "-0.0001", 14, "FRRDELTAFIX")
 
 
 def test_variable_share_cap_includes_plain_frr():
@@ -466,6 +585,253 @@ def test_closed_slice_gets_new_generation_while_open_slice_remains_idempotent():
         replacement = {**intent_order(), "slice_key": base + ":r1"}
         created, _ = store.reserve_intent(replacement, D("1000"))
         assert created is True
+
+
+def test_age_reprice_chain_preserves_elapsed_time_across_replacement_and_restart(tmp_path):
+    now = 1_900_000_000_000
+    state_path = tmp_path / "state.sqlite3"
+    store = LendingStateStore(state_path)
+    strategy = "v3"
+    offer = {
+        "id": 701,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0006"),
+        "rate_real": D("0.0006"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "quick",
+        "mts_created": now - 10 * 60_000,
+    }
+    legacy_order = {
+        **intent_order(),
+        "slice_key": "old:short:quick:0",
+        "strategy_version": "old",
+    }
+    _, intent = store.reserve_intent(legacy_order, D("1000"))
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    plan = {
+        "plan_hash": "plan",
+        # A fully allocated account has no new-order plan. Existing offers must
+        # still age through repricing using the deterministic market benchmark.
+        "plan": [],
+    }
+    market = signals(best_bid=D("0.0003"), anchor_rate=D("0.0003"))
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    canceled = runtime._cancel_reprice_candidates({"market": market}, plan, now, strategy)
+    assert canceled == [701]
+    chain = store.reprice_chains(active_only=True)[0]
+    assert chain["current_stage"] == 1
+    assert D(chain["pending_target_rate"]) == D("0.0005")
+    assert chain["started_at_ms"] == offer["mts_created"]
+
+    store.reconcile_offers([], now + 1)
+    replacement_order = {
+        **intent_order(),
+        "slice_key": "v3:short:quick:0:r1",
+        "submitted_rate": D("0.0005"),
+        "effective_rate": D("0.0005"),
+    }
+    _, replacement_intent = store.reserve_intent(replacement_order, D("1000"))
+    store.confirm_intent(replacement_intent["id"], 702)
+    store.bind_reprice_replacement(
+        "v3:short:quick:0",
+        strategy,
+        702,
+        D("0.0005"),
+        now_ms=now + 2,
+    )
+    replacement_offer = {**offer, "id": 702, "rate": D("0.0005"), "rate_real": D("0.0005"), "mts_created": now + 2}
+    store.reconcile_offers([replacement_offer], now + 2)
+
+    restarted_store = LendingStateStore(state_path)
+    restarted_chain = restarted_store.reprice_chain_for_offer(702)
+    assert restarted_chain["started_at_ms"] == offer["mts_created"]
+    assert restarted_chain["current_stage"] == 1
+    second_client = Client()
+    restarted_runtime = LendingRuntimeV3(second_client, limit_policy(), restarted_store, hub=object())
+    second = restarted_runtime._cancel_reprice_candidates(
+        {"market": market},
+        plan,
+        now + 30 * 60_000,
+        strategy,
+    )
+    assert second == [702]
+    assert D(restarted_store.reprice_chains(active_only=True)[0]["pending_target_rate"]) == D("0.0004")
+
+
+def test_market_rise_reprice_resets_chain_when_replacement_is_bound(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 801,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0003"),
+        "rate_real": D("0.0003"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "quick",
+        "mts_created": now - 20 * 60_000,
+    }
+    _, intent = store.reserve_intent(intent_order(), D("1000"))
+    store.confirm_intent(intent["id"], 801)
+    store.reconcile_offers([offer], now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def cancel_funding_offer(self, offer_id):
+            return [0, "SUCCESS"]
+
+    plan = {
+        "plan_hash": "rise",
+        "plan": [
+            {
+                **intent_order(),
+                "slice_index": 0,
+                "display_type": "LIMIT",
+                "effective_rate": D("0.0005"),
+                "submitted_rate": D("0.0005"),
+                "target_rate": D("0.0005"),
+                "gross_daily_floor": gross_daily_floor(D("0.05"), D("0.15")),
+            }
+        ],
+    }
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    assert runtime._cancel_reprice_candidates(
+        {"market": signals(best_bid=D("0.0005"), anchor_rate=D("0.0005"))},
+        plan,
+        now,
+        "v3",
+    ) == [801]
+    pending = store.reprice_chains(active_only=True)[0]
+    assert pending["pending_action"] == "MARKET_RISE"
+    store.bind_reprice_replacement("v3:short:quick:0", "v3", 802, D("0.0004999"), now_ms=now + 100)
+    reset = store.reprice_chain_for_offer(802)
+    assert reset["current_stage"] == 0
+    assert reset["started_at_ms"] == now + 100
+    assert D(reset["origin_rate"]) == D("0.0004999")
+
+
+def test_pending_stage_target_is_used_for_replacement_submission(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 901,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0006"),
+        "rate_real": D("0.0006"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "quick",
+        "mts_created": now - 10 * 60_000,
+    }
+    _, intent = store.reserve_intent(intent_order(), D("1000"))
+    store.confirm_intent(intent["id"], 901)
+    store.reconcile_offers([offer], now)
+    chain = store.ensure_reprice_chain({**offer, "offer_id": 901}, "new", now)
+    store.mark_reprice_pending(chain["chain_key"], "AGE_STAGE", D("0.0005"), stage=1, now_ms=now)
+    store.reconcile_offers([], now + 1)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.rate = None
+
+        def submit_funding_offer(self, _symbol, _amount, rate, _period, _offer_type, flags=0):
+            self.rate = D(rate)
+            return [0, "on-req", None, None, [902]]
+
+    row = {
+        **intent_order(),
+        "slice_index": 0,
+        "display_type": "LIMIT",
+        "target_rate": D("0.0003"),
+        "gross_daily_floor": gross_daily_floor(D("0.05"), D("0.15")),
+        "plan_hash": "replacement",
+    }
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    submitted = runtime._submit_plan({"plan": [row]}, D("150"), "new")
+    assert client.rate == D("0.0005")
+    assert submitted[0]["effective_rate"] == D("0.0005")
+    rebound = store.reprice_chain_for_offer(902)
+    assert rebound["current_stage"] == 1
+    assert rebound["started_at_ms"] == offer["mts_created"]
+
+
+def test_historical_strategy_slices_with_same_index_keep_distinct_chains(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    for index, offer_id in enumerate((1001, 1002)):
+        amount = D("150") + index
+        order = {
+            **intent_order(amount=format(amount, "f")),
+            "slice_key": "old:short:quick:0",
+            "strategy_version": "old",
+        }
+        _, intent = store.reserve_intent(order, D("1000"))
+        store.confirm_intent(intent["id"], offer_id)
+        offer = {
+            "id": offer_id,
+            "currency": "USD",
+            "amount": amount,
+            "amount_original": amount,
+            "rate": D("0.0004"),
+            "rate_real": D("0.0004"),
+            "period": 2,
+            "offer_type": "LIMIT",
+            "display_type": "LIMIT",
+            "flags": 0,
+            "status": "ACTIVE",
+            "managed": True,
+            "pool": "short",
+            "layer": "quick",
+            "mts_created": now,
+        }
+        store.reconcile_offers([offer], now)
+        store.ensure_reprice_chain({**offer, "offer_id": offer_id}, "new-active", now)
+    chains = store.reprice_chains(active_only=True)
+    assert len(chains) == 2
+    assert len({row["chain_key"] for row in chains}) == 2
+    assert {row["current_offer_id"] for row in chains} == {1001, 1002}
 
 
 def test_ambiguous_resolution_requires_operator_and_returns_paused():
@@ -814,6 +1180,65 @@ def test_credit_is_attributed_to_managed_offer_through_funding_trade():
         assert credit["managed"] == 1
         assert credit["offer_id"] == 9001
         assert credit["pool"] == "short"
+
+
+def test_preflight_adoption_creates_managed_intent_and_is_idempotent():
+    with tempfile.TemporaryDirectory() as directory:
+        store = LendingStateStore(f"{directory}/state.sqlite3")
+        offer = {
+            "id": 9901,
+            "currency": "USD",
+            "amount": D("175"),
+            "amount_original": D("175"),
+            "rate": D("0.00025"),
+            "rate_real": None,
+            "period": 14,
+            "offer_type": "LIMIT",
+            "display_type": "LIMIT",
+            "flags": 0,
+            "status": "ACTIVE",
+            "pool": "medium",
+            "mts_created": 1_900_000_000_000,
+            "mts_updated": 1_900_000_000_000,
+        }
+        first = store.adopt_external_offers([offer], "active-v3")
+        second = store.adopt_external_offers([offer], "active-v3")
+        assert first == [9901]
+        assert second == []
+        assert store.offers(active_only=True)[0]["managed"] == 1
+        with store.read_connection() as connection:
+            intent = connection.execute("SELECT * FROM order_intents WHERE exchange_offer_id=9901").fetchone()
+            events = connection.execute("SELECT COUNT(*) FROM ownership_events WHERE offer_id=9901").fetchone()[0]
+        assert intent["resolution"] == "PREFLIGHT_ADOPTED"
+        assert intent["pool"] == "medium"
+        assert events == 1
+
+
+def test_credit_unique_direct_match_avoids_external_misattribution():
+    with tempfile.TemporaryDirectory() as directory:
+        opening = 1_900_000_100_000
+        store = LendingStateStore(f"{directory}/state.sqlite3", clock=lambda: opening / 1000)
+        _, intent = store.reserve_intent(intent_order(amount="150"), D("1000"))
+        store.confirm_intent(intent["id"], 9910)
+        store.reconcile_credits(
+            [
+                {
+                    "id": 8810,
+                    "currency": "USD",
+                    "amount": D("150"),
+                    "rate": D("0.0002"),
+                    "period": 2,
+                    "rate_type": "FIXED",
+                    "status": "ACTIVE",
+                    "mts_opening": opening,
+                }
+            ],
+            opening,
+        )
+        credit = store.credits(active_only=True)[0]
+        assert credit["managed"] == 1
+        assert credit["attribution_state"] == "MANAGED"
+        assert credit["offer_id"] == 9910
 
 
 def test_variable_floor_violation_tracks_start_update_and_end():

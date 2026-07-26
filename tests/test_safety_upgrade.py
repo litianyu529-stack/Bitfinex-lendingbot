@@ -163,13 +163,26 @@ def test_manual_safe_resolution_returns_only_to_paused():
     assert mode_after_ambiguous_resolution(0, "LIVE", False) == "LIVE"
 
 
-def test_schema_v4_is_explicit(tmp_path):
+def test_schema_v6_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "4"
+    assert version == "6"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
+    with store.read_connection() as connection:
+        credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
+        ownership_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ownership_events'"
+        ).fetchone()
+        reprice_chain_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='reprice_chains'"
+        ).fetchone()
+        reprice_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_events)")}
+    assert "attribution_state" in credit_columns
+    assert ownership_table is not None
+    assert reprice_chain_table is not None
+    assert {"chain_key", "stage", "benchmark_rate", "floor_rate"} <= reprice_columns
 
 
 def test_schema_migration_creates_online_backup(tmp_path):
@@ -318,6 +331,101 @@ def test_multiple_authoritative_matches_stay_manual_safe(tmp_path):
     assert store.reconcile_ambiguous_candidates() == []
     assert store.intent(intent["id"])["state"] == "AMBIGUOUS"
     assert store.runtime()["mode"] == "SAFE"
+
+
+def test_unique_ambiguous_submit_match_automatically_resumes_live(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    _, intent = store.reserve_intent(order(), D("500"))
+    store.mark_submitting(intent["id"])
+    store.mark_ambiguous(intent["id"], "connection reset")
+    store.reconcile_offers([matching_offer(9001)])
+
+    resolved = store.reconcile_ambiguous_candidates(now_ms=1_000_000)
+
+    assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
+    assert store.runtime()["mode"] == "LIVE"
+    assert store.intent(intent["id"])["resolution"] == "AUTO_UNIQUE_MATCH"
+
+
+def test_ambiguous_submit_absence_requires_two_authoritative_history_snapshots(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    _, intent = store.reserve_intent(order(), D("500"))
+    store.mark_submitting(intent["id"])
+    store.mark_ambiguous(intent["id"], "connection reset")
+    store.reconcile_offers([])
+
+    store.reconcile_ambiguous_candidates(confirm_absent=False, now_ms=1_000_000)
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=1_030_000)
+    assert store.runtime()["mode"] == "SAFE"
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=1_060_000)
+
+    assert store.runtime()["mode"] == "LIVE"
+    assert store.intent(intent["id"])["state"] == "CLOSED"
+    assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
+
+
+def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    store.enter_safe("AMBIGUOUS_CANCEL:9001", manual=True)
+
+    store.observe_ambiguous_cancel({9001}, now_ms=1_000_000)
+    store.observe_ambiguous_cancel({9001}, now_ms=1_020_000)
+    assert store.runtime()["mode"] == "SAFE"
+    store.observe_ambiguous_cancel({9001}, now_ms=1_030_000)
+
+    assert store.runtime()["mode"] == "LIVE"
+    with store.read_connection() as connection:
+        event = connection.execute("SELECT * FROM ownership_events ORDER BY id DESC LIMIT 1").fetchone()
+    assert event["offer_id"] == 9001
+    assert event["event_type"] == "CANCEL_RECONCILED_PRESENT"
+
+
+def test_ambiguous_cancel_absent_automatically_resumes_live(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    store.enter_safe("AMBIGUOUS_CANCEL:9001", manual=True)
+
+    store.observe_ambiguous_cancel(set(), now_ms=1_000_000)
+    store.observe_ambiguous_cancel(set(), now_ms=1_030_000)
+
+    assert store.runtime()["mode"] == "LIVE"
+    with store.read_connection() as connection:
+        event_type = connection.execute("SELECT event_type FROM ownership_events ORDER BY id DESC LIMIT 1").fetchone()[
+            "event_type"
+        ]
+    assert event_type == "CANCEL_RECONCILED_ABSENT"
+
+
+def test_ambiguous_submit_history_uses_request_window_not_capped_90_day_window(tmp_path):
+    request_ms = 2_000_000
+
+    class HistoryClient:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.calls = []
+
+        def funding_trades_history(self, symbol, **kwargs):
+            self.calls.append(("trades", symbol, kwargs))
+            return []
+
+        def funding_offers_history(self, symbol, **kwargs):
+            self.calls.append(("offers", symbol, kwargs))
+            return []
+
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    client = HistoryClient()
+    runtime = LendingRuntimeV3(client, policy(), store, hub=NullHub())
+    intent = {"request_started_at_ms": request_ms, "updated_at_ms": request_ms}
+
+    assert runtime.sync_ambiguous_write_history([intent], request_ms + 60_000) is True
+    assert [call[0] for call in client.calls] == ["trades", "offers"]
+    assert all(call[2]["start"] == request_ms - 300_000 for call in client.calls)
+    assert all(call[2]["end"] == request_ms + 60_000 for call in client.calls)
 
 
 def test_rollout_stages_are_restricted(tmp_path):

@@ -1,4 +1,4 @@
-# MikaLendingBot 0.3.0
+# Bitfinex-lendingbot 0.3.0
 
 面向单台 Windows 电脑、单一 Bitfinex 账户的 USD Funding 自动放贷工具。项目只保留 V3 策略；Dashboard 默认 `PAUSED`，只有完成真实账户只读预检并人工确认后才会启动 LIVE Worker。
 
@@ -6,12 +6,13 @@
 
 - 仅支持 `USD`，期限限定为 Bitfinex Funding 的 2–120 天。
 - API 必须允许 wallets 读取、funding 读取/写入；withdraw 与 ui_withdraw 写权限必须关闭。
-- 机器人只撤改 SQLite 中能够证明归属的挂单。外部挂单计入资金上限，但绝不会由机器人撤销。
-- 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`，不会自动重试。
-- 进程重启时，未发出的 `PLANNED` 意图会关闭；遗留 `SUBMITTING` 会转为 `AMBIGUOUS` 并进入人工 SAFE。只有 Offers、Funding Trades/历史记录能唯一匹配时才自动绑定，恢复后仍回到 `PAUSED`。
+- 机器人默认只撤改 SQLite 中能够证明归属的挂单。开启“接管外部挂单”后，只有 LIVE 预检逐笔列出并人工确认的 USD 挂单会转为托管；运行中新出现的外部单仍不会自动接管。
+- 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；超过 `max(150 USD, 2%)` 容差时分阶段再平衡。
+- 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
+- 网络、市场数据和普通运行故障在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。只有出现多个可能匹配时才保持人工 SAFE。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
-- SQLite 使用显式 schema v4。升级前在线备份，迁移在事务中完成。
+- SQLite 使用显式 schema v5。升级前在线备份，迁移在事务中完成。
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
 

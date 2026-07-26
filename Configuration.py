@@ -123,6 +123,7 @@ V3_BOOL_FIELDS = {
     "enable_frr_delta_fixed",
     "enable_frr_delta_variable",
     "enable_hidden",
+    "adopt_external_offers",
 }
 V3_INT_FIELDS = {
     "target_slices",
@@ -133,7 +134,14 @@ V3_INT_FIELDS = {
     "rest_stale_seconds",
     "market_retention_days",
 }
-V3_LIST_FIELDS = {"short_periods", "medium_periods", "long_periods"}
+V3_LIST_FIELDS = {
+    "short_periods",
+    "medium_periods",
+    "long_periods",
+    "short_reprice_stages_minutes",
+    "medium_reprice_stages_minutes",
+    "long_reprice_stages_minutes",
+}
 V3_CONFIG_FIELDS = tuple(name for name in StrategyPolicyV3.__dataclass_fields__ if name not in {"version", "currency"})
 
 

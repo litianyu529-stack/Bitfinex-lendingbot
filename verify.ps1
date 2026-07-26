@@ -20,4 +20,4 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 git diff --check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "MikaLendingBot verification passed."
+Write-Host "Bitfinex-lendingbot verification passed."

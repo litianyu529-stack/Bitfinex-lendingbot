@@ -15,7 +15,7 @@
     const groups = [
         {
             title: "期限资金池",
-            description: "USD 全部本金按期限管理；资金池比例必须合计 100%。",
+            description: "比例约束机器人可控的未成交挂单金额；已成交 Credits 不参与挂单配比。",
             fields: [
                 ["short_share", "短期比例", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["medium_share", "中期比例", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -40,18 +40,18 @@
                 ["quick_share", "快速成交层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["balanced_share", "平衡层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["high_share", "高收益层", "number", "%", { min: 0, max: 100, step: 1 }],
-                ["max_pool_shift", "动态比例最大偏移", "number", "百分点", { min: 0, max: 25, step: 1 }],
             ],
         },
         {
             title: "订单类型与费用",
-            description: "普通 FRR 映射为零偏移 Variable，并共享 Variable 资金上限。",
+            description: "外部挂单接管默认关闭；开启后仍须停止 Worker，并在 LIVE 预检中逐笔确认，确认后机器人可撤销或重定价。",
             fields: [
                 ["enable_limit", "LIMIT", "checkbox", "", {}],
                 ["enable_frr", "FRR", "checkbox", "", {}],
                 ["enable_frr_delta_fixed", "FRR Delta Fixed", "checkbox", "", {}],
                 ["enable_frr_delta_variable", "FRR Delta Variable", "checkbox", "", {}],
                 ["enable_hidden", "Hidden", "checkbox", "", {}],
+                ["adopt_external_offers", "预检确认后接管外部 USD 挂单", "checkbox", "", {}],
                 ["variable_max_share", "Variable最高占比", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["hidden_max_share", "Hidden最高占比", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["normal_fee_rate", "普通手续费", "number", "%", { min: 0, max: 99, step: 0.1 }],
@@ -63,6 +63,9 @@
             details: true,
             fields: [
                 ["minimum_offer_minutes", "最短挂单时间", "number", "分钟", { min: 1 }],
+                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "10 / 30 / 60" }],
+                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "20 / 60 / 120" }],
+                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "60 / 180 / 360" }],
                 ["reprice_cooldown_minutes", "重定价冷却", "number", "分钟", { min: 1 }],
                 ["max_reprices_per_hour", "每小时重定价上限", "number", "次", { min: 0, max: 90 }],
                 ["minimum_rate_change", "显著利率变化", "number", "%/日", { min: 0, step: 0.0001 }],
@@ -77,6 +80,10 @@
     ];
 
     const allFields = groups.flatMap((group) => group.fields.map((field) => field[0]));
+    const listFields = new Set([
+        "short_periods", "medium_periods", "long_periods",
+        "short_reprice_stages_minutes", "medium_reprice_stages_minutes", "long_reprice_stages_minutes",
+    ]);
 
     function createField([name, label, type, unit, options]) {
         const wrapper = document.createElement("label");
@@ -121,7 +128,8 @@
                 <div><span>ACTIVE</span><strong id="v3ActiveVersion">--</strong></div>
                 <div><span>DRAFT</span><strong id="v3DraftVersion">--</strong></div>
                 <div><span>PENDING</span><strong id="v3PendingVersion">--</strong></div>
-                <div><span>数据源</span><strong id="v3DataSource">--</strong></div>
+                <div><span>账户快照</span><strong id="v3AccountSource">--</strong></div>
+                <div><span>市场行情</span><strong id="v3MarketSource">--</strong></div>
                 <div><span>市场状态</span><strong id="v3Regime">--</strong></div>
                 <div class="v3-mode-actions">
                     <button id="v3PauseButton" class="button secondary" type="button">暂停</button>
@@ -201,7 +209,9 @@
         for (const name of allFields) {
             const element = input(name);
             let value = policy?.[name];
-            if (["short_periods", "medium_periods", "long_periods"].includes(name) && Array.isArray(value)) value = value.join(",");
+            if (listFields.has(name) && Array.isArray(value)) {
+                value = name.endsWith("_reprice_stages_minutes") ? value.join(" / ") : value.join(",");
+            }
             if (element.type === "checkbox") element.checked = Boolean(value);
             else element.value = value ?? "";
         }
@@ -215,8 +225,8 @@
         for (const name of allFields) {
             const element = input(name);
             if (element.type === "checkbox") policy[name] = element.checked;
-            else if (["short_periods", "medium_periods", "long_periods"].includes(name)) {
-                policy[name] = element.value.split(",").map((value) => value.trim()).filter(Boolean).map(Number);
+            else if (listFields.has(name)) {
+                policy[name] = element.value.split(/[,/、\s]+/).map((value) => value.trim()).filter(Boolean).map(Number);
             } else policy[name] = element.value === "" ? null : element.value;
         }
         return policy;
@@ -233,6 +243,17 @@
         if (poolTotal !== 100) throw new Error(`期限资金池比例当前为 ${poolTotal}%，必须等于100%`);
         if (layerTotal !== 100) throw new Error(`成交层比例当前为 ${layerTotal}%，必须等于100%`);
         if (numberValue("min_order_amount") < 150) throw new Error("USD最低单笔金额不能低于150");
+        for (const pool of ["short", "medium", "long"]) {
+            const name = `${pool}_reprice_stages_minutes`;
+            const stages = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
+            if (
+                stages.length !== 3
+                || stages.some((value) => !Number.isInteger(value) || value < 1 || value > 1440)
+                || !(stages[0] < stages[1] && stages[1] < stages[2])
+            ) {
+                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是三个递增的 1–1440 分钟整数`);
+            }
+        }
         if (input("enable_hidden").checked && numberValue("hidden_max_share") <= 0) throw new Error("启用Hidden时必须设置最高占比");
         if (![input("enable_limit"), input("enable_frr"), input("enable_frr_delta_fixed"), input("enable_frr_delta_variable")].some((item) => item.checked)) {
             throw new Error("至少启用一种Funding订单类型");
@@ -269,7 +290,7 @@
         byId("v3Principal").textContent = `${Number(data.principal || plan.planned_amount || 0).toLocaleString("zh-CN")} USD`;
         byId("v3PlanCount").textContent = `${(plan.plan || []).length} / ${plan.target_slice_count || 0}`;
         const basis = data.accountSnapshot || {};
-        byId("v3DataSource").textContent = basis.stale
+        byId("v3AccountSource").textContent = basis.stale
             ? `历史快照 · ${basis.timestamp ? new Date(basis.timestamp).toLocaleString("zh-CN", { hour12: false }) : "无数据"}`
             : "实时账户";
         const list = byId("v3PlanList");
@@ -277,7 +298,14 @@
         const orders = plan.plan || [];
         if (!orders.length) {
             const empty = document.createElement("p");
-            empty.textContent = (data.warnings || []).join("；") || "当前没有满足收益下限的候选订单";
+            const reasons = {
+                NO_AVAILABLE_BALANCE: "当前没有可用 Funding 余额",
+                BELOW_MINIMUM: "可用余额低于最低单笔金额",
+                OFFER_RATIOS_SATISFIED: "当前挂单比例已在允许范围内",
+                MARKET_BELOW_FLOOR: "当前市场利率低于收益下限",
+                FUNDING_CAP_REACHED: "已达到最大放贷资金上限",
+            };
+            empty.textContent = reasons[plan.emptyReason || plan.empty_reason] || (data.warnings || []).join("；") || "当前没有新挂单计划";
             list.append(empty);
             return;
         }
@@ -314,7 +342,8 @@
         byId("v3PendingVersion").textContent = data.pendingStrategy?.version_id || "--";
         const market = status?.market || {};
         const marketData = status?.marketData || data.marketSnapshot || {};
-        byId("v3DataSource").textContent = marketData.source || "--";
+        byId("v3MarketSource").textContent = `${marketData.source || "--"}${marketData.publicAgeMs != null ? ` · ${marketData.publicAgeMs}ms` : ""}`;
+        if (status?.last_update) byId("v3AccountSource").textContent = `实时账户 · ${status.last_update}`;
         if (market.regime) byId("v3Regime").textContent = market.regime;
         if (market.frr_daily_rate != null) byId("v3Frr").textContent = percentDaily(market.frr_daily_rate);
         if (market.best_bid != null) byId("v3BestBid").textContent = percentDaily(market.best_bid);
@@ -340,11 +369,13 @@
             const utilization = document.createElement("span");
             const interest = document.createElement("span");
             const apr = document.createElement("b");
+            const coverage = document.createElement("small");
             heading.textContent = key === "all" ? "全部" : key;
             utilization.textContent = `利用率 ${Number(row.utilizationPercent).toFixed(1)}%`;
             interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} USD`;
             apr.textContent = `净APR ${Number(row.actualNetAprPercent).toFixed(2)}%`;
-            item.append(heading, utilization, interest, apr);
+            coverage.textContent = `本金采样覆盖 ${Number(row.sampleDays || 0).toFixed(2)} 天`;
+            item.append(heading, utilization, interest, apr, coverage);
             container.append(item);
         }
     }

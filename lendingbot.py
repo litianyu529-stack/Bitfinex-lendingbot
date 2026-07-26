@@ -32,6 +32,7 @@ from StrategyV3 import (
     json_decimal,
     pool_for_period,
     policy_v3_to_json,
+    rate_below_floor,
     replay_strategy_v3,
     validate_policy_v3,
 )
@@ -327,6 +328,22 @@ def load_v3_account_context(client, store, now_ms):
     return LendingRuntimeV3._account(snapshot), snapshot, basis
 
 
+def proposed_external_adoption(account_snapshot, policy):
+    candidates = []
+    simulated = {key: [dict(row) for row in account_snapshot.get(key, [])] for key in ("wallets", "offers", "credits")}
+    if policy.adopt_external_offers:
+        for offer in simulated["offers"]:
+            if offer.get("currency") != "USD" or offer.get("managed"):
+                continue
+            candidates.append({**offer, "display_type": v3_offer_display_type(offer)})
+            offer["managed"] = True
+            offer["pool"] = offer.get("pool") or pool_for_period(offer["period"])
+            offer["layer"] = offer.get("layer") or "balanced"
+            offer["display_type"] = v3_offer_display_type(offer)
+    candidates.sort(key=lambda row: int(row["id"]))
+    return LendingRuntimeV3._account(simulated), simulated, candidates
+
+
 def load_v3_market_context(client, policy, now_ms):
     warnings = []
     try:
@@ -408,6 +425,7 @@ def strategy_v3_preview(
     now = int(now_ms if now_ms is not None else app_context.now() * 1000)
     client = client_factory(settings.api_key, settings.api_secret)
     account, account_snapshot, basis = load_v3_account_context(client, store, now)
+    account, planned_snapshot, adoption_candidates = proposed_external_adoption(account_snapshot, policy)
     book, trades, stats, signals, warnings = load_v3_market_context(client, policy, now)
     warnings = [*basis["warnings"], *warnings]
     result = LendingRuntimeV3._build_plan(account, policy, signals, proposed_version)
@@ -415,7 +433,7 @@ def strategy_v3_preview(
         warnings.append("三个最低净年化尚未全部填写；允许预览，但 LIVE 将被阻止。")
     proposed_record = {"version_id": proposed_version, "policy": json_decimal(policy.__dict__)}
     incompatible = []
-    for offer in account_snapshot["offers"]:
+    for offer in planned_snapshot["offers"]:
         violations = v3_offer_violations(offer, policy)
         if violations:
             incompatible.append({**json_decimal(offer), "violations": violations})
@@ -444,6 +462,11 @@ def strategy_v3_preview(
         },
         "incompatibleOffers": incompatible,
         "nonChangeableCredits": non_changeable_credits,
+        "externalAdoptionCandidates": json_decimal(adoption_candidates),
+        "externalAdoptionDigest": _canonical_sha256(adoption_candidates),
+        "ratioRebalanceCancellations": json_decimal(
+            LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
+        ),
         "replay": replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
@@ -533,7 +556,7 @@ def v3_offer_violations(offer, policy):
     if floor_apr is not None:
         fee = policy.hidden_fee_rate if hidden else policy.normal_fee_rate
         effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
-        if effective < gross_daily_floor(floor_apr, fee):
+        if rate_below_floor(effective, gross_daily_floor(floor_apr, fee)):
             violations.append("below_new_floor")
     return violations
 
@@ -1054,6 +1077,8 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
 
     now = int(context.now() * 1000)
     account, snapshot, basis = load_v3_account_context(client, store, now)
+    original_snapshot = snapshot
+    account, snapshot, adoption_candidates = proposed_external_adoption(snapshot, policy)
     add_check(
         "account_snapshot",
         "真实账户快照",
@@ -1070,6 +1095,13 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
+    if policy.max_pool_shift:
+        warnings.append(
+            {
+                "code": "LEGACY_POOL_SHIFT_IGNORED",
+                "message": "动态资金池偏移为旧字段；生产挂单固定使用短/中/长页面比例。",
+            }
+        )
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
@@ -1097,7 +1129,16 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
                 "message": f"启动后将先撤销 {len(incompatible_managed)} 笔不兼容机器人挂单，确认消失后才创建新单。",
             }
         )
-    if incompatible_external:
+    if policy.adopt_external_offers and adoption_candidates:
+        warnings.append(
+            {
+                "code": "EXTERNAL_ADOPTION_REQUIRES_CONFIRMATION",
+                "message": (
+                    f"预检确认后将接管 {len(adoption_candidates)} 笔外部 USD Funding 挂单；集合变化会使确认失效。"
+                ),
+            }
+        )
+    elif incompatible_external:
         warnings.append(
             {
                 "code": "INCOMPATIBLE_EXTERNAL_OFFERS",
@@ -1143,7 +1184,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         "onlyLimit": enabled_types == ["LIMIT"],
         "policy": strategy_v3_api_values(policy),
         "accountSnapshot": basis,
-        "accountDigest": _account_context_digest(account, snapshot),
+        "accountDigest": _account_context_digest(LendingRuntimeV3._account(original_snapshot), original_snapshot),
         "account": json_decimal(account),
         "fundingPools": {
             pool: {
@@ -1167,6 +1208,18 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         "strategyPlan": json_decimal(result["plan"]),
         "pendingCancellations": incompatible_managed,
         "externalIncompatibilities": incompatible_external,
+        "externalAdoptionCandidates": json_decimal(adoption_candidates),
+        "externalAdoptionDigest": _canonical_sha256(adoption_candidates),
+        "ratioRebalanceCancellations": json_decimal(
+            LendingRuntimeV3.ratio_rebalance_candidates(snapshot["offers"], result, policy, now)
+        ),
+        "offerPoolAllocation": {
+            "basis": result.get("allocation_basis"),
+            "target": json_decimal(result.get("target_offer_amounts", {})),
+            "current": json_decimal(result.get("current_offer_amounts", {})),
+            "deviation": json_decimal(result.get("deviation_amounts", {})),
+            "tolerance": status_decimal(result.get("ratio_tolerance", 0)),
+        },
         "nonChangeableCredits": incompatible_credits,
         "marketSignals": json_decimal(signals),
     }
@@ -1223,6 +1276,8 @@ def create_controlled_bot_preflight(config_path, client_factory=None, now=None, 
                 "accountDigest": summary.get("accountDigest"),
                 "buildId": summary.get("buildId"),
                 "cancellationDigest": _canonical_sha256(summary.get("pendingCancellations") or []),
+                "externalAdoptionDigest": summary.get("externalAdoptionDigest"),
+                "externalAdoptionIds": [int(row["id"]) for row in summary.get("externalAdoptionCandidates") or []],
                 "clientFactory": client_factory,
             }
     return response
@@ -1265,6 +1320,17 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
         raise ConfigError("实际 V3 计划在预检后发生变化，请重新运行预检")
     if _canonical_sha256(summary.get("pendingCancellations") or []) != current.get("cancellationDigest"):
         raise ConfigError("待撤销挂单集合在预检后发生变化，请重新运行预检")
+    if summary.get("externalAdoptionDigest") != current.get("externalAdoptionDigest"):
+        raise ConfigError("待接管外部挂单集合在预检后发生变化，请重新运行预检")
+    current_ids = [int(row["id"]) for row in summary.get("externalAdoptionCandidates") or []]
+    if current_ids != current.get("externalAdoptionIds"):
+        raise ConfigError("待接管外部挂单集合在预检后发生变化，请重新运行预检")
+    adopted = (
+        store.adopt_external_offers(summary.get("externalAdoptionCandidates") or [], active["version_id"])
+        if current_ids
+        else []
+    )
+    return {"adoptedOfferIds": adopted}
 
 
 def start_controlled_bot(config_path, status_path, preflight_id, context=None):
@@ -1627,7 +1693,11 @@ def main(argv=None):
     client = Bitfinex(settings.api_key, settings.api_secret)
     state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
     _, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
-    state_store_v3.set_mode("LIVE", "live_preflight_confirmed")
+    # Preserve a durable SAFE across process restarts so bootstrap can reconcile
+    # the uncertain exchange write from authoritative account data. Normal
+    # PAUSED starts still transition directly to LIVE after the confirmed preflight.
+    if state_store_v3.runtime()["mode"] != "SAFE":
+        state_store_v3.set_mode("LIVE", "live_preflight_confirmed")
     runtime_v3 = LendingRuntimeV3(
         client,
         active_policy,

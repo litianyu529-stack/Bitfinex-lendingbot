@@ -227,6 +227,17 @@ function ageLabel(created) {
     return hours < 24 ? `${hours} 小时` : `${Math.floor(hours / 24)} 天`;
 }
 
+function repriceLabel(offer) {
+    const age = ageLabel(offer.created);
+    const state = offer.repriceState;
+    if (!state) return age;
+    const stage = safeNumber(state.stage);
+    if (!state.nextStageAtMs) return `${age} · 已到第 ${stage} 阶段`;
+    const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
+    const minutes = Math.ceil(remaining / 60000);
+    return `${age} · 第 ${stage} 阶段 · ${minutes} 分钟后检查`;
+}
+
 function appendCell(row, text, className = "") {
     const cell = document.createElement("td");
     if (className) {
@@ -256,7 +267,7 @@ function renderOffers() {
         appendCell(row, `${offer.period || "--"} 天`);
         appendCell(row, offer.offerType || "LIMIT");
         appendCell(row, offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单");
-        appendCell(row, ageLabel(offer.created));
+        appendCell(row, repriceLabel(offer));
         appendCell(row, offer.status || "ACTIVE", "status-pill");
         table.append(row);
 
@@ -271,7 +282,7 @@ function renderOffers() {
         status.textContent = offer.status || "ACTIVE";
         header.append(currency, status);
         const list = document.createElement("dl");
-        for (const [label, value] of [["金额", formatAmount(offer.amount)], ["日利率", formatPercent(offer.dailyRatePercent)], ["周期", `${offer.period || "--"} 天`], ["类型", offer.offerType || "LIMIT"], ["归属", offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单"], ["等待", ageLabel(offer.created)]]) {
+        for (const [label, value] of [["金额", formatAmount(offer.amount)], ["日利率", formatPercent(offer.dailyRatePercent)], ["周期", `${offer.period || "--"} 天`], ["类型", offer.offerType || "LIMIT"], ["归属", offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单"], ["等待", repriceLabel(offer)]]) {
             const block = document.createElement("div");
             const term = document.createElement("dt");
             const detail = document.createElement("dd");
@@ -331,9 +342,13 @@ function renderStatus() {
     $("offerCount").textContent = `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
     $("chartTotal").textContent = valid ? formatAmount(total) : "--";
     const safeReason = status.runtime?.safe_reason;
+    const recoverySyncs = Math.max(0, Math.min(2, Number(status.runtime?.consistent_syncs || 0)));
+    const recoveryDetail = mode === "SAFE" ? ` · 自动对账 ${recoverySyncs}/2` : "";
     $("statusHeadline").textContent = stale
         ? "状态已过期，请检查实盘进程或网络。"
-        : (mode === "SAFE" ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}` : (status.last_status || "实盘状态已同步。"));
+        : (mode === "SAFE"
+            ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}${recoveryDetail}`
+            : (status.last_status || "实盘状态已同步。"));
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
@@ -511,11 +526,21 @@ function renderPreflight(data) {
         ["切片", `${summary.actualSlices ?? 0} / ${summary.targetSlices ?? 0} 笔`],
         ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
         ["启动后先撤销", `${(summary.pendingCancellations || []).length} 笔不兼容机器人挂单`],
+        ["确认后接管外部挂单", `${(summary.externalAdoptionCandidates || []).length} 笔`],
+        ["比例再平衡预计撤销", `${(summary.ratioRebalanceCancellations || []).length} 笔`],
         ["无法撤销的贷款", `${(summary.nonChangeableCredits || []).length} 笔`],
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
     items.push(["实际 V3 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    const adoptionRows = (summary.externalAdoptionCandidates || []).map(
+        (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
+    );
+    if (adoptionRows.length) items.push(["待接管外部挂单明细", adoptionRows.join("；")]);
+    const ratioRows = (summary.ratioRebalanceCancellations || []).map(
+        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} USD · ${row.period}天`
+    );
+    if (ratioRows.length) items.push(["比例再平衡撤单明细", ratioRows.join("；")]);
     if (data.preflightId) {
         const expires = new Date(data.expiresAt);
         items.push(["本地启动确认有效至", Number.isNaN(expires.getTime()) ? data.expiresAt : `${expires.toLocaleTimeString("zh-CN", { hour12: false })}（最长 5 分钟，不是 Bitfinex API 令牌）`]);
