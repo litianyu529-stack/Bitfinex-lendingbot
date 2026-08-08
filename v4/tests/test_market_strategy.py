@@ -140,6 +140,8 @@ def test_pool_redistribution_and_small_idle_target(policy: V4Policy, market) -> 
     targeted = build_plan(policy, market, D("610"), D("1000"), target_pool="medium")
     assert {item.pool for item in targeted.orders} == {"medium"}
     assert sum(item.amount for item in targeted.orders) == D("610")
+    one_minimum = build_plan(policy, market, D("150"), D("150"))
+    assert {item.pool for item in one_minimum.orders} == {"short"}
     with pytest.raises(ValueError):
         build_plan(policy, market, D("610"), D("1000"), target_pool="long")
 

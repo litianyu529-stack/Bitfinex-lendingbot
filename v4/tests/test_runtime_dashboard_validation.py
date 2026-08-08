@@ -33,6 +33,7 @@ D = Decimal
 
 
 def settings(tmp_path: Path, policy: V4Policy | None = None) -> V4Settings:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     config = tmp_path / "default.cfg"
     config.write_text("[BITFINEX]\n[BOT_V4]\n[STRATEGY_V4]\n", encoding="utf-8")
     return V4Settings(
@@ -115,6 +116,11 @@ def test_live_runtime_stale_market_enters_safe(tmp_path: Path) -> None:
     runtime.bootstrap_market()
     assert runtime.cycle(force_full=True).mode == RuntimeMode.SAFE
     assert "market data" in (store.safe_reason() or "")
+
+    shadow_store = V4Store(tmp_path / "shadow.sqlite3")
+    shadow_runtime = LendingRuntime(settings(tmp_path / "shadow"), client=client, store=shadow_store)
+    shadow_runtime.bootstrap_market()
+    assert shadow_runtime.cycle(force_full=True).mode == RuntimeMode.SAFE
 
 
 def test_runtime_unknown_available_balance_enters_safe_before_reconciliation(tmp_path: Path) -> None:

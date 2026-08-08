@@ -165,8 +165,9 @@ class LendingRuntime:
             self.last_action = "SAFE_ACCOUNT_SYNC"
             return self.status()
         self.last_account = account
-        if not account.authoritative:
-            self.store.enter_safe("account available balance is not authoritative")
+        account_stale = int(time.time() * 1000) - account.as_of_ms > self.policy.fast_sync_seconds * 1000
+        if not account.authoritative or account_stale:
+            self.store.enter_safe("account snapshot is stale or available balance is not authoritative")
             self.last_action = "SAFE_ACCOUNT_UNKNOWN"
             self._write_status()
             return self.status()
@@ -185,8 +186,7 @@ class LendingRuntime:
         market = self._snapshot_market(refresh_rest=full_due)
         self.last_market = market
         if not market.fresh or market.valid_components < 2:
-            if mode == RuntimeMode.LIVE:
-                self.store.enter_safe("market data is stale or has fewer than two valid anchor signals")
+            self.store.enter_safe("market data is stale or has fewer than two valid anchor signals")
             self.last_action = "NO_WRITE_STALE_MARKET"
             self._write_status()
             return self.status()

@@ -107,6 +107,12 @@ def _allocate_pool_amounts(policy: V4Policy, market: MarketSnapshot, deployable:
     amounts["medium"] = remainder - amounts["short"]
     # A pool that cannot create one valid offer releases its amount to the other
     # eligible pool. This preserves utilization without violating the floor.
+    undersized = [pool for pool in ("short", "medium") if D("0") < amounts[pool] < MIN_OFFER]
+    if len(undersized) == 2:
+        preferred = max(("short", "medium"), key=lambda pool: (weights[pool], pool == "short"))
+        other = "medium" if preferred == "short" else "short"
+        amounts[preferred] = amounts["short"] + amounts["medium"]
+        amounts[other] = D("0")
     for pool, other in (("short", "medium"), ("medium", "short")):
         if D("0") < amounts[pool] < MIN_OFFER:
             amounts[other] += amounts[pool]
