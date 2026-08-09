@@ -173,6 +173,32 @@ def test_watchdog_hung_worker_enters_recovery_and_stops_exact_process(tmp_path, 
     assert recovery["category"] == "WORKER_HEARTBEAT_TIMEOUT"
 
 
+def test_watchdog_ignores_stale_heartbeat_from_previous_worker(tmp_path, monkeypatch):
+    context = lendingbot.AppContext.for_project(tmp_path, now=lambda: 400)
+    context.process_state.supervisor_stop = OneSupervisorIteration()
+    context.process_state.supervisor_session = "session"
+    context.process_state.auto_restart_authorization = {
+        "session": "session",
+        "authorizedAt": 399,
+    }
+    store = LendingStateStore(context.state_db_path, clock=lambda: 400)
+    store.set_mode("PAUSED", "dashboard_stop")
+    store.touch_heartbeat(1_000)
+    monkeypatch.setattr(lendingbot, "v3_store_for_config", lambda _path: (store, None))
+    monkeypatch.setattr(lendingbot, "controlled_bot_status", lambda *_args, **_kwargs: {"running": True})
+    stopped = []
+    monkeypatch.setattr(
+        lendingbot,
+        "stop_controlled_bot",
+        lambda *_args, **kwargs: stopped.append(kwargs.get("preserve_authorization")),
+    )
+
+    lendingbot.worker_supervisor_loop(context.config_path, context.status_path, context)
+
+    assert stopped == []
+    assert store.recovery_status()["active"] is False
+
+
 def test_watchdog_restarts_only_after_valid_session_preflight(tmp_path, monkeypatch):
     context = lendingbot.AppContext.for_project(tmp_path, now=lambda: 100)
     context.process_state.supervisor_stop = OneSupervisorIteration()

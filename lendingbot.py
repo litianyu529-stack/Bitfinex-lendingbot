@@ -367,8 +367,7 @@ def provider_funding_rows(snapshot):
 def proposed_external_adoption(account_snapshot, policy):
     candidates = []
     simulated = {
-        key: [dict(row) for row in account_snapshot.get(key, [])]
-        for key in ("wallets", "offers", "credits", "loans")
+        key: [dict(row) for row in account_snapshot.get(key, [])] for key in ("wallets", "offers", "credits", "loans")
     }
     if policy.adopt_external_offers:
         for offer in simulated["offers"]:
@@ -917,10 +916,7 @@ def dashboard_status_payload(status_path, config_path, context=None):
             empty["runtime"] = runtime
             empty["recovery"] = recovery
             empty["operationMode"] = "PAUSED" if runtime["mode"] != "SAFE" else "SAFE"
-            empty["last_status"] = (
-                f"机器人进程已停止（{stop_reason_message(stop_reason)}）；"
-                "账户与挂单快照当前不可用。"
-            )
+            empty["last_status"] = f"机器人进程已停止（{stop_reason_message(stop_reason)}）；账户与挂单快照当前不可用。"
             empty["lastStopReason"] = stop_reason
             empty["snapshotAvailable"] = False
             empty["process"] = process
@@ -1261,9 +1257,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         if basis["source"] == "REAL_ACCOUNT"
         else "实时账户读取失败，不能使用历史快照启动实盘",
     )
-    account_reconciled = bool(account.get("walletAvailableKnown")) and account.get(
-        "reconciliationStatus"
-    ) == "MATCHED"
+    account_reconciled = bool(account.get("walletAvailableKnown")) and account.get("reconciliationStatus") == "MATCHED"
     add_check(
         "account_reconciliation",
         "Funding 账户对账",
@@ -1654,7 +1648,11 @@ def worker_supervisor_loop(config_path, status_path, context):
             if status["running"]:
                 heartbeat = recovery.get("heartbeatAt")
                 authorized_ms = int(float(authorization.get("authorizedAt") or context.now()) * 1000)
-                baseline = int(heartbeat or authorized_ms)
+                # A heartbeat belongs to the worker that wrote it.  After a
+                # controlled restart the persisted value may be older than the
+                # new process, so never start the five-minute timeout before
+                # this session's authorization time.
+                baseline = max(int(heartbeat or 0), authorized_ms)
                 if now_ms - baseline < WORKER_HEARTBEAT_TIMEOUT_MS:
                     continue
                 runtime = store.runtime()
