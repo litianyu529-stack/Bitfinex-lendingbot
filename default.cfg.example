@@ -28,21 +28,17 @@ long_floor_apr =
 
 # Term pools and execution layers must each total 100.
 short_share = 50
-medium_share = 30
-long_share = 20
+medium_share = 35
+long_share = 15
 quick_share = 40
 balanced_share = 40
 high_share = 20
 
-short_periods = 2,3,5,7
-medium_periods = 8,14,21,30
+short_periods = 2,7
+medium_periods = 14,30
 long_periods = 120
-target_slices = 50
-min_order_amount = 150
 max_lend_amount =
 max_lend_percent = 100
-amount_jitter = 3
-max_pool_shift = 10
 
 normal_fee_rate = 15
 hidden_fee_rate = 18
@@ -56,9 +52,9 @@ adopt_external_offers = false
 hidden_max_share =
 
 minimum_offer_minutes = 10
-short_reprice_stages_minutes = 10,30,60
-medium_reprice_stages_minutes = 20,60,120
-long_reprice_stages_minutes = 60,180,360
+short_reprice_stages_minutes = 10,30,60,90,120,180
+medium_reprice_stages_minutes = 20,60,120,180,240,360
+long_reprice_stages_minutes = 60,180,360,480,720,1440
 reprice_cooldown_minutes = 10
 max_reprices_per_hour = 6
 minimum_rate_change = 0.002

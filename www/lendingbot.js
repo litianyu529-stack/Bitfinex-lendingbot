@@ -155,6 +155,79 @@ function normalizedOffer(offer) {
     };
 }
 
+const creditGroupDefinitions = [
+    { key: "short", label: "短期", range: "2–7 天" },
+    { key: "medium", label: "中期", range: "7–30 天" },
+    { key: "long", label: "长期", range: "30–120 天" },
+];
+
+function creditDisplayPool(credit) {
+    if (["short", "medium", "long"].includes(credit.displayPool)) return credit.displayPool;
+    if (["short", "medium", "long"].includes(credit.pool)) return credit.pool;
+    const period = safeNumber(credit.period);
+    if (period <= 7) return "short";
+    return period <= 30 ? "medium" : "long";
+}
+
+function normalizedCredit(credit) {
+    const effectiveRate = credit.effectiveRate ?? credit.rate_real ?? credit.rate;
+    const dailyRatePercent = credit.dailyRatePercent ?? (
+        effectiveRate == null ? null : safeNumber(effectiveRate) * 100
+    );
+    const opening = credit.mts_opening || credit.mts_created || null;
+    const elapsedDays = credit.elapsedDays ?? (
+        opening ? Math.max(0, Date.now() - safeNumber(opening)) / 86400000 : null
+    );
+    const contractEndAtMs = credit.contractEndAtMs ?? (
+        opening ? safeNumber(opening) + safeNumber(credit.period) * 86400000 : null
+    );
+    return {
+        ...credit,
+        displayPool: creditDisplayPool(credit),
+        dailyRatePercent,
+        elapsedDays,
+        contractEndAtMs,
+        opening,
+        managedByBot: credit.managedByBot ?? Boolean(credit.managed),
+        displayType: credit.display_type || credit.rate_type || "FIXED",
+        fundingState: credit.funding_state || "credit",
+    };
+}
+
+function fundingStateLabel(credit) {
+    return credit.fundingState === "loan" ? "Funding Loan" : "Funding Credit";
+}
+
+function formatDays(value, digits = 1) {
+    if (value === null || value === undefined || value === "") return "--";
+    return `${formatAmount(value, digits)} 天`;
+}
+
+function formatDateTime(value) {
+    if (!value) return "--";
+    const date = new Date(safeNumber(value));
+    if (Number.isNaN(date.getTime())) return "--";
+    return date.toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+    });
+}
+
+function creditAttribution(credit) {
+    if (!credit.managedByBot) return "外部订单";
+    const pool = credit.pool || credit.displayPool;
+    const poolLabel = { short: "短期", medium: "中期", long: "长期" }[pool] || pool;
+    const layerLabel = {
+        quick: "快速成交",
+        balanced: "均衡",
+        high: "高收益",
+    }[credit.layer] || credit.layer;
+    return `机器人 · ${poolLabel}${layerLabel ? ` · ${layerLabel}` : ""}`;
+}
+
 function distributionValues() {
     const account = state.status?.account || {};
     return [
@@ -231,11 +304,22 @@ function repriceLabel(offer) {
     const age = ageLabel(offer.created);
     const state = offer.repriceState;
     if (!state) return age;
+    const floorState = state.floorState;
+    if (floorState === "REPRICE_PENDING") return `${age} · 正在重挂到策略底线`;
+    if (floorState === "REPRICE_REQUIRED") return `${age} · 已到第 6 阶段 · 等待重挂到底线`;
+    if (floorState === "SATISFIED_WITHIN_TOLERANCE") return `${age} · 已达到策略底线（容差内）`;
     const stage = safeNumber(state.stage);
-    if (!state.nextStageAtMs) return `${age} · 已到第 ${stage} 阶段`;
+    const stageType = state.stageType === "FLOOR" ? "底线" : "市场";
+    const nextStageType = state.nextStageType === "FLOOR" ? "底线" : "市场";
+    if (stage <= 0 && state.nextStageAtMs) {
+        const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
+        const minutes = Math.ceil(remaining / 60000);
+        return `${age} · 等待${nextStageType}第 1 阶段 · ${minutes} 分钟后检查`;
+    }
+    if (!state.nextStageAtMs) return `${age} · ${stageType}第 ${stage} 阶段已检查`;
     const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
     const minutes = Math.ceil(remaining / 60000);
-    return `${age} · 第 ${stage} 阶段 · ${minutes} 分钟后检查`;
+    return `${age} · ${stageType}第 ${stage} 阶段 · ${minutes} 分钟后检查 · 下一阶段：${nextStageType}`;
 }
 
 function appendCell(row, text, className = "") {
@@ -253,12 +337,17 @@ function appendCell(row, text, className = "") {
 
 function renderOffers() {
     const offers = Array.isArray(state.status?.openOffers) ? state.status.openOffers.map(normalizedOffer) : [];
+    const snapshotAvailable = state.status?.snapshotAvailable !== false;
     const table = $("offersTable");
     const cards = $("offersCards");
+    const empty = $("offersEmpty");
     table.replaceChildren();
     cards.replaceChildren();
-    $("offersEmpty").hidden = offers.length > 0;
-    $("offersMeta").textContent = offers.length ? `${offers.length} 笔真实挂单` : "暂无挂单";
+    empty.hidden = offers.length > 0;
+    empty.textContent = snapshotAvailable ? "暂无活跃挂单" : "挂单状态未知；启动实盘并完成同步后更新";
+    $("offersMeta").textContent = !snapshotAvailable
+        ? "挂单状态未知"
+        : (offers.length ? `${offers.length} 笔真实挂单` : "暂无挂单");
     for (const offer of offers) {
         const row = document.createElement("tr");
         appendCell(row, offer.currency || "--", "currency-pill");
@@ -296,6 +385,172 @@ function renderOffers() {
     }
 }
 
+function appendCreditGroupStat(container, label, value) {
+    const block = document.createElement("div");
+    block.className = "credit-group-stat";
+    const term = document.createElement("span");
+    const detail = document.createElement("strong");
+    term.textContent = label;
+    detail.textContent = value;
+    block.append(term, detail);
+    container.append(block);
+}
+
+function appendCreditCardFact(list, label, value) {
+    const block = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    detail.textContent = value;
+    block.append(term, detail);
+    list.append(block);
+}
+
+function renderCreditGroup(definition, summary, credits) {
+    const section = document.createElement("section");
+    section.className = "credit-group";
+    section.setAttribute("aria-label", `${definition.label}贷出订单`);
+
+    const heading = document.createElement("header");
+    heading.className = "credit-group-heading";
+    const title = document.createElement("div");
+    title.className = "credit-group-title";
+    const titleText = document.createElement("strong");
+    const titleMeta = document.createElement("small");
+    titleText.textContent = `${definition.label}贷出`;
+    titleMeta.textContent = `${definition.range} · ${summary.orderCount || 0} 笔 · ${formatAmount(summary.principal)} USD`;
+    title.append(titleText, titleMeta);
+    heading.append(title);
+    appendCreditGroupStat(heading, "加权平均日利率", formatPercent(summary.averageDailyRatePercent, 5));
+    appendCreditGroupStat(heading, "加权平均期限", formatDays(summary.averageContractDays));
+    appendCreditGroupStat(heading, "平均已贷时长", formatDays(summary.averageElapsedDays));
+    appendCreditGroupStat(heading, "预计净年化", formatPercent(summary.estimatedNetAprPercent, 2));
+    section.append(heading);
+
+    if (!credits.length) {
+        const empty = document.createElement("p");
+        empty.className = "credit-group-empty";
+        empty.textContent = `暂无${definition.label}计息订单`;
+        section.append(empty);
+        return section;
+    }
+
+    const tableWrap = document.createElement("div");
+    tableWrap.className = "credit-table-wrap";
+    const table = document.createElement("table");
+    table.className = "credit-table";
+    const head = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    for (const label of ["金额", "日利率", "净年化", "期限", "已贷时长", "开始时间", "最晚到期", "类型", "资金状态", "归属", "状态"]) {
+        const cell = document.createElement("th");
+        cell.textContent = label;
+        headerRow.append(cell);
+    }
+    head.append(headerRow);
+    const body = document.createElement("tbody");
+    for (const credit of credits) {
+        const row = document.createElement("tr");
+        appendCell(row, `${formatAmount(credit.amount)} ${credit.currency || "USD"}`);
+        appendCell(row, formatPercent(credit.dailyRatePercent, 5));
+        appendCell(row, formatPercent(credit.netAprPercent, 2));
+        appendCell(row, `${credit.period || "--"} 天`);
+        appendCell(row, formatDays(credit.elapsedDays));
+        appendCell(row, formatDateTime(credit.opening));
+        appendCell(row, formatDateTime(credit.contractEndAtMs));
+        appendCell(row, credit.displayType);
+        appendCell(row, fundingStateLabel(credit));
+        appendCell(row, creditAttribution(credit), "credit-attribution");
+        appendCell(row, credit.status || "ACTIVE", "status-pill");
+        body.append(row);
+    }
+    table.append(head, body);
+    tableWrap.append(table);
+
+    const cards = document.createElement("div");
+    cards.className = "credit-order-cards";
+    for (const credit of credits) {
+        const card = document.createElement("article");
+        card.className = "credit-order-card";
+        const cardHeader = document.createElement("header");
+        const amount = document.createElement("strong");
+        const status = document.createElement("span");
+        amount.textContent = `${formatAmount(credit.amount)} ${credit.currency || "USD"}`;
+        status.className = "status-pill";
+        status.textContent = credit.status || "ACTIVE";
+        cardHeader.append(amount, status);
+        const facts = document.createElement("dl");
+        appendCreditCardFact(facts, "日利率", formatPercent(credit.dailyRatePercent, 5));
+        appendCreditCardFact(facts, "净年化", formatPercent(credit.netAprPercent, 2));
+        appendCreditCardFact(facts, "期限", `${credit.period || "--"} 天`);
+        appendCreditCardFact(facts, "已贷时长", formatDays(credit.elapsedDays));
+        appendCreditCardFact(facts, "开始时间", formatDateTime(credit.opening));
+        appendCreditCardFact(facts, "最晚到期", formatDateTime(credit.contractEndAtMs));
+        appendCreditCardFact(facts, "类型", credit.displayType);
+        appendCreditCardFact(facts, "资金状态", fundingStateLabel(credit));
+        appendCreditCardFact(facts, "归属", creditAttribution(credit));
+        card.append(cardHeader, facts);
+        cards.append(card);
+    }
+    section.append(tableWrap, cards);
+    return section;
+}
+
+function renderCredits(valid, stale, total) {
+    const status = state.status || {};
+    const snapshotAvailable = status.snapshotAvailable !== false;
+    const credits = valid && snapshotAvailable && Array.isArray(status.credits)
+        ? status.credits.map(normalizedCredit)
+        : [];
+    const dashboardSummary = valid && snapshotAvailable ? status.activeCreditSummary || {} : {};
+    const overall = dashboardSummary.overall || {};
+    const groups = dashboardSummary.groups || {};
+    const principal = safeNumber(overall.principal);
+
+    $("creditPrincipal").textContent = valid && snapshotAvailable ? formatAmount(principal) : "--";
+    $("creditOrderCount").textContent = valid && snapshotAvailable ? `${overall.orderCount || 0} 笔正在计息` : "--";
+    $("creditUtilization").textContent = valid && snapshotAvailable
+        ? formatPercent(overall.utilizationPercent, 1)
+        : "--";
+    $("creditIdleAmount").textContent = valid && snapshotAvailable
+        ? `未计息资金 ${formatAmount(Math.max(0, total - principal))} USD`
+        : "未计息资金 --";
+    $("creditAverageRate").textContent = valid && snapshotAvailable
+        ? formatPercent(overall.averageDailyRatePercent, 5)
+        : "--";
+    $("creditNetApr").textContent = valid && snapshotAvailable
+        ? `净年化估算 ${formatPercent(overall.estimatedNetAprPercent, 2)}`
+        : "净年化估算 --";
+    $("creditAveragePeriod").textContent = valid && snapshotAvailable
+        ? formatDays(overall.averageContractDays)
+        : "--";
+    $("creditAverageElapsed").textContent = valid && snapshotAvailable
+        ? `平均已贷 ${formatDays(overall.averageElapsedDays)}`
+        : "平均已贷 --";
+    $("creditDailyIncome").textContent = valid && snapshotAvailable
+        ? `${formatAmount(overall.estimatedNetIncomePerDay, 4)} USD`
+        : "--";
+    $("currentLendingRate").textContent = valid && snapshotAvailable
+        ? formatPercent(overall.averageDailyRatePercent, 5)
+        : "--";
+    $("creditsMeta").textContent = !snapshotAvailable
+        ? "贷出状态未知"
+        : (stale ? "数据已过期" : `${credits.length} 笔正在计息`);
+
+    const container = $("creditGroups");
+    container.replaceChildren();
+    for (const definition of creditGroupDefinitions) {
+        const rows = credits
+            .filter((credit) => credit.displayPool === definition.key)
+            .sort((left, right) => safeNumber(right.amount) - safeNumber(left.amount));
+        container.append(renderCreditGroup(definition, groups[definition.key] || {}, rows));
+    }
+    const empty = $("creditsEmpty");
+    empty.hidden = credits.length > 0;
+    empty.textContent = snapshotAvailable
+        ? "暂无正在计息的订单"
+        : "贷出状态未知；启动实盘并完成同步后更新";
+}
+
 function renderStatus() {
     const status = state.status || {};
     const valid = status.schemaVersion === 3 && !status.legacyIgnored && Boolean(status.last_update);
@@ -315,6 +570,12 @@ function renderStatus() {
     $("totalLent").textContent = valid ? formatAmount(lent) : "--";
     $("totalOffers").textContent = valid ? formatAmount(offers) : "--";
     $("totalAvailable").textContent = valid ? formatAmount(available) : "--";
+    $("totalCoins").title = valid
+        ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} USD；组成项对账 ${account.reconciliationStatus || "--"}`
+        : "";
+    $("totalLent").title = valid
+        ? `Funding Credits ${formatAmount(account.creditPrincipal)} USD + Funding Loans ${formatAmount(account.loanPrincipal)} USD`
+        : "";
     $("earningsToday").textContent = realized.today != null
         ? formatAmount(realized.today)
         : (statistics["1d"] ? formatAmount(statistics["1d"].netInterest) : "--");
@@ -339,7 +600,9 @@ function renderStatus() {
     }
     incomeState.classList.toggle("income-warning", incomeSync.status === "ERROR");
     $("totalCurrency").textContent = currency;
-    $("offerCount").textContent = `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
+    $("offerCount").textContent = status.snapshotAvailable === false
+        ? "--"
+        : `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
     $("chartTotal").textContent = valid ? formatAmount(total) : "--";
     const safeReason = status.runtime?.safe_reason;
     const recoverySyncs = Math.max(0, Math.min(2, Number(status.runtime?.consistent_syncs || 0)));
@@ -353,9 +616,9 @@ function renderStatus() {
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3 · ${mode}`);
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.1 · ${mode}`);
     badge.classList.toggle("invalid", !valid || stale || mode === "SAFE");
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3 · 已过期" : `V3 · ${mode}`);
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.1 · 已过期" : `V3.1 · ${mode}`);
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
     const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
@@ -369,6 +632,7 @@ function renderStatus() {
 
     const values = distributionValues();
     renderLegend(values, total);
+    renderCredits(valid, stale, total);
     renderOffers();
     renderLogs(status.log || []);
     drawDistribution();
@@ -482,6 +746,13 @@ function trapDialogKey(event) {
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
 }
 
+function allocationPercentages(allocation) {
+    const entries = Object.entries(allocation?.current || {}).map(([name, value]) => [name, safeNumber(value)]);
+    const total = entries.reduce((sum, [, value]) => sum + value, 0);
+    if (total <= 0) return "当前无机器人挂单";
+    return entries.map(([name, value]) => `${name} ${formatAmount(value / total * 100, 1)}%`).join(" / ");
+}
+
 function renderPreflight(data) {
     $("preflightLoading").hidden = true;
     $("preflightContent").hidden = false;
@@ -520,8 +791,10 @@ function renderPreflight(data) {
         ["真实账户本金", `${formatAmount(summary.account?.total)} USD`],
         ["真实可用余额", `${formatAmount(summary.account?.wallet)} USD`],
         ["允许订单类型", (summary.enabledOrderTypes || []).join(" / ") || "--"],
-        ["期限资金池", Object.entries(summary.fundingPools || {}).map(([name, row]) => `${name} ${row.share}%`).join(" / ") || "--"],
-        ["成交层", Object.entries(summary.executionLayers || {}).map(([name, value]) => `${name} ${value}%`).join(" / ") || "--"],
+        ["目标期限资金池", Object.entries(summary.fundingPools || {}).map(([name, row]) => `${name} ${row.share}%`).join(" / ") || "--"],
+        ["当前机器人挂单期限", allocationPercentages(summary.offerPoolAllocation)],
+        ["目标成交层", Object.entries(summary.executionLayers || {}).map(([name, value]) => `${name} ${value}%`).join(" / ") || "--"],
+        ["当前机器人挂单成交层", allocationPercentages(summary.offerLayerAllocation)],
         ["资金上限", `${formatAmount(summary.fundingLimit?.effectiveCap)} USD · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
         ["切片", `${summary.actualSlices ?? 0} / ${summary.targetSlices ?? 0} 笔`],
         ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
@@ -532,7 +805,7 @@ function renderPreflight(data) {
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    items.push(["实际 V3.1 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );

@@ -9,6 +9,7 @@ from decimal import Decimal
 from ExchangeModels import (
     parse_credit_rows,
     parse_funding_trade_history,
+    parse_loan_rows,
     parse_offer_rows,
     parse_wallet_rows,
 )
@@ -64,11 +65,13 @@ class BitfinexMarketDataHub:
         self._wallet_snapshot_ready = False
         self._offers_snapshot_ready = False
         self._credits_snapshot_ready = False
+        self._loans_snapshot_ready = False
         self._book = {}
         self._trades = deque(maxlen=self.max_trades)
         self._wallets = {}
         self._offers = {}
         self._credits = {}
+        self._loans = {}
         self._funding_trades = deque(maxlen=5000)
         self._public_connected = False
         self._auth_connected = False
@@ -168,6 +171,7 @@ class BitfinexMarketDataHub:
             self._wallet_snapshot_ready = False
             self._offers_snapshot_ready = False
             self._credits_snapshot_ready = False
+            self._loans_snapshot_ready = False
             self._auth_connected = False
         nonce = str(int(time.time() * 1_000_000))
         payload = "AUTH" + nonce
@@ -178,6 +182,7 @@ class BitfinexMarketDataHub:
             "authSig": signature,
             "authNonce": nonce,
             "authPayload": payload,
+            "calc": 1,
             "filter": [f"funding-{self.symbol}", "wallet"],
         }
         with websocket_connect(
@@ -311,6 +316,14 @@ class BitfinexMarketDataHub:
                 self._credits[credit["id"]] = credit
             elif event == "fcc" and payload:
                 self._credits.pop(int(payload[0]), None)
+            elif event == "fls":
+                self._loans = {int(row[0]): self._parse_loan(row) for row in payload or [] if len(row) >= 13}
+                self._loans_snapshot_ready = True
+            elif event in {"fln", "flu"} and payload:
+                loan = self._parse_loan(payload)
+                self._loans[loan["id"]] = loan
+            elif event == "flc" and payload:
+                self._loans.pop(int(payload[0]), None)
             elif event == "ws":
                 self._wallets = {
                     self._wallet_key(row): self._parse_wallet(row) for row in payload or [] if len(row) >= 3
@@ -341,11 +354,25 @@ class BitfinexMarketDataHub:
         return parsed[0] if parsed else None
 
     @staticmethod
+    def _parse_loan(row):
+        parsed = parse_loan_rows([row], currency="")
+        return parsed[0] if parsed else None
+
+    @staticmethod
     def _parse_funding_trade(row):
         parsed = parse_funding_trade_history([row], currency="")
         return parsed[0] if parsed else None
 
-    def apply_rest_snapshot(self, book=None, trades=None, wallets=None, offers=None, credits=None, synced_at_ms=None):
+    def apply_rest_snapshot(
+        self,
+        book=None,
+        trades=None,
+        wallets=None,
+        offers=None,
+        credits=None,
+        loans=None,
+        synced_at_ms=None,
+    ):
         now = int(synced_at_ms if synced_at_ms is not None else _now_ms())
         with self._lock:
             if book is not None:
@@ -379,6 +406,13 @@ class BitfinexMarketDataHub:
                     else self._parse_credit(row)
                     for row in credits
                 }
+            if loans is not None:
+                self._loans = {
+                    int(row["id"] if isinstance(row, dict) else row[0]): dict(row)
+                    if isinstance(row, dict)
+                    else self._parse_loan(row)
+                    for row in loans
+                }
             self._rest_last_sync_ms = now
         if self.store is not None and trades:
             self.store.upsert_market_trades(trades)
@@ -390,11 +424,24 @@ class BitfinexMarketDataHub:
             auth_age = None if self._auth_last_message_ms is None else max(0, now - self._auth_last_message_ms)
             rest_age = None if self._rest_last_sync_ms is None else max(0, now - self._rest_last_sync_ms)
             public_ready = self._public_connected and self._book_snapshot_ready
+            wallet_currency = self.symbol[1:] if str(self.symbol).upper().startswith("F") else self.symbol
+            funding_wallets = [
+                row
+                for row in self._wallets.values()
+                if row is not None
+                and row.get("wallet_type") == "funding"
+                and row.get("currency") == str(wallet_currency).upper()
+            ]
+            wallet_available_ready = bool(funding_wallets) and all(
+                row.get("available") is not None for row in funding_wallets
+            )
             auth_ready = not self.api_key or (
                 self._auth_connected
                 and self._wallet_snapshot_ready
+                and wallet_available_ready
                 and self._offers_snapshot_ready
                 and self._credits_snapshot_ready
+                and self._loans_snapshot_ready
             )
             ws_healthy = public_ready and auth_ready
             rest_fresh = rest_age is not None and rest_age <= self.rest_stale_ms
@@ -422,6 +469,7 @@ class BitfinexMarketDataHub:
                 "authGeneration": self._auth_generation if self.api_key else None,
                 "bookSnapshotReady": self._book_snapshot_ready,
                 "accountSnapshotsReady": auth_ready if self.api_key else None,
+                "walletAvailableReady": wallet_available_ready if self.api_key else None,
                 "publicAgeMs": public_age,
                 "authAgeMs": auth_age,
                 "restAgeMs": rest_age,
@@ -433,5 +481,6 @@ class BitfinexMarketDataHub:
                 "wallets": [dict(row) for row in self._wallets.values()],
                 "offers": [dict(row) for row in self._offers.values()],
                 "credits": [dict(row) for row in self._credits.values()],
+                "loans": [dict(row) for row in self._loans.values()],
                 "fundingTrades": [dict(row) for row in self._funding_trades],
             }

@@ -2,12 +2,15 @@
 
 import json
 import os
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 WWW = os.path.join(ROOT, "www")
+FIXTURE_NOW_MS = int(time.time() * 1000)
+FIXTURE_LAST_UPDATE = time.strftime("%Y-%m-%d %H:%M:%S")
 
 CONFIG = {
     "configPath": os.path.join(ROOT, "tests", "fixture.cfg"),
@@ -61,14 +64,11 @@ V3_POLICY = {
     "short_floor_apr": "6",
     "medium_floor_apr": "8",
     "long_floor_apr": "10",
-    "short_periods": [2, 3, 5, 7],
-    "medium_periods": [8, 14, 21, 30],
-    "long_periods": [120],
-    "target_slices": 60,
-    "min_order_amount": "150",
+    "short_periods": "2-7",
+    "medium_periods": "7-30",
+    "long_periods": "30-120",
     "max_lend_amount": None,
     "max_lend_percent": "100",
-    "amount_jitter": "3",
     "max_pool_shift": "10",
     "normal_fee_rate": "15",
     "hidden_fee_rate": "18",
@@ -169,12 +169,42 @@ CONFIG["strategy"] = {
 }
 
 STATUS = {
-    "schemaVersion": 2,
-    "operationMode": "live",
-    "last_status": "已放贷：[9,760.00 USD] · 3 笔挂单等待成交",
-    "last_update": "2026-07-18 16:20:08",
+    "schemaVersion": 3,
+    "operationMode": "LIVE",
+    "runtime": {"mode": "LIVE", "safe_reason": None, "consistent_syncs": 2},
+    "snapshotAvailable": True,
+    "last_status": "已放贷 9,760.00 USD · 3 笔贷款正在计息",
+    "last_update": FIXTURE_LAST_UPDATE,
     "outputCurrency": {"currency": "USD", "highestBid": "1"},
     "platformFeeRate": "15",
+    "account": {
+        "total": "12480",
+        "credits": "9760",
+        "offers": "1520",
+        "wallet": "1200",
+    },
+    "market": {"anchor_rate": "0.000149"},
+    "strategyV3": {
+        "currency": "USD",
+        "plan": [
+            {"amount": "600", "effective_rate": "0.00015"},
+            {"amount": "600", "effective_rate": "0.00018"},
+        ],
+    },
+    "realizedIncome": {
+        "today": "4.28",
+        "thirtyDays": "118.64",
+        "lifetime": "842.36",
+    },
+    "incomeHistorySync": {
+        "status": "COMPLETE",
+        "earliestMts": FIXTURE_NOW_MS - 365 * 86_400_000,
+        "error": "",
+    },
+    "statistics": {
+        "1d": {"netInterest": "4.28", "actualNetAprPercent": "10.8"},
+        "30d": {"netInterest": "118.64", "actualNetAprPercent": "11.56"},
+    },
     "raw_data": {
         "USD": {
             "totalCoins": "12480",
@@ -241,6 +271,122 @@ STATUS = {
             "status": "ACTIVE",
         },
     ],
+    "credits": [
+        {
+            "id": "83100101",
+            "currency": "USD",
+            "amount": "3000",
+            "rate": "0.00015",
+            "effectiveRate": "0.00015",
+            "dailyRatePercent": "0.015",
+            "feeRatePercent": "15",
+            "netAprPercent": "4.65375",
+            "period": 7,
+            "elapsedDays": "1",
+            "mts_opening": FIXTURE_NOW_MS - 86_400_000,
+            "contractEndAtMs": FIXTURE_NOW_MS + 6 * 86_400_000,
+            "rate_type": "FIXED",
+            "display_type": "LIMIT",
+            "displayPool": "short",
+            "pool": "short",
+            "layer": "quick",
+            "managed": True,
+            "managedByBot": True,
+            "status": "ACTIVE",
+        },
+        {
+            "id": "83100102",
+            "currency": "USD",
+            "amount": "3000",
+            "rate": "0.0002",
+            "effectiveRate": "0.0002",
+            "dailyRatePercent": "0.02",
+            "feeRatePercent": "18",
+            "netAprPercent": "5.986",
+            "period": 14,
+            "elapsedDays": "4",
+            "mts_opening": FIXTURE_NOW_MS - 4 * 86_400_000,
+            "contractEndAtMs": FIXTURE_NOW_MS + 10 * 86_400_000,
+            "rate_type": "FIXED",
+            "display_type": "LIMIT Hidden",
+            "displayPool": "medium",
+            "pool": "medium",
+            "layer": "balanced",
+            "hidden": True,
+            "managed": True,
+            "managedByBot": True,
+            "status": "ACTIVE",
+        },
+        {
+            "id": "83100103",
+            "currency": "USD",
+            "amount": "3760",
+            "rate": "0.00025",
+            "effectiveRate": "0.00025",
+            "dailyRatePercent": "0.025",
+            "feeRatePercent": "15",
+            "netAprPercent": "7.75625",
+            "period": 120,
+            "elapsedDays": "10",
+            "mts_opening": FIXTURE_NOW_MS - 10 * 86_400_000,
+            "contractEndAtMs": FIXTURE_NOW_MS + 110 * 86_400_000,
+            "rate_type": "FIXED",
+            "display_type": "LIMIT",
+            "displayPool": "long",
+            "pool": "external",
+            "managed": False,
+            "managedByBot": False,
+            "status": "ACTIVE",
+        },
+    ],
+    "activeCreditSummary": {
+        "overall": {
+            "orderCount": 3,
+            "principal": "9760",
+            "utilizationPercent": "78.20512820512820512820512821",
+            "shareOfLentPercent": "100",
+            "averageDailyRatePercent": "0.02038934426229508196721311475",
+            "estimatedNetAprPercent": "6.258478483606557377049180327",
+            "averageContractDays": "52.68442622950819672131147541",
+            "averageElapsedDays": "5.389344262295081967213114754",
+            "estimatedNetIncomePerDay": "1.6735",
+        },
+        "groups": {
+            "short": {
+                "orderCount": 1,
+                "principal": "3000",
+                "utilizationPercent": "24.03846153846153846153846154",
+                "shareOfLentPercent": "30.73770491803278688524590164",
+                "averageDailyRatePercent": "0.015",
+                "estimatedNetAprPercent": "4.65375",
+                "averageContractDays": "7",
+                "averageElapsedDays": "1",
+                "estimatedNetIncomePerDay": "0.3825",
+            },
+            "medium": {
+                "orderCount": 1,
+                "principal": "3000",
+                "utilizationPercent": "24.03846153846153846153846154",
+                "shareOfLentPercent": "30.73770491803278688524590164",
+                "averageDailyRatePercent": "0.02",
+                "estimatedNetAprPercent": "5.986",
+                "averageContractDays": "14",
+                "averageElapsedDays": "4",
+                "estimatedNetIncomePerDay": "0.492",
+            },
+            "long": {
+                "orderCount": 1,
+                "principal": "3760",
+                "utilizationPercent": "30.12820512820512820512820513",
+                "shareOfLentPercent": "38.52459016393442622950819672",
+                "averageDailyRatePercent": "0.025",
+                "estimatedNetAprPercent": "7.75625",
+                "averageContractDays": "120",
+                "averageElapsedDays": "10",
+                "estimatedNetIncomePerDay": "0.799",
+            },
+        },
+    },
     "log": [
         "2026-07-18 16:20:08 实盘同步完成：钱包、放贷和挂单状态已更新",
         "2026-07-18 16:20:07 USD 当前市场日利率 0.0149%，策略底价 0.0159%",
@@ -330,14 +476,18 @@ def preflight_payload():
                 "short": {
                     "share": "50",
                     "netFloorAprPercent": "6",
-                    "periods": [2, 3, 5, 7],
+                    "periodRange": "2-7",
                 },
                 "medium": {
                     "share": "30",
                     "netFloorAprPercent": "8",
-                    "periods": [8, 14, 21, 30],
+                    "periodRange": "7-30",
                 },
-                "long": {"share": "20", "netFloorAprPercent": "10", "periods": [120]},
+                "long": {
+                    "share": "20",
+                    "netFloorAprPercent": "10",
+                    "periodRange": "30-120",
+                },
             },
             "executionLayers": {"quick": "40", "balanced": "40", "high": "20"},
             "fundingLimit": {
@@ -347,8 +497,13 @@ def preflight_payload():
                 "existingExposure": "11280",
                 "capRemaining": "1200",
             },
-            "targetSlices": 60,
+            "targetSlices": 8,
             "actualSlices": 2,
+            "orderSizing": {
+                "chunkBaseAmount": "150",
+                "remainderPolicy": "EVENLY_DISTRIBUTE",
+                "maxSubmissionsPer60Seconds": 60,
+            },
             "planHash": "fixture-plan-hash",
             "strategyPlan": [
                 {
@@ -410,6 +565,7 @@ class FixtureHandler(SimpleHTTPRequestHandler):
         if path == "/api/config":
             return self.send_json(CONFIG)
         if path == "/api/status":
+            STATUS["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
             return self.send_json(STATUS)
         if path == "/api/control/status":
             return self.send_json(CONTROL)
@@ -518,7 +674,7 @@ class FixtureHandler(SimpleHTTPRequestHandler):
                         "plan": plan,
                         "planned_amount": "1200",
                         "idle_amount": "0",
-                        "target_slice_count": 60,
+                        "target_slice_count": 8,
                         "plan_hash": "fixture-plan-hash",
                         "funding_cap": "12480",
                         "existing_exposure": "11280",

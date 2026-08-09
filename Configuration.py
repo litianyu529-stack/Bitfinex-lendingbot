@@ -111,7 +111,6 @@ V3_PERCENT_FIELDS = {
     "short_floor_apr",
     "medium_floor_apr",
     "long_floor_apr",
-    "amount_jitter",
     "normal_fee_rate",
     "hidden_fee_rate",
     "minimum_rate_change",
@@ -126,7 +125,6 @@ V3_BOOL_FIELDS = {
     "adopt_external_offers",
 }
 V3_INT_FIELDS = {
-    "target_slices",
     "minimum_offer_minutes",
     "reprice_cooldown_minutes",
     "max_reprices_per_hour",
@@ -142,7 +140,13 @@ V3_LIST_FIELDS = {
     "medium_reprice_stages_minutes",
     "long_reprice_stages_minutes",
 }
-V3_CONFIG_FIELDS = tuple(name for name in StrategyPolicyV3.__dataclass_fields__ if name not in {"version", "currency"})
+V3_PERIOD_FIELDS = {"short_periods", "medium_periods", "long_periods"}
+V3_FIXED_FIELDS = {"max_pool_shift"}
+V3_CONFIG_FIELDS = tuple(
+    name
+    for name in StrategyPolicyV3.__dataclass_fields__
+    if name not in {"version", "currency", *V3_FIXED_FIELDS}
+)
 
 
 def strategy_v3_from_config(config):
@@ -171,6 +175,8 @@ def strategy_v3_from_config(config):
                 values[field_name] = str(raw).strip().lower() in {"1", "true", "yes", "on"}
             elif field_name in V3_INT_FIELDS:
                 values[field_name] = int(raw)
+            elif field_name in V3_PERIOD_FIELDS:
+                values[field_name] = raw
             elif field_name in V3_LIST_FIELDS:
                 values[field_name] = tuple(int(item.strip()) for item in str(raw).split(",") if item.strip())
             else:
@@ -191,6 +197,8 @@ def strategy_v3_config_values(policy):
             values[field_name] = decimal_percent_to_config(value)
         elif isinstance(value, bool):
             values[field_name] = str(value).lower()
+        elif field_name in V3_PERIOD_FIELDS:
+            values[field_name] = ",".join(str(item) for item in value)
         elif isinstance(value, tuple):
             values[field_name] = ",".join(str(item) for item in value)
         elif isinstance(value, Decimal):
@@ -202,6 +210,7 @@ def strategy_v3_config_values(policy):
 
 def strategy_v3_api_values(policy):
     payload = policy_v3_to_json(policy)
+    payload.pop("max_pool_shift", None)
     for field_name in V3_PERCENT_FIELDS:
         value = getattr(policy, field_name)
         payload[field_name] = None if value is None else decimal_percent_to_config(value)
@@ -213,6 +222,12 @@ def strategy_v3_api_values(policy):
         if policy.floor_apr(pool) is None
         else decimal_percent_to_config(Decimal(payload["gross_daily_floors"][pool]))
         for pool in ("short", "medium", "long")
+    }
+    payload["fixedSafety"] = {
+        "minimumOrderUsd": "150",
+        "poolShiftCapPercentagePoints": "10",
+        "primaryTermMaxPercent": "70",
+        "submissionLimitPer60Seconds": 60,
     }
     return payload
 
@@ -240,6 +255,8 @@ def strategy_v3_from_api_payload(payload, base=None):
             )
         elif field_name in V3_INT_FIELDS:
             values[field_name] = int(value)
+        elif field_name in V3_PERIOD_FIELDS:
+            values[field_name] = value
         elif field_name in V3_LIST_FIELDS:
             raw = value if isinstance(value, (list, tuple)) else str(value).split(",")
             values[field_name] = tuple(int(item) for item in raw if str(item).strip())
@@ -335,6 +352,7 @@ def normalize_current_active_strategy(config_path):
     serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     canonical_version = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
     if active["version_id"] == canonical_version:
+        store.repair_normalized_reprice_chains(canonical_version)
         return {"changed": False, "versionId": canonical_version, "backup": None}
     if backup is None:
         backup = backup_strategy_state(config_path, settings.state_db_file)

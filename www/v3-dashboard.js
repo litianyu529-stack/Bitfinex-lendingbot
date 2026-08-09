@@ -14,8 +14,8 @@
 
     const groups = [
         {
-            title: "期限资金池",
-            description: "比例约束机器人可控的未成交挂单金额；已成交 Credits 不参与挂单配比。",
+            title: "目标期限资金池",
+            description: "范围作为风险边界；实际挂单按近期 USD 成交笔数 60% + 成交金额 40% 自动加权，优先 2、7、30、120 等活跃期限，不再平均铺到冷门天数。已成交 Credits 不参与挂单配比。",
             fields: [
                 ["short_share", "短期比例", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["medium_share", "中期比例", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -23,20 +23,17 @@
                 ["short_floor_apr", "短期最低净年化", "number", "%", { min: 0, step: 0.01, placeholder: "LIVE 必填", floor: "short" }],
                 ["medium_floor_apr", "中期最低净年化", "number", "%", { min: 0, step: 0.01, placeholder: "LIVE 必填", floor: "medium" }],
                 ["long_floor_apr", "长期最低净年化", "number", "%", { min: 0, step: 0.01, placeholder: "LIVE 必填", floor: "long" }],
-                ["short_periods", "短期期限", "text", "天", {}],
-                ["medium_periods", "中期期限", "text", "天", {}],
-                ["long_periods", "长期期限", "text", "天", { readonly: true }],
+                ["short_periods", "短期候选天数", "text", "天", { placeholder: "2,4,7" }],
+                ["medium_periods", "中期候选天数", "text", "天", { placeholder: "14,30" }],
+                ["long_periods", "长期候选天数", "text", "天", { placeholder: "120" }],
             ],
         },
         {
-            title: "切片与成交层",
-            description: "实际切片数会根据全部本金与最低金额自动缩减。",
+            title: "切片与目标成交层",
+            description: "订单以 150 USD 为最低基数尽可能多地拆分，尾数平均分摊到所有订单；每 60 秒最多新建 60 单，后续循环自动补齐。成交层比例约束机器人可控的未成交挂单。",
             fields: [
-                ["target_slices", "目标切片数", "number", "笔", { min: 1, max: 100, step: 1 }],
-                ["min_order_amount", "最低单笔金额", "number", "USD", { min: 150, step: 0.01 }],
                 ["max_lend_amount", "最大放贷金额", "number", "USD", { min: 0, step: 0.01, placeholder: "不限制" }],
                 ["max_lend_percent", "最大放贷比例", "number", "%", { min: 0, max: 100, step: 1 }],
-                ["amount_jitter", "金额扰动", "number", "%", { min: 0, max: 10, step: 0.1 }],
                 ["quick_share", "快速成交层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["balanced_share", "平衡层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["high_share", "高收益层", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -63,9 +60,9 @@
             details: true,
             fields: [
                 ["minimum_offer_minutes", "最短挂单时间", "number", "分钟", { min: 1 }],
-                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "10 / 30 / 60" }],
-                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "20 / 60 / 120" }],
-                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "60 / 180 / 360" }],
+                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "10 / 30 / 60 / 90 / 120 / 180" }],
+                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "20 / 60 / 120 / 180 / 240 / 360" }],
+                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "60 / 180 / 360 / 480 / 720 / 1440" }],
                 ["reprice_cooldown_minutes", "重定价冷却", "number", "分钟", { min: 1 }],
                 ["max_reprices_per_hour", "每小时重定价上限", "number", "次", { min: 0, max: 90 }],
                 ["minimum_rate_change", "显著利率变化", "number", "%/日", { min: 0, step: 0.0001 }],
@@ -80,6 +77,11 @@
     ];
 
     const allFields = groups.flatMap((group) => group.fields.map((field) => field[0]));
+    const periodFields = new Map([
+        ["short_periods", [2, 7]],
+        ["medium_periods", [7, 30]],
+        ["long_periods", [30, 120]],
+    ]);
     const listFields = new Set([
         "short_periods", "medium_periods", "long_periods",
         "short_reprice_stages_minutes", "medium_reprice_stages_minutes", "long_reprice_stages_minutes",
@@ -93,16 +95,23 @@
         input.type = type;
         for (const [key, value] of Object.entries(options || {})) {
             if (["floor"].includes(key)) continue;
-            if (typeof value === "boolean") input[key] = value;
-            else input.setAttribute(key, value);
+            if (typeof value === "boolean") {
+                if (value) input.setAttribute(key, "");
+            } else input.setAttribute(key, value);
         }
         if (type === "checkbox") {
             const text = document.createElement("span");
             text.textContent = label;
+            if (name.endsWith("_reprice_stages_minutes")) {
+                text.textContent = `${label}（订单创建后的累计分钟）`;
+            }
             wrapper.append(input, text);
         } else {
             const text = document.createElement("span");
             text.textContent = label;
+            if (name.endsWith("_reprice_stages_minutes")) {
+                text.textContent = `${label}（订单创建后的累计分钟）`;
+            }
             const control = document.createElement("div");
             control.append(input);
             if (unit) {
@@ -150,9 +159,15 @@
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
                     <section><h2>实际统计</h2><div id="v3Stats" class="v3-stats"></div></section>
+                    <section><h2>期限自主选择</h2><div id="v3PeriodSelection" class="v3-period-selection"><p>等待市场评分</p></div></section>
+                    <section><h2>近24小时期限分布</h2><div id="v3PeriodActivity" class="v3-period-activity"><p>等待运行数据</p></div></section>
                 </aside>
             </div>`;
         const form = byId("v3StrategyForm");
+        const fixedSafety = document.createElement("p");
+        fixedSafety.className = "v3-fixed-safety";
+        fixedSafety.textContent = "V3.1 固定安全规则：最低订单 150 USD · 单池最多高于基础比例 10 个百分点 · 第一期限最多占池 70% · 每 60 秒最多提交 60 单。";
+        form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");
             section.className = "v3-section";
@@ -210,7 +225,7 @@
             const element = input(name);
             let value = policy?.[name];
             if (listFields.has(name) && Array.isArray(value)) {
-                value = name.endsWith("_reprice_stages_minutes") ? value.join(" / ") : value.join(",");
+                value = periodFields.has(name) ? value.join(",") : value.join(" / ");
             }
             if (element.type === "checkbox") element.checked = Boolean(value);
             else element.value = value ?? "";
@@ -242,16 +257,26 @@
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
         if (poolTotal !== 100) throw new Error(`期限资金池比例当前为 ${poolTotal}%，必须等于100%`);
         if (layerTotal !== 100) throw new Error(`成交层比例当前为 ${layerTotal}%，必须等于100%`);
-        if (numberValue("min_order_amount") < 150) throw new Error("USD最低单笔金额不能低于150");
+        for (const [name, [minimum, maximum]] of periodFields) {
+            const periods = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
+            const unique = new Set(periods);
+            if (
+                periods.length === 0
+                || unique.size !== periods.length
+                || periods.some((value) => !Number.isInteger(value) || value < minimum || value > maximum)
+            ) {
+                throw new Error(`${name.startsWith("short") ? "短期" : name.startsWith("medium") ? "中期" : "长期"}天数必须是 ${minimum}–${maximum} 范围内、不重复的整数，用逗号分隔`);
+            }
+        }
         for (const pool of ["short", "medium", "long"]) {
             const name = `${pool}_reprice_stages_minutes`;
             const stages = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
             if (
-                stages.length !== 3
-                || stages.some((value) => !Number.isInteger(value) || value < 1 || value > 1440)
-                || !(stages[0] < stages[1] && stages[1] < stages[2])
+                stages.length !== 6
+                || stages.some((value) => !Number.isInteger(value) || value < 1 || value > 10080)
+                || stages.some((value, index) => index > 0 && stages[index - 1] >= value)
             ) {
-                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是三个递增的 1–1440 分钟整数`);
+                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是六个递增的 1–10080 分钟整数`);
             }
         }
         if (input("enable_hidden").checked && numberValue("hidden_max_share") <= 0) throw new Error("启用Hidden时必须设置最高占比");
@@ -278,6 +303,51 @@
         return Number.isFinite(number) ? `${(number * 100).toFixed(5)}%` : "--";
     }
 
+    function scorePercent(value) {
+        const number = Number(value);
+        return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : "--";
+    }
+
+    function renderPeriodSelection(selection, activity) {
+        const container = byId("v3PeriodSelection");
+        if (!container) return;
+        container.replaceChildren();
+        const byPool = selection?.byPool || {};
+        for (const pool of ["short", "medium", "long"]) {
+            const data = byPool[pool];
+            if (!data) continue;
+            const block = document.createElement("div");
+            block.className = "v3-period-pool";
+            const title = document.createElement("strong");
+            const duration = Number(data.selectedDurationMs || 0);
+            title.textContent = `${pool} · 当前 ${data.selectedPeriod ?? "闲置"} 天 · ${data.selectionReason || "--"}${duration ? ` · 持续 ${Math.floor(duration / 60000)} 分钟` : ""}`;
+            const challengerMinutes = Math.floor(Number(data.challengerDurationMs || 0) / 60000);
+            const challenger = data.challengerPeriod == null
+                ? "无挑战期限"
+                : `挑战 ${data.challengerPeriod} 天已持续 ${challengerMinutes}/10 分钟`;
+            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 池上限 ${data.poolCapPercent ?? "--"}% · 70/30 · ${challenger}`;
+            block.append(title);
+            for (const row of data.scores || []) {
+                const item = document.createElement("div");
+                item.className = "v3-period-score";
+                const windows = row.windows || {};
+                item.textContent = `${row.period}天｜需求 ${scorePercent(row.demandScore)}｜成交可能 ${scorePercent(row.fillScore)}｜总分 ${scorePercent(row.totalScore)}｜1h ${windows["1h"]?.tradeCount || 0}笔/${Number(windows["1h"]?.tradeVolume || 0).toFixed(2)}｜24h ${windows["24h"]?.tradeCount || 0}笔/${Number(windows["24h"]?.tradeVolume || 0).toFixed(2)}｜7d ${windows["7d"]?.tradeCount || 0}笔/${Number(windows["7d"]?.tradeVolume || 0).toFixed(2)}｜可成交深度 ${Number(row.executableBorrowDepth || 0).toFixed(2)} USD｜最佳借款价 ${percentDaily(row.bestBorrowRate)}｜${row.eligible ? "合格" : row.eligibilityReason || "不合格"}`;
+                block.append(item);
+            }
+            container.append(block);
+        }
+        if (!container.children.length) container.textContent = "当前没有期限评分";
+
+        const activityContainer = byId("v3PeriodActivity");
+        if (!activityContainer) return;
+        activityContainer.replaceChildren();
+        for (const [label, rows] of [["提交", activity?.submitted], ["成交", activity?.traded]]) {
+            const line = document.createElement("p");
+            line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} USD`).join("；") || "暂无"}`;
+            activityContainer.append(line);
+        }
+    }
+
     function renderPreview(data) {
         state.preview = data;
         const signals = data.signals || {};
@@ -289,6 +359,7 @@
         byId("v3Utilization").textContent = signals.utilization == null ? "--" : `${(Number(signals.utilization) * 100).toFixed(1)}%`;
         byId("v3Principal").textContent = `${Number(data.principal || plan.planned_amount || 0).toLocaleString("zh-CN")} USD`;
         byId("v3PlanCount").textContent = `${(plan.plan || []).length} / ${plan.target_slice_count || 0}`;
+        renderPeriodSelection(data.periodSelection || signals.periodSelection, data.periodActivity);
         const basis = data.accountSnapshot || {};
         byId("v3AccountSource").textContent = basis.stale
             ? `历史快照 · ${basis.timestamp ? new Date(basis.timestamp).toLocaleString("zh-CN", { hour12: false }) : "无数据"}`
@@ -337,11 +408,21 @@
         const runtime = data.runtime || {};
         state.runtime = runtime;
         byId("v3Mode").textContent = data.displayMode || runtime.mode || "PAUSED";
-        byId("v3ActiveVersion").textContent = data.activeStrategy?.version_id || "--";
-        byId("v3DraftVersion").textContent = data.draftStrategy?.version_id || "--";
-        byId("v3PendingVersion").textContent = data.pendingStrategy?.version_id || "--";
+        for (const [id, version] of [
+            ["v3ActiveVersion", data.activeStrategy?.version_id],
+            ["v3DraftVersion", data.draftStrategy?.version_id],
+            ["v3PendingVersion", data.pendingStrategy?.version_id],
+        ]) {
+            const element = byId(id);
+            element.textContent = version || "--";
+            element.title = version || "";
+        }
         const market = status?.market || {};
         const marketData = status?.marketData || data.marketSnapshot || {};
+        renderPeriodSelection(
+            status?.strategyV3?.periodSelection || status?.market?.periodSelection,
+            status?.strategyV3?.periodActivity,
+        );
         byId("v3MarketSource").textContent = `${marketData.source || "--"}${marketData.publicAgeMs != null ? ` · ${marketData.publicAgeMs}ms` : ""}`;
         if (status?.last_update) byId("v3AccountSource").textContent = `实时账户 · ${status.last_update}`;
         if (market.regime) byId("v3Regime").textContent = market.regime;
@@ -354,7 +435,18 @@
             byId("v3FormMessage").textContent = `SAFE：${runtime.safe_reason}`;
         }
         byId("v3ApplyButton").disabled = !data.draftStrategy;
-        byId("v3DiscardButton").disabled = !data.draftStrategy;
+        const canDiscardPending = Boolean(
+            data.pendingStrategy
+            && !data.process?.running
+            && runtime.mode !== "LIVE"
+        );
+        const discardButton = byId("v3DiscardButton");
+        discardButton.disabled = !data.draftStrategy && !canDiscardPending;
+        discardButton.textContent = data.draftStrategy
+            ? "放弃草稿"
+            : canDiscardPending
+                ? "撤销待应用策略"
+                : "放弃草稿";
     }
 
     function renderStats(statistics) {
@@ -486,12 +578,17 @@
 
     async function discardDraft() {
         try {
-            await postJson("/api/strategy/v3/discard", {});
+            const result = await postJson("/api/strategy/v3/discard", {});
             state.preview = null;
             state.previewPolicy = null;
             state.applyToken = null;
             state.draftVersionId = null;
-            byId("v3FormMessage").textContent = "草稿已放弃，恢复 ACTIVE 策略";
+            const discarded = result.discarded || [];
+            byId("v3FormMessage").textContent = discarded.includes("PENDING")
+                ? "待应用策略已撤销，恢复 ACTIVE 策略"
+                : discarded.includes("DRAFT")
+                    ? "草稿已放弃，恢复 ACTIVE 策略"
+                    : "没有可放弃的策略";
             await loadAll();
         } catch (error) {
             byId("v3FormMessage").textContent = error.message;

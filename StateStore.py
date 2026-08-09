@@ -17,6 +17,12 @@ from WriteRecovery import (
 D = Decimal
 RUNTIME_MODES = {"PAUSED", "LIVE", "REPLAY", "SAFE", "APPLYING"}
 OPEN_INTENT_STATES = {"PLANNED", "SUBMITTING", "AMBIGUOUS"}
+AUTO_RECOVERABLE_SAFE_REASONS = {
+    "MARKET_DATA_STALE",
+    "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN",
+    "ACCOUNT_RECONCILIATION_MISMATCH",
+    "AMBIGUOUS_WALLET_TRANSFER",
+}
 
 
 class StateStoreError(Exception):
@@ -91,7 +97,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 6:
+        if version >= 9:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -264,6 +270,7 @@ class LendingStateStore:
                 offer_id INTEGER PRIMARY KEY,
                 currency TEXT NOT NULL,
                 amount TEXT NOT NULL,
+                amount_original TEXT,
                 rate TEXT NOT NULL,
                 rate_real TEXT,
                 period INTEGER NOT NULL,
@@ -369,6 +376,7 @@ class LendingStateStore:
                 last_reprice_at_ms INTEGER,
                 pending_action TEXT,
                 pending_target_rate TEXT,
+                market_anchor_rate TEXT,
                 status TEXT NOT NULL DEFAULT 'ACTIVE',
                 updated_at_ms INTEGER NOT NULL
             )""",
@@ -425,6 +433,15 @@ class LendingStateStore:
             )""",
             """CREATE INDEX IF NOT EXISTS ownership_events_time_idx
                 ON ownership_events(created_at_ms)""",
+            """CREATE TABLE IF NOT EXISTS period_selection_state (
+                strategy_version TEXT NOT NULL,
+                pool TEXT NOT NULL,
+                selected_period INTEGER,
+                selected_since_ms INTEGER,
+                scores_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (strategy_version, pool)
+            )""",
         ]
         connection = self._connect()
         try:
@@ -438,9 +455,12 @@ class LendingStateStore:
             self._migrate_v4_columns(connection)
             self._migrate_v5_columns(connection)
             self._migrate_v6_reprice_columns(connection)
+            self._migrate_v7_reprice_chain_columns(connection)
+            self._migrate_v8_recovery_columns(connection)
+            self._migrate_v9_period_selection_columns(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '6')
-                   ON CONFLICT(key) DO UPDATE SET value='6'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '9')
+                   ON CONFLICT(key) DO UPDATE SET value='9'"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
@@ -454,6 +474,20 @@ class LendingStateStore:
                 ) VALUES(1, 'PAUSED', NULL, ?)""",
                 (self._now_ms(),),
             )
+
+    @staticmethod
+    def _migrate_v9_period_selection_columns(connection):
+        existing = {
+            row["name"] for row in connection.execute("PRAGMA table_info(period_selection_state)")
+        }
+        for name, definition in {
+            "challenger_period": "INTEGER",
+            "challenger_since_ms": "INTEGER",
+        }.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE period_selection_state ADD COLUMN {name} {definition}"
+                )
 
     @staticmethod
     def _migrate_v3_audit_columns(connection):
@@ -561,10 +595,29 @@ class LendingStateStore:
             if name not in existing:
                 connection.execute(f"ALTER TABLE reprice_events ADD COLUMN {name} {definition}")
 
+    @staticmethod
+    def _migrate_v7_reprice_chain_columns(connection):
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
+        if "market_anchor_rate" not in existing:
+            connection.execute("ALTER TABLE reprice_chains ADD COLUMN market_anchor_rate TEXT")
+
+    @staticmethod
+    def _migrate_v8_recovery_columns(connection):
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(offer_history)")}
+        if "amount_original" not in existing:
+            connection.execute("ALTER TABLE offer_history ADD COLUMN amount_original TEXT")
+
     def runtime(self):
         with self.read_connection() as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
         return dict(row)
+
+    def latest_mode_event(self):
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM mode_events ORDER BY created_at_ms DESC, id DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else dict(row)
 
     def set_mode(self, mode, reason=""):
         mode = str(mode).upper()
@@ -617,7 +670,11 @@ class LendingStateStore:
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
-            if row["mode"] != "SAFE" or row["safe_manual"]:
+            if (
+                row["mode"] != "SAFE"
+                or row["safe_manual"]
+                or str(row["safe_reason"] or "") not in AUTO_RECOVERABLE_SAFE_REASONS
+            ):
                 return dict(row)
             previous_sync = row["last_consistent_sync_ms"]
             count = row["consistent_syncs"]
@@ -774,12 +831,74 @@ class LendingStateStore:
                        activated_at_ms=excluded.activated_at_ms""",
                 (version_id, serialized, now, now),
             )
+            if from_version is not None:
+                connection.execute(
+                    """INSERT OR IGNORE INTO reprice_chains(
+                           chain_key, strategy_version, base_slice_key, pool, layer,
+                           origin_rate, started_at_ms, current_stage, current_offer_id,
+                           last_reprice_at_ms, pending_action, pending_target_rate,
+                           market_anchor_rate, status, updated_at_ms
+                       )
+                       SELECT
+                           ? || CASE
+                               WHEN instr(chain_key, '|') > 0
+                                   THEN substr(chain_key, instr(chain_key, '|'))
+                               ELSE '|' || chain_key
+                           END,
+                           ?, base_slice_key, pool, layer, origin_rate, started_at_ms,
+                           current_stage, current_offer_id, last_reprice_at_ms,
+                           pending_action, pending_target_rate, market_anchor_rate,
+                           status, ?
+                       FROM reprice_chains
+                       WHERE strategy_version=? AND status='ACTIVE'""",
+                    (version_id, version_id, now, from_version),
+                )
             connection.execute(
                 """INSERT INTO strategy_events(event_type, from_version, to_version, plan_hash, reason, created_at_ms)
                    VALUES('SCHEMA_NORMALIZATION', ?, ?, NULL, ?, ?)""",
                 (from_version, version_id, str(reason), now),
             )
         return version_id
+
+    def repair_normalized_reprice_chains(self, strategy_version, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            event = connection.execute(
+                """SELECT from_version FROM strategy_events
+                   WHERE event_type='SCHEMA_NORMALIZATION' AND to_version=?
+                   ORDER BY created_at_ms DESC, id DESC LIMIT 1""",
+                (str(strategy_version),),
+            ).fetchone()
+            if event is None or not event["from_version"]:
+                return 0
+            before = connection.total_changes
+            connection.execute(
+                """INSERT OR IGNORE INTO reprice_chains(
+                       chain_key, strategy_version, base_slice_key, pool, layer,
+                       origin_rate, started_at_ms, current_stage, current_offer_id,
+                       last_reprice_at_ms, pending_action, pending_target_rate,
+                       market_anchor_rate, status, updated_at_ms
+                   )
+                   SELECT
+                       ? || CASE
+                           WHEN instr(chain_key, '|') > 0
+                               THEN substr(chain_key, instr(chain_key, '|'))
+                           ELSE '|' || chain_key
+                       END,
+                       ?, base_slice_key, pool, layer, origin_rate, started_at_ms,
+                       current_stage, current_offer_id, last_reprice_at_ms,
+                       pending_action, pending_target_rate, market_anchor_rate,
+                       status, ?
+                   FROM reprice_chains
+                   WHERE strategy_version=? AND status='ACTIVE'""",
+                (
+                    str(strategy_version),
+                    str(strategy_version),
+                    now,
+                    event["from_version"],
+                ),
+            )
+            return connection.total_changes - before
 
     def strategy(self, status="ACTIVE"):
         with self.read_connection() as connection:
@@ -845,6 +964,147 @@ class LendingStateStore:
         finally:
             if owns_connection:
                 connection.close()
+
+    def submission_attempt_count_since(self, since_ms, currency="USD"):
+        """Count conservatively reserved submit attempts in a rolling window."""
+
+        with self.read_connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS attempt_count FROM order_intents
+                   WHERE currency=? AND created_at_ms>=?""",
+                (str(currency).upper(), int(since_ms)),
+            ).fetchone()
+        return int(row["attempt_count"] or 0)
+
+    def observe_period_selection(
+        self,
+        strategy_version,
+        pool,
+        selected_period,
+        scores,
+        now_ms=None,
+        advantage=D("0.20"),
+        hold_ms=600_000,
+    ):
+        """Persist an active term and require a qualified challenger to hold for ten minutes."""
+
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        version = str(strategy_version)
+        pool = str(pool)
+        period = None if selected_period is None else int(selected_period)
+        score_rows = scores or []
+        serialized = json.dumps(score_rows, ensure_ascii=False, sort_keys=True, default=str)
+        score_by_period = {
+            int(row["period"]): D(row.get("totalScore") or 0)
+            for row in score_rows
+            if row.get("period") is not None and row.get("eligible", True)
+        }
+        with self.transaction(immediate=True) as connection:
+            previous = connection.execute(
+                """SELECT * FROM period_selection_state
+                   WHERE strategy_version=? AND pool=?""",
+                (version, pool),
+            ).fetchone()
+            active = None if previous is None else previous["selected_period"]
+            selected_since = (
+                now
+                if previous is None or previous["selected_since_ms"] is None
+                else int(previous["selected_since_ms"])
+            )
+            challenger = None
+            challenger_since = None
+            promoted = False
+            if period is None:
+                active = None
+                selected_since = now
+            elif previous is None or active is None:
+                active = period
+                selected_since = now
+            elif int(active) != period:
+                old_score = score_by_period.get(int(active))
+                new_score = score_by_period.get(period)
+                qualifies = new_score is not None and (
+                    old_score is None
+                    or (new_score > old_score and new_score >= old_score * (D("1") + D(advantage)))
+                )
+                if qualifies:
+                    previous_challenger = previous["challenger_period"]
+                    challenger = period
+                    challenger_since = (
+                        int(previous["challenger_since_ms"])
+                        if previous_challenger == period and previous["challenger_since_ms"] is not None
+                        else now
+                    )
+                    if now - challenger_since >= int(hold_ms):
+                        active = period
+                        selected_since = now
+                        challenger = None
+                        challenger_since = None
+                        promoted = True
+            connection.execute(
+                """INSERT INTO period_selection_state(
+                       strategy_version, pool, selected_period, selected_since_ms,
+                       scores_json, updated_at_ms, challenger_period, challenger_since_ms
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(strategy_version, pool) DO UPDATE SET
+                       selected_period=excluded.selected_period,
+                       selected_since_ms=excluded.selected_since_ms,
+                       scores_json=excluded.scores_json,
+                       updated_at_ms=excluded.updated_at_ms,
+                       challenger_period=excluded.challenger_period,
+                       challenger_since_ms=excluded.challenger_since_ms""",
+                (
+                    version,
+                    pool,
+                    active,
+                    selected_since,
+                    serialized,
+                    now,
+                    challenger,
+                    challenger_since,
+                ),
+            )
+        return {
+            "strategyVersion": version,
+            "pool": pool,
+            "selectedPeriod": None if active is None else int(active),
+            "selectedSinceMs": selected_since,
+            "leaderPeriod": period,
+            "challengerPeriod": challenger,
+            "challengerSinceMs": challenger_since,
+            "challengerDurationMs": 0 if challenger_since is None else max(0, now - challenger_since),
+            "promoted": promoted,
+            "updatedAtMs": now,
+        }
+
+    def period_activity(self, since_ms, currency="USD"):
+        """Return recent robot submissions and managed fills grouped by term."""
+
+        with self.read_connection() as connection:
+            submitted = connection.execute(
+                """SELECT period, COUNT(*) AS order_count, COALESCE(SUM(CAST(amount AS REAL)), 0) AS amount
+                   FROM order_intents
+                   WHERE currency=? AND created_at_ms>=?
+                   GROUP BY period ORDER BY period""",
+                (str(currency).upper(), int(since_ms)),
+            ).fetchall()
+            traded = connection.execute(
+                """SELECT period, COUNT(*) AS trade_count, COALESCE(SUM(ABS(CAST(amount AS REAL))), 0) AS amount
+                   FROM funding_trades
+                   WHERE currency=? AND managed=1 AND mts>=?
+                   GROUP BY period ORDER BY period""",
+                (str(currency).upper(), int(since_ms)),
+            ).fetchall()
+        return {
+            "submitted": [
+                {"period": int(row["period"]), "count": int(row["order_count"]), "amount": D(str(row["amount"]))}
+                for row in submitted
+            ],
+            "traded": [
+                {"period": int(row["period"]), "count": int(row["trade_count"]), "amount": D(str(row["amount"]))}
+                for row in traded
+            ],
+        }
 
     def reserve_intent(self, order, wallet_available):
         fingerprint = order.get("fingerprint") or order_intent_fingerprint(
@@ -1100,36 +1360,57 @@ class LendingStateStore:
                 candidate_ids = set()
                 offers = connection.execute(
                     """SELECT offer_id FROM offers
-                       WHERE status != 'CLOSED' AND currency=? AND amount=? AND period=?
+                       WHERE status != 'CLOSED' AND currency=?
+                         AND (amount=? OR COALESCE(amount_original, amount)=?) AND period=?
                          AND offer_type=? AND flags=?
+                         AND (rate=? OR rate_real=?)
                          AND COALESCE(mts_created, 0) BETWEEN ? AND ?""",
                     (
                         intent["currency"],
                         intent["amount"],
+                        intent["amount"],
                         intent["period"],
                         intent["offer_type"],
                         intent["flags"],
+                        intent["submitted_rate"],
+                        intent["effective_rate"],
                         start,
                         end,
                     ),
                 ).fetchall()
                 candidate_ids.update(int(row["offer_id"]) for row in offers)
                 trades = connection.execute(
-                    """SELECT DISTINCT offer_id FROM funding_trades
+                    """SELECT offer_id FROM funding_trades
                        WHERE currency=? AND period=? AND mts BETWEEN ? AND ?
-                         AND offer_id IS NOT NULL""",
-                    (intent["currency"], intent["period"], start, end),
+                         AND offer_id IS NOT NULL
+                         AND ABS(CAST(rate AS REAL) - CAST(? AS REAL)) <= 0.0000001
+                       GROUP BY offer_id
+                       HAVING ABS(SUM(CAST(amount AS REAL)) - CAST(? AS REAL)) <= 0.00000001""",
+                    (
+                        intent["currency"],
+                        intent["period"],
+                        start,
+                        end,
+                        intent["effective_rate"],
+                        intent["amount"],
+                    ),
                 ).fetchall()
                 candidate_ids.update(int(row["offer_id"]) for row in trades if row["offer_id"] is not None)
                 historical_offers = connection.execute(
                     """SELECT offer_id FROM offer_history
-                       WHERE currency=? AND period=? AND offer_type=? AND flags=?
+                       WHERE currency=? AND (amount=? OR COALESCE(amount_original, amount)=?)
+                         AND period=? AND offer_type=? AND flags=?
+                         AND (rate=? OR rate_real=?)
                          AND COALESCE(mts_created, 0) BETWEEN ? AND ?""",
                     (
                         intent["currency"],
+                        intent["amount"],
+                        intent["amount"],
                         intent["period"],
                         intent["offer_type"],
                         intent["flags"],
+                        intent["submitted_rate"],
+                        intent["effective_rate"],
                         start,
                         end,
                     ),
@@ -1170,7 +1451,11 @@ class LendingStateStore:
             if (
                 remaining
                 and confirm_absent
-                and all(candidate_counts.get(int(item["id"]), 0) == 0 for item in remaining)
+                and all(
+                    candidate_counts.get(int(item["id"]), 0) == 0
+                    and str(item["offer_type"]).upper() == "LIMIT"
+                    for item in remaining
+                )
             ):
                 previous_sync = runtime["last_consistent_sync_ms"]
                 count = int(runtime["consistent_syncs"])
@@ -1310,24 +1595,57 @@ class LendingStateStore:
                 (chain_key,),
             ).fetchone()
             if current is None:
-                connection.execute(
-                    """INSERT INTO reprice_chains(
-                           chain_key, strategy_version, base_slice_key, pool, layer,
-                           origin_rate, started_at_ms, current_stage, current_offer_id,
-                           status, updated_at_ms
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, 'ACTIVE', ?)""",
-                    (
-                        chain_key,
-                        str(strategy_version),
-                        base_key,
-                        str(offer.get("pool") or intent["pool"]),
-                        str(offer.get("layer") or intent["layer"]),
-                        observed_rate,
-                        started_at,
-                        offer_id,
-                        now,
-                    ),
-                )
+                predecessor = connection.execute(
+                    """SELECT * FROM reprice_chains
+                       WHERE current_offer_id=? AND status='ACTIVE'
+                         AND strategy_version<>?
+                       ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1""",
+                    (offer_id, str(strategy_version)),
+                ).fetchone()
+                if predecessor is None:
+                    connection.execute(
+                        """INSERT INTO reprice_chains(
+                               chain_key, strategy_version, base_slice_key, pool, layer,
+                               origin_rate, started_at_ms, current_stage, current_offer_id,
+                               status, updated_at_ms
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, 'ACTIVE', ?)""",
+                        (
+                            chain_key,
+                            str(strategy_version),
+                            base_key,
+                            str(offer.get("pool") or intent["pool"]),
+                            str(offer.get("layer") or intent["layer"]),
+                            observed_rate,
+                            started_at,
+                            offer_id,
+                            now,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO reprice_chains(
+                               chain_key, strategy_version, base_slice_key, pool, layer,
+                               origin_rate, started_at_ms, current_stage, current_offer_id,
+                               last_reprice_at_ms, pending_action, pending_target_rate,
+                               market_anchor_rate, status, updated_at_ms
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)""",
+                        (
+                            chain_key,
+                            str(strategy_version),
+                            base_key,
+                            predecessor["pool"],
+                            predecessor["layer"],
+                            predecessor["origin_rate"],
+                            predecessor["started_at_ms"],
+                            predecessor["current_stage"],
+                            offer_id,
+                            predecessor["last_reprice_at_ms"],
+                            predecessor["pending_action"],
+                            predecessor["pending_target_rate"],
+                            predecessor["market_anchor_rate"],
+                            now,
+                        ),
+                    )
             elif int(current["current_offer_id"] or 0) != offer_id:
                 if current["pending_action"] == "AGE_STAGE":
                     connection.execute(
@@ -1343,6 +1661,7 @@ class LendingStateStore:
                            SET pool=?, layer=?, origin_rate=?, started_at_ms=?,
                                current_stage=0, current_offer_id=?, last_reprice_at_ms=NULL,
                                pending_action=NULL, pending_target_rate=NULL,
+                               market_anchor_rate=NULL,
                                status='ACTIVE', updated_at_ms=?
                            WHERE chain_key=?""",
                         (
@@ -1387,14 +1706,39 @@ class LendingStateStore:
         with self.read_connection() as connection:
             return [dict(row) for row in connection.execute(query).fetchall()]
 
-    def complete_reprice_stage(self, chain_key, stage, now_ms=None):
+    def complete_reprice_stage(self, chain_key, stage, now_ms=None, market_anchor_rate=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            if market_anchor_rate is None:
+                connection.execute(
+                    """UPDATE reprice_chains
+                       SET current_stage=MAX(current_stage, ?), updated_at_ms=?
+                       WHERE chain_key=?""",
+                    (int(stage), now, str(chain_key)),
+                )
+            else:
+                connection.execute(
+                    """UPDATE reprice_chains
+                       SET current_stage=MAX(current_stage, ?),
+                           market_anchor_rate=COALESCE(market_anchor_rate, ?),
+                           updated_at_ms=?
+                       WHERE chain_key=?""",
+                    (int(stage), _decimal_text(market_anchor_rate), now, str(chain_key)),
+                )
+            row = connection.execute(
+                "SELECT * FROM reprice_chains WHERE chain_key=?",
+                (str(chain_key),),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def set_reprice_market_anchor(self, chain_key, rate, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             connection.execute(
                 """UPDATE reprice_chains
-                   SET current_stage=MAX(current_stage, ?), updated_at_ms=?
+                   SET market_anchor_rate=COALESCE(market_anchor_rate, ?), updated_at_ms=?
                    WHERE chain_key=?""",
-                (int(stage), now, str(chain_key)),
+                (_decimal_text(rate), now, str(chain_key)),
             )
             row = connection.execute(
                 "SELECT * FROM reprice_chains WHERE chain_key=?",
@@ -1402,7 +1746,15 @@ class LendingStateStore:
             ).fetchone()
         return None if row is None else dict(row)
 
-    def mark_reprice_pending(self, chain_key, action, target_rate, stage=None, now_ms=None):
+    def mark_reprice_pending(
+        self,
+        chain_key,
+        action,
+        target_rate,
+        stage=None,
+        now_ms=None,
+        market_anchor_rate=None,
+    ):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             if str(action) == "AGE_STAGE":
@@ -1410,13 +1762,16 @@ class LendingStateStore:
                     """UPDATE reprice_chains
                        SET current_stage=MAX(current_stage, ?), current_offer_id=NULL,
                            last_reprice_at_ms=?, pending_action=?,
-                           pending_target_rate=?, updated_at_ms=?
+                           pending_target_rate=?,
+                           market_anchor_rate=COALESCE(market_anchor_rate, ?),
+                           updated_at_ms=?
                        WHERE chain_key=?""",
                     (
                         int(stage or 0),
                         now,
                         str(action),
                         _decimal_text(target_rate),
+                        None if market_anchor_rate is None else _decimal_text(market_anchor_rate),
                         now,
                         str(chain_key),
                     ),
@@ -1499,7 +1854,8 @@ class LendingStateStore:
                     """UPDATE reprice_chains
                        SET origin_rate=?, started_at_ms=?, current_stage=0,
                            current_offer_id=?, pending_action=NULL,
-                           pending_target_rate=NULL, status='ACTIVE', updated_at_ms=?
+                           pending_target_rate=NULL, market_anchor_rate=NULL,
+                           status='ACTIVE', updated_at_ms=?
                        WHERE chain_key=?""",
                     (_decimal_text(effective_rate), now, int(offer_id), now, chain_key),
                 )
@@ -2033,13 +2389,14 @@ class LendingStateStore:
                 )
                 connection.execute(
                     """INSERT OR REPLACE INTO offer_history(
-                        offer_id, currency, amount, rate, rate_real, period, offer_type,
-                        flags, status, mts_created, mts_updated, managed
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        offer_id, currency, amount, amount_original, rate, rate_real,
+                        period, offer_type, flags, status, mts_created, mts_updated, managed
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         int(offer["id"]),
                         str(offer.get("currency", "USD")).upper(),
                         _decimal_text(offer["amount"]),
+                        _decimal_text(offer.get("amount_original", offer["amount"])),
                         _decimal_text(offer["rate"]),
                         None if offer.get("rate_real") is None else _decimal_text(offer["rate_real"]),
                         int(offer["period"]),
@@ -2087,19 +2444,24 @@ class LendingStateStore:
                 )
 
     def upsert_market_trades(self, trades):
+        rows = [
+            (
+                str(trade["id"]),
+                int(trade["mts"]),
+                _decimal_text(abs(D(trade["amount"]))),
+                _decimal_text(trade["rate"]),
+                int(trade["period"]),
+            )
+            for trade in (trades or [])
+        ]
+        if not rows:
+            return
         with self.transaction(immediate=True) as connection:
-            for trade in trades or []:
-                connection.execute(
-                    """INSERT OR IGNORE INTO market_trades(trade_id, mts, amount, rate, period)
-                       VALUES(?, ?, ?, ?, ?)""",
-                    (
-                        str(trade["id"]),
-                        int(trade["mts"]),
-                        _decimal_text(abs(D(trade["amount"]))),
-                        _decimal_text(trade["rate"]),
-                        int(trade["period"]),
-                    ),
-                )
+            connection.executemany(
+                """INSERT OR IGNORE INTO market_trades(trade_id, mts, amount, rate, period)
+                   VALUES(?, ?, ?, ?, ?)""",
+                rows,
+            )
 
     def upsert_funding_stats(self, stats):
         with self.transaction(immediate=True) as connection:
@@ -2202,7 +2564,9 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             trade_count = connection.execute("DELETE FROM market_trades WHERE mts < ?", (threshold,)).rowcount
             bar_count = connection.execute("DELETE FROM market_bars WHERE bucket_ms < ?", (threshold,)).rowcount
-        return {"trades": trade_count, "bars": bar_count}
+            book_count = connection.execute("DELETE FROM book_snapshots WHERE mts < ?", (threshold,)).rowcount
+            stats_count = connection.execute("DELETE FROM funding_stats WHERE mts < ?", (threshold,)).rowcount
+        return {"trades": trade_count, "bars": bar_count, "books": book_count, "stats": stats_count}
 
     def record_account_sample(self, total, wallet, offers, credits, net_interest, mts=None):
         mts = int(mts if mts is not None else self._now_ms())

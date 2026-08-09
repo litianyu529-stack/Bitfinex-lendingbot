@@ -16,10 +16,12 @@ from http.server import ThreadingHTTPServer
 from bitfinex import Bitfinex, BitfinexApiError
 from Logger import Logger
 from AppContext import AppContext
-from ExchangeModels import parse_funding_stats, parse_funding_trades
+from ExchangeModels import parse_funding_stats, parse_funding_trades, parse_loan_rows
 from StateStore import LendingStateStore, StateStoreError
 from RuntimeV3 import (
     LendingRuntimeV3,
+    build_active_credit_dashboard,
+    order_sizing_payload,
     parse_book_v3,
     parse_credit_rows_v3,
     parse_offer_rows_v3,
@@ -27,6 +29,7 @@ from RuntimeV3 import (
 )
 from MarketDataStream import BitfinexMarketDataHub, websocket_dependency_available
 from StrategyV3 import (
+    USD_ORDER_CHUNK,
     build_market_signals_v3,
     gross_daily_floor,
     json_decimal,
@@ -97,7 +100,7 @@ PREFLIGHT_TTL_SECONDS = 300
 DASHBOARD_SERVICE_ID = "mika-lending-dashboard-v3"
 DASHBOARD_BUILD_PLACEHOLDER = "__MIKA_DASHBOARD_BUILD_ID__"
 DASHBOARD_CSRF_PLACEHOLDER = "__MIKA_DASHBOARD_CSRF_TOKEN__"
-DASHBOARD_BUILD_FILES = (
+WORKER_BUILD_FILES = (
     "lendingbot.py",
     "DashboardServer.py",
     "bitfinex.py",
@@ -113,17 +116,20 @@ DASHBOARD_BUILD_FILES = (
     "StrategyV3.py",
     "StrategyResearch.py",
     "WriteRecovery.py",
+)
+DASHBOARD_ASSET_FILES = (
     os.path.join("www", "lendingbot.html"),
     os.path.join("www", "lendingbot.js"),
     os.path.join("www", "v3-dashboard.js"),
     os.path.join("www", "lendingbot.css"),
 )
+DASHBOARD_BUILD_FILES = WORKER_BUILD_FILES + DASHBOARD_ASSET_FILES
 
 
-def dashboard_build_id(root=None):
+def _files_build_id(files, root=None):
     root = os.path.abspath(root or os.path.dirname(__file__))
     digest = hashlib.sha256()
-    for relative in sorted(DASHBOARD_BUILD_FILES):
+    for relative in sorted(files):
         path = os.path.join(root, relative)
         digest.update(relative.replace("\\", "/").encode("utf-8"))
         try:
@@ -132,6 +138,14 @@ def dashboard_build_id(root=None):
         except OSError:
             digest.update(b"<missing>")
     return digest.hexdigest()[:20]
+
+
+def worker_build_id(root=None):
+    return _files_build_id(WORKER_BUILD_FILES, root)
+
+
+def dashboard_build_id(root=None):
+    return _files_build_id(DASHBOARD_BUILD_FILES, root)
 
 
 class LiveProcessLock:
@@ -187,15 +201,17 @@ class LiveProcessLock:
         except (OSError, BlockingIOError):
             handle.close()
             return False
+        metadata = dict(metadata or {})
+        build_id = worker_build_id() if metadata.get("role") == "live_worker" else dashboard_build_id()
         lock_metadata = {
             "pid": os.getpid(),
             "startedAt": timestamp(),
             "configPath": os.path.abspath(config_path),
             "projectRoot": os.path.abspath(os.path.dirname(__file__)),
             "executablePath": os.path.abspath(sys.executable),
-            "buildId": dashboard_build_id(),
+            "buildId": build_id,
         }
-        lock_metadata.update(metadata or {})
+        lock_metadata.update(metadata)
         handle.seek(1)
         handle.truncate(1)
         handle.write(json.dumps(lock_metadata, ensure_ascii=False).encode("utf-8"))
@@ -288,6 +304,10 @@ def load_v3_account_context(client, store, now_ms):
             credits = parse_credit_rows_v3(client.active_funding_credits("fUSD"))
         except AttributeError:
             credits = []
+        try:
+            loans = parse_loan_rows(client.active_funding_loans("fUSD"))
+        except AttributeError:
+            loans = []
     except Exception as exc:
         basis.update({"source": "HISTORICAL_SNAPSHOT", "stale": True})
         basis["warnings"].append(f"实时账户快照不可用，使用最近已保存快照：{exc}")
@@ -295,6 +315,7 @@ def load_v3_account_context(client, store, now_ms):
             sample = connection.execute("SELECT * FROM account_samples ORDER BY mts DESC LIMIT 1").fetchone()
         offers = [dict(row, id=row["offer_id"]) for row in store.offers(active_only=True)]
         credits = [dict(row, id=row["credit_id"]) for row in store.credits(active_only=True)]
+        loans = []
         if sample is None:
             wallets = []
             basis["timestamp"] = None
@@ -303,7 +324,7 @@ def load_v3_account_context(client, store, now_ms):
                 {
                     "wallet_type": "funding",
                     "currency": "USD",
-                    "balance": Decimal(sample["wallet_available"]),
+                    "balance": Decimal(sample["total_principal"]),
                     "available": Decimal(sample["wallet_available"]),
                     "unsettled_interest": Decimal("0"),
                 }
@@ -318,19 +339,35 @@ def load_v3_account_context(client, store, now_ms):
         offer["layer"] = (managed or {}).get("layer")
         offer["display_type"] = (managed or {}).get("display_type") or v3_offer_display_type(offer)
     stored_credits = {int(row["credit_id"]): row for row in store.credits()}
-    for credit in credits:
+    for credit in [*credits, *loans]:
         stored = stored_credits.get(int(credit["id"]))
         credit["managed"] = bool(stored and stored["managed"])
         credit["pool"] = (stored or {}).get("pool") or pool_for_period(credit["period"])
         credit["layer"] = (stored or {}).get("layer")
         credit["display_type"] = v3_credit_display_type({**credit, **(stored or {})})
-    snapshot = {"wallets": wallets, "offers": offers, "credits": credits}
+    snapshot = {"wallets": wallets, "offers": offers, "credits": credits, "loans": loans}
     return LendingRuntimeV3._account(snapshot), snapshot, basis
+
+
+def provider_funding_rows(snapshot):
+    """Return lender-side active funding once across credit/loan states."""
+
+    merged = {}
+    for row in [*snapshot.get("credits", []), *snapshot.get("loans", [])]:
+        if int(row.get("side") or 0) < 0:
+            continue
+        row_id = row.get("id", row.get("credit_id"))
+        key = str(row_id) if row_id is not None else f"{row.get('funding_state')}:{len(merged)}"
+        merged[key] = row
+    return list(merged.values())
 
 
 def proposed_external_adoption(account_snapshot, policy):
     candidates = []
-    simulated = {key: [dict(row) for row in account_snapshot.get(key, [])] for key in ("wallets", "offers", "credits")}
+    simulated = {
+        key: [dict(row) for row in account_snapshot.get(key, [])]
+        for key in ("wallets", "offers", "credits", "loans")
+    }
     if policy.adopt_external_offers:
         for offer in simulated["offers"]:
             if offer.get("currency") != "USD" or offer.get("managed"):
@@ -353,7 +390,7 @@ def load_v3_market_context(client, policy, now_ms):
         warnings.append(f"Funding Book 不可用：{exc}")
     try:
         trades = parse_funding_trades(
-            client.funding_trades("fUSD", start=now_ms - 7 * 86_400_000, end=now_ms, limit=10000, sort=1)
+            client.funding_trades("fUSD", start=now_ms - 7 * 86_400_000, end=now_ms, limit=10000, sort=-1)
         )
     except Exception as exc:
         trades = []
@@ -369,6 +406,25 @@ def load_v3_market_context(client, policy, now_ms):
 strategy_preview_tokens = {}
 strategy_apply_tokens = {}
 strategy_token_lock = threading.RLock()
+STRATEGY_TOKEN_CACHE_LIMIT = 512
+
+
+def _prune_strategy_tokens(current_time=None):
+    current = time.time() if current_time is None else float(current_time)
+    removed = 0
+    with strategy_token_lock:
+        for cache in (strategy_preview_tokens, strategy_apply_tokens):
+            expired = [token for token, context in cache.items() if current > float(context["expiresAt"])]
+            for token in expired:
+                cache.pop(token, None)
+                removed += 1
+            overflow = max(0, len(cache) - STRATEGY_TOKEN_CACHE_LIMIT)
+            if overflow:
+                oldest = sorted(cache, key=lambda token: float(cache[token]["expiresAt"]))[:overflow]
+                for token in oldest:
+                    cache.pop(token, None)
+                    removed += 1
+    return removed
 
 
 def _canonical_sha256(payload):
@@ -396,6 +452,10 @@ def _account_context_digest(account, snapshot):
                 snapshot.get("credits", []),
                 ("id", "amount", "rate", "rate_real", "period", "display_type", "hidden", "managed"),
             ),
+            "loans": compact(
+                snapshot.get("loans", []),
+                ("id", "amount", "rate", "rate_real", "period", "display_type", "hidden", "managed"),
+            ),
         }
     )
 
@@ -413,6 +473,7 @@ def strategy_v3_preview(
     app_context=None,
 ):
     app_context = process_context(config_path, app_context, client_factory=client_factory)
+    _prune_strategy_tokens(app_context.now())
     client_factory = client_factory or app_context.client_factory or Bitfinex
     store, settings = v3_store_for_config(config_path)
     active, active_policy = ensure_active_strategy_v3(store, settings)
@@ -438,7 +499,7 @@ def strategy_v3_preview(
         if violations:
             incompatible.append({**json_decimal(offer), "violations": violations})
     non_changeable_credits = []
-    for credit in account_snapshot["credits"]:
+    for credit in provider_funding_rows(account_snapshot):
         violations = v3_credit_violations(credit, policy)
         if violations:
             non_changeable_credits.append({**json_decimal(credit), "violations": violations})
@@ -452,6 +513,9 @@ def strategy_v3_preview(
         "proposedVersion": proposed_version,
         "strategyDiff": v3_strategy_diff(active, proposed_record),
         "policy": strategy_v3_api_values(policy),
+        "orderSizing": order_sizing_payload(),
+        "periodSelection": json_decimal(signals.get("periodSelection", {})),
+        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, "USD")),
         "signals": json_decimal(signals),
         "plan": json_decimal(result),
         "fundingLimit": {
@@ -488,6 +552,7 @@ def strategy_v3_preview(
         }
         with strategy_token_lock:
             strategy_preview_tokens[token] = context
+        _prune_strategy_tokens(issued_at)
         response["previewToken"] = token
         response["expiresAt"] = _token_expiry_iso(context["expiresAt"])
     return response
@@ -563,6 +628,7 @@ def v3_offer_violations(offer, policy):
 
 def runtime_v3_payload(config_path, context=None):
     context = process_context(config_path, context)
+    _prune_strategy_tokens(context.now())
     store, settings = v3_store_for_config(config_path)
     market_snapshot = None
     if context.process_state.market_hub is not None:
@@ -611,6 +677,7 @@ def stats_v3_payload(store):
 
 def save_strategy_v3_draft(config_path, payload, app_context=None):
     now = app_context.now if app_context is not None else time.time
+    _prune_strategy_tokens(now())
     store, settings = v3_store_for_config(config_path)
     active, active_policy = ensure_active_strategy_v3(store, settings)
     policy = strategy_v3_from_api_payload(payload.get("strategyV3", {}), base=active_policy)
@@ -650,6 +717,7 @@ def save_strategy_v3_draft(config_path, payload, app_context=None):
     }
     with strategy_token_lock:
         strategy_apply_tokens[apply_token] = apply_context
+    _prune_strategy_tokens(now())
     return {
         "versionId": version_id,
         "draftVersionId": version_id,
@@ -663,6 +731,7 @@ def save_strategy_v3_draft(config_path, payload, app_context=None):
 
 def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_context=None):
     app_context = process_context(config_path, app_context, client_factory=client_factory)
+    _prune_strategy_tokens(app_context.now())
     client_factory = client_factory or app_context.client_factory or Bitfinex
     store, settings = v3_store_for_config(config_path)
     active, _ = ensure_active_strategy_v3(store, settings)
@@ -703,10 +772,33 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     return {"status": "ACTIVE", "strategy": strategy}
 
 
-def discard_strategy_v3_draft(config_path):
+def discard_strategy_v3_draft(config_path, app_context=None):
+    app_context = process_context(config_path, app_context)
     store, _ = v3_store_for_config(config_path)
-    store.discard_strategy("DRAFT")
-    return {"status": "DISCARDED", "activeStrategy": store.strategy("ACTIVE")}
+    discarded = []
+    with app_context.process_state.lock:
+        draft = store.strategy("DRAFT")
+        pending = store.strategy("PENDING")
+        running = controlled_bot_running(config_path, app_context)
+        runtime = store.runtime()
+        if pending is not None and draft is None and (running or runtime["mode"] == "LIVE"):
+            raise ApiRequestError(
+                "待应用策略正在由机器人处理；请先停止机器人再撤销",
+                "PENDING_STRATEGY_RUNNING",
+                409,
+            )
+        if draft is not None:
+            store.discard_strategy("DRAFT")
+            discarded.append("DRAFT")
+        if pending is not None and not running and runtime["mode"] != "LIVE":
+            store.discard_strategy("PENDING")
+            discarded.append("PENDING")
+    return {
+        "status": "DISCARDED" if discarded else "UNCHANGED",
+        "discarded": discarded,
+        "activeStrategy": store.strategy("ACTIVE"),
+        "pendingStrategy": store.strategy("PENDING"),
+    }
 
 
 def replay_v3_from_store(config_path, now_ms=None, context=None):
@@ -725,6 +817,12 @@ def replay_v3_from_store(config_path, now_ms=None, context=None):
 
 
 def empty_status_payload():
+    active_credit_dashboard = build_active_credit_dashboard(
+        [],
+        Decimal("0"),
+        StrategyPolicyV3(),
+        0,
+    )
     return {
         "schemaVersion": STATUS_SCHEMA_VERSION,
         "operationMode": "PAUSED",
@@ -735,6 +833,8 @@ def empty_status_payload():
         "platformFeeRate": "15",
         "raw_data": {},
         "openOffers": [],
+        "credits": active_credit_dashboard["credits"],
+        "activeCreditSummary": active_credit_dashboard["summary"],
         "strategyDecision": {},
         "legacyIgnored": False,
     }
@@ -766,6 +866,22 @@ def read_status_payload(status_path):
     return payload
 
 
+STOP_REASON_MESSAGES = {
+    "worker_build_mismatch": "检测到新版本，旧实盘进程已安全停止",
+    "worker_build_mismatch_stopped": "检测到新版本，旧实盘进程已安全停止",
+    "dashboard_started_without_live_process": "控制台启动时未发现实盘进程",
+    "stopped_by_dashboard": "实盘进程已由控制台停止",
+    "paused_by_operator": "策略已由操作员暂停",
+}
+
+
+def stop_reason_message(reason):
+    reason = str(reason or "").strip()
+    if not reason:
+        return "原因未记录"
+    return STOP_REASON_MESSAGES.get(reason, reason)
+
+
 def dashboard_status_payload(status_path, config_path, context=None):
     payload = read_status_payload(status_path)
     try:
@@ -773,10 +889,20 @@ def dashboard_status_payload(status_path, config_path, context=None):
         runtime = store.runtime()
         process = controlled_bot_status(config_path, context)
         if not process["running"]:
+            mode_event = store.latest_mode_event()
+            stop_reason = process.get("stopReason")
+            if not stop_reason and mode_event and mode_event.get("to_mode") == "PAUSED":
+                stop_reason = mode_event.get("reason")
+            process["stopReason"] = stop_reason
             empty = empty_status_payload()
+            empty["log"] = list(payload.get("log") or [])
             empty["runtime"] = runtime
             empty["operationMode"] = "PAUSED" if runtime["mode"] != "SAFE" else "SAFE"
-            empty["last_status"] = "机器人进程已停止；账户与收益实时数据已清空。"
+            empty["last_status"] = (
+                f"机器人进程已停止（{stop_reason_message(stop_reason)}）；"
+                "账户与挂单快照当前不可用。"
+            )
+            empty["lastStopReason"] = stop_reason
             empty["snapshotAvailable"] = False
             empty["process"] = process
             return empty
@@ -789,8 +915,20 @@ def dashboard_status_payload(status_path, config_path, context=None):
         elif runtime["mode"] == "SAFE":
             payload["last_status"] = f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}"
         payload.update(stats_v3_payload(store))
-    except Exception:
-        pass
+    except Exception as exc:
+        unavailable = empty_status_payload()
+        unavailable["log"] = list(payload.get("log") or [])
+        unavailable["operationMode"] = "UNKNOWN"
+        unavailable["runtime"] = {
+            "mode": "UNKNOWN",
+            "safe_reason": None,
+            "status_error": type(exc).__name__,
+        }
+        unavailable["process"] = {"running": False, "statusAvailable": False}
+        unavailable["snapshotAvailable"] = False
+        unavailable["statusUnavailable"] = True
+        unavailable["last_status"] = "控制台无法读取当前运行状态；实时账户与挂单数据已隐藏。"
+        return unavailable
     return payload
 
 
@@ -916,7 +1054,7 @@ def external_live_process(config_path=DEFAULT_CONFIG, context=None):
     expected_config = os.path.abspath(config_path)
     if metadata.get("configPath") and os.path.abspath(metadata["configPath"]) != expected_config:
         state_error = f"实盘进程使用其他配置：{metadata['configPath']}"
-    current_build = dashboard_build_id()
+    current_build = worker_build_id()
     worker_build = metadata.get("buildId")
     return {
         **metadata,
@@ -941,6 +1079,13 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
         process = state.process
         internal_running = process is not None and process.poll() is None
         external = None if internal_running else external_live_process(config_path, context)
+        internal_worker_build = None
+        if internal_running:
+            inspection = LiveProcessLock.inspect(context.live_lock_path)
+            metadata = inspection.get("metadata") or {}
+            if inspection.get("locked") and int(metadata.get("pid") or 0) == int(process.pid):
+                internal_worker_build = metadata.get("buildId")
+        current_worker_build = worker_build_id()
         running = internal_running or external is not None
         return_code = None
         if process is not None:
@@ -955,8 +1100,11 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
             "stopReason": state.stop_reason,
             "managedExternally": bool(external),
             "dashboardBuildId": dashboard_build_id(),
-            "workerBuildId": dashboard_build_id() if internal_running else (external or {}).get("workerBuildId"),
-            "buildMismatch": bool(external and external.get("buildMismatch")),
+            "workerBuildId": internal_worker_build if internal_running else (external or {}).get("workerBuildId"),
+            "buildMismatch": bool(
+                (internal_running and internal_worker_build and internal_worker_build != current_worker_build)
+                or (external and external.get("buildMismatch"))
+            ),
             **({"stateError": external["stateError"]} if external and external.get("stateError") else {}),
         }
 
@@ -1087,6 +1235,17 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         if basis["source"] == "REAL_ACCOUNT"
         else "实时账户读取失败，不能使用历史快照启动实盘",
     )
+    account_reconciled = bool(account.get("walletAvailableKnown")) and account.get(
+        "reconciliationStatus"
+    ) == "MATCHED"
+    add_check(
+        "account_reconciliation",
+        "Funding 账户对账",
+        account_reconciled,
+        "Funding 钱包余额、可用余额、挂单及贷款已完整对账"
+        if account_reconciled
+        else "Funding 可用余额尚未计算或账户组件金额不一致；为避免重复放贷已阻止启动",
+    )
     for message in basis["warnings"]:
         warnings.append({"code": "ACCOUNT_SNAPSHOT_WARNING", "message": message})
     book, trades, stats, signals, market_warnings = load_v3_market_context(client, policy, now)
@@ -1095,13 +1254,6 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
-    if policy.max_pool_shift:
-        warnings.append(
-            {
-                "code": "LEGACY_POOL_SHIFT_IGNORED",
-                "message": "动态资金池偏移为旧字段；生产挂单固定使用短/中/长页面比例。",
-            }
-        )
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
@@ -1111,7 +1263,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         item = {**json_decimal(offer), "display_type": v3_offer_display_type(offer), "violations": violations}
         (incompatible_managed if offer.get("managed") else incompatible_external).append(item)
     incompatible_credits = []
-    for credit in snapshot["credits"]:
+    for credit in provider_funding_rows(snapshot):
         violations = v3_credit_violations(credit, policy)
         if violations:
             incompatible_credits.append({**json_decimal(credit), "violations": violations})
@@ -1120,7 +1272,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         warnings.append(
             {"code": "NO_AVAILABLE_BALANCE", "message": "USD 当前没有可用资金；仍可先撤销不兼容的机器人挂单。"}
         )
-    elif account["wallet"] < policy.min_order_amount:
+    elif account["wallet"] < USD_ORDER_CHUNK:
         warnings.append({"code": "BELOW_MINIMUM", "message": "USD 可用余额低于 V3 最低单笔金额。"})
     if incompatible_managed:
         warnings.append(
@@ -1152,7 +1304,8 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
             {
                 "code": "INCOMPATIBLE_ACTIVE_CREDITS",
                 "message": (
-                    f"发现 {len(incompatible_credits)} 笔已成交贷款不符合新策略；无法撤销，只会阻止继续创建同类订单。"
+                    f"发现 {len(incompatible_credits)} 笔已成交贷款不符合新策略；这些旧贷款本身无法修改，"
+                    "需等待借款人归还；这不会阻止修改策略，新订单仍严格按新策略生成。"
                 ),
             }
         )
@@ -1176,13 +1329,16 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
     ]
     summary = {
         "strategyVersion": 3,
-        "buildId": dashboard_build_id(),
+        "buildId": worker_build_id(),
         "strategySource": "SQLITE_ACTIVE",
         "activeStrategyVersion": active["version_id"],
         "policyHash": strategy_v3_version_id(policy),
         "enabledOrderTypes": enabled_types,
         "onlyLimit": enabled_types == ["LIMIT"],
         "policy": strategy_v3_api_values(policy),
+        "orderSizing": order_sizing_payload(),
+        "periodSelection": json_decimal(signals.get("periodSelection", {})),
+        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, "USD")),
         "accountSnapshot": basis,
         "accountDigest": _account_context_digest(LendingRuntimeV3._account(original_snapshot), original_snapshot),
         "account": json_decimal(account),
@@ -1190,7 +1346,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
             pool: {
                 "share": decimal_to_config(policy.pool_shares()[pool]),
                 "netFloorAprPercent": decimal_percent_to_config(policy.floor_apr(pool)),
-                "periods": list(policy.periods(pool)),
+                "periodRange": ",".join(str(value) for value in getattr(policy, f"{pool}_periods")),
             }
             for pool in ("short", "medium", "long")
         },
@@ -1202,7 +1358,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
             "existingExposure": status_decimal(result["existing_exposure"]),
             "capRemaining": status_decimal(result["cap_remaining"]),
         },
-        "targetSlices": policy.target_slices,
+        "targetSlices": result["target_slice_count"],
         "actualSlices": len(result["plan"]),
         "planHash": result["plan_hash"],
         "strategyPlan": json_decimal(result["plan"]),
@@ -1218,6 +1374,13 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
             "target": json_decimal(result.get("target_offer_amounts", {})),
             "current": json_decimal(result.get("current_offer_amounts", {})),
             "deviation": json_decimal(result.get("deviation_amounts", {})),
+            "tolerance": status_decimal(result.get("ratio_tolerance", 0)),
+        },
+        "offerLayerAllocation": {
+            "basis": result.get("layer_allocation_basis"),
+            "target": json_decimal(result.get("target_layer_amounts", {})),
+            "current": json_decimal(result.get("current_layer_amounts", {})),
+            "deviation": json_decimal(result.get("layer_deviation_amounts", {})),
             "tolerance": status_decimal(result.get("ratio_tolerance", 0)),
         },
         "nonChangeableCredits": incompatible_credits,
@@ -1303,19 +1466,23 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
         raise ConfigError("ACTIVE 策略在预检后发生变化，请重新运行预检")
     if strategy_v3_version_id(policy) != current.get("policyHash"):
         raise ConfigError("ACTIVE 策略哈希在预检后发生变化，请重新运行预检")
-    if dashboard_build_id() != current.get("buildId"):
-        raise ConfigError("Dashboard build 在预检后发生变化，请重新运行预检")
+    if worker_build_id() != current.get("buildId"):
+        raise ConfigError("Worker build 在预检后发生变化，请重新运行预检")
     refreshed = evaluate_live_preflight(
         config_path,
         client_factory=current.get("clientFactory") or context.client_factory or Bitfinex,
         context=context,
     )
+    summary = refreshed.get("summary", {})
+    # Report an account mutation specifically even when the mutation itself
+    # makes the refreshed preflight fail (for example a newly unreconciled
+    # available balance). This is both more actionable and preserves the
+    # single-use confirmation contract.
+    if summary.get("accountDigest") != current.get("accountDigest"):
+        raise ConfigError("账户快照在预检后发生变化，请重新运行预检")
     failed = [check for check in refreshed.get("checks", []) if check.get("status") != "pass"]
     if failed:
         raise ConfigError("启动前重新核验失败，请重新运行预检")
-    summary = refreshed.get("summary", {})
-    if summary.get("accountDigest") != current.get("accountDigest"):
-        raise ConfigError("账户快照在预检后发生变化，请重新运行预检")
     if summary.get("planHash") != current.get("planHash"):
         raise ConfigError("实际 V3 计划在预检后发生变化，请重新运行预检")
     if _canonical_sha256(summary.get("pendingCancellations") or []) != current.get("cancellationDigest"):
@@ -1469,7 +1636,7 @@ def make_dashboard_handler(directory, config_path, status_path, build_id=None, c
     return Handler
 
 
-def start_web_server(log, config_path, status_path, context=None):
+def start_web_server(log, config_path, status_path, context=None, raise_errors=False):
     context = process_context(config_path, context)
     state = context.process_state
     port = 8000
@@ -1489,11 +1656,19 @@ def start_web_server(log, config_path, status_path, context=None):
                 rest_stale_seconds=active_policy.rest_stale_seconds,
             )
             state.market_hub.start()
-        state.dashboard_server = ThreadingHTTPServer((host, port), handler)
-        log.log(f"网页控制台已启动：http://{host}:{port}/lendingbot.html")
-        state.dashboard_server.serve_forever()
+        server = ThreadingHTTPServer((host, port), handler)
+        state.dashboard_server = server
+        try:
+            log.log(f"网页控制台已启动：http://{host}:{port}/lendingbot.html")
+            server.serve_forever()
+        finally:
+            server.server_close()
+            if state.dashboard_server is server:
+                state.dashboard_server = None
     except Exception as exc:
         log.log(f"网页控制台启动失败：{exc}")
+        if raise_errors:
+            raise
 
 
 def stop_web_server(log, context=None):
@@ -1502,22 +1677,33 @@ def stop_web_server(log, context=None):
     if state.market_hub is not None:
         state.market_hub.stop()
         state.market_hub = None
-    if state.dashboard_server is None:
+    server = state.dashboard_server
+    if server is None:
         return
     try:
         log.log("正在停止网页控制台")
-        state.dashboard_server.shutdown()
-        state.dashboard_server = None
+        server.shutdown()
+        server.server_close()
+        if state.dashboard_server is server:
+            state.dashboard_server = None
     except Exception as exc:
         log.log(f"停止网页控制台失败：{exc}")
 
 
 def publish_safe_status(log, store, exc):
-    runtime = store.enter_safe(f"UNEXPECTED_RUNTIME_ERROR:{type(exc).__name__}")
+    reason = f"UNEXPECTED_RUNTIME_ERROR:{type(exc).__name__}"
+    current = store.runtime()
+    if current["mode"] == "SAFE" and current.get("safe_manual"):
+        runtime = current
+    else:
+        # Account reconciliation can prove that balances are consistent, but it
+        # cannot prove that an unknown programming error has disappeared. Keep
+        # the worker read-only until an operator restarts it after investigation.
+        runtime = store.set_mode("PAUSED", reason)
     log.updateMetaValue("schemaVersion", STATUS_SCHEMA_VERSION)
-    log.updateMetaValue("operationMode", "SAFE")
+    log.updateMetaValue("operationMode", runtime["mode"])
     log.updateMetaValue("runtime", runtime)
-    log.refreshStatus(f"SAFE：{type(exc).__name__}：{exc}")
+    log.refreshStatus(f"{runtime['mode']}：{type(exc).__name__}：{exc}")
     log.persistStatus()
     return runtime
 
@@ -1648,22 +1834,22 @@ def main(argv=None):
                 f"配置和数据库备份位于 {os.path.dirname(normalization['backup']['database'])}"
             )
         log.log("控制台已就绪；只有完成只读预检并确认后才会启动实盘机器人。")
-        thread = threading.Thread(
-            target=start_web_server,
-            args=(log, args.config, settings.json_file, context),
-            daemon=True,
-        )
-        thread.start()
+        exit_code = 0
         try:
-            while True:
-                time.sleep(3600)
+            # The dashboard server owns this process. Running it on the main
+            # thread makes bind/serve failures terminate the process and release
+            # the single-instance lock instead of leaving a headless lock holder.
+            start_web_server(log, args.config, settings.json_file, context, raise_errors=True)
         except KeyboardInterrupt:
             pass
+        except Exception as exc:
+            exit_code = 1
+            log.log(f"控制台进程因网页服务失败而退出：{exc}")
         finally:
             stop_web_server(log, context)
             dashboard_lock.release()
             log.log("已退出")
-        return 0
+        return exit_code
 
     normalization = normalize_current_active_strategy(args.config)
     if normalization["changed"]:

@@ -106,8 +106,8 @@ h3 { font-size: 13px; }
 .metric-strip article:nth-last-child(-n+4) strong { color: var(--teal-dark); }
 #incomeHistoryState.income-warning { color: #a86700; font-weight: 700; }
 
-.market-surface, .offers-surface { padding: 18px 26px; }
-.market-surface { border-bottom: 1px solid var(--line); }
+.market-surface, .credits-surface, .offers-surface { padding: 18px 26px; }
+.market-surface, .offers-surface { border-bottom: 1px solid var(--line); }
 .surface-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .schema-badge, .section-meta { color: var(--muted); font-size: 11px; }
 .schema-badge { padding: 4px 7px; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 3px; }
@@ -129,6 +129,28 @@ h3 { font-size: 13px; }
 .rate-stack dt { color: var(--muted); font-size: 11px; }
 .rate-stack dd { margin: 5px 0 0; font-size: 20px; font-weight: 750; }
 .rate-stack div:first-child dd { color: var(--teal-dark); }
+
+.credit-overall { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--radius); }
+.credit-overall article { display: flex; flex-direction: column; min-width: 0; padding: 15px 14px; border-right: 1px solid var(--line); }
+.credit-overall article:last-child { border-right: 0; }
+.credit-overall span, .credit-overall small { overflow: hidden; color: var(--muted); font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
+.credit-overall strong { overflow: hidden; margin: 6px 0 3px; color: var(--teal-dark); font-size: 19px; white-space: nowrap; text-overflow: ellipsis; }
+.credit-groups { display: grid; gap: 12px; margin-top: 14px; }
+.credit-group { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); }
+.credit-group-heading { display: grid; grid-template-columns: minmax(120px, .7fr) repeat(4, minmax(110px, 1fr)); align-items: stretch; background: var(--surface-soft); border-bottom: 1px solid var(--line); }
+.credit-group-title { display: flex; flex-direction: column; justify-content: center; padding: 13px 14px; border-right: 1px solid var(--line); }
+.credit-group-title strong { font-size: 15px; }
+.credit-group-title small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.credit-group-stat { display: flex; flex-direction: column; justify-content: center; min-width: 0; padding: 11px 13px; border-right: 1px solid var(--line); }
+.credit-group-stat:last-child { border-right: 0; }
+.credit-group-stat span { color: var(--muted); font-size: 9px; }
+.credit-group-stat strong { overflow: hidden; margin-top: 3px; font-size: 13px; white-space: nowrap; text-overflow: ellipsis; }
+.credit-table-wrap { overflow-x: auto; }
+.credit-table { min-width: 920px; }
+.credit-order-cards { display: none; }
+.credit-group-empty { padding: 18px; color: var(--muted); font-size: 11px; text-align: center; }
+.credit-note { margin-top: 11px; color: var(--muted); font-size: 10px; }
+.credit-attribution { color: var(--teal-dark); font-weight: 700; }
 
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
@@ -315,9 +337,16 @@ tbody tr:last-child td { border-bottom: 0; }
     .metric-strip article:nth-child(4n) { border-right: 0; }
     .market-layout { grid-template-columns: 210px minmax(180px,1fr); }
     .chart-block, .chart-block canvas { width: 210px; height: 210px; }
-    .rate-stack { grid-column: 1 / -1; grid-template-columns: repeat(3, 1fr); }
+    .rate-stack { grid-column: 1 / -1; grid-template-columns: repeat(4, 1fr); }
     .rate-stack div { border-right: 1px solid var(--line); border-bottom: 0; }
     .rate-stack div:last-child { border-right: 0; }
+    .credit-overall { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .credit-overall article { border-bottom: 1px solid var(--line); }
+    .credit-overall article:nth-child(3) { border-right: 0; }
+    .credit-overall article:nth-child(n+4) { border-bottom: 0; }
+    .credit-group-heading { grid-template-columns: minmax(120px, .8fr) repeat(2, minmax(120px, 1fr)); }
+    .credit-group-stat:nth-child(n+4) { border-top: 1px solid var(--line); }
+    .credit-group-stat:nth-child(4) { border-left: 1px solid var(--line); }
     .form-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
     .strategy-layout { grid-template-columns: minmax(0, 1fr) 340px; }
     .field-grid.thirds { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -339,6 +368,15 @@ tbody tr:last-child td { border-bottom: 0; }
     .market-layout { grid-template-columns: 1fr; justify-items: center; }
     .distribution-legend { width: 100%; }
     .rate-stack { width: 100%; grid-column: auto; }
+    .credit-overall { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .credit-overall article, .credit-overall article:nth-child(n+4) { border-bottom: 1px solid var(--line); }
+    .credit-overall article:nth-child(2n) { border-right: 0; }
+    .credit-overall article:last-child { grid-column: 1 / -1; border-bottom: 0; }
+    .credit-group-heading { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .credit-group-title { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--line); }
+    .credit-group-stat:nth-child(n) { border-top: 0; border-right: 1px solid var(--line); border-left: 0; }
+    .credit-group-stat:nth-child(odd) { border-right: 0; }
+    .credit-group-stat:nth-child(n+4) { border-top: 1px solid var(--line); }
     .strategy-layout { display: flex; flex-direction: column; }
     .strategy-preview { order: -1; width: 100%; }
     .preview-sticky { position: static; }
@@ -357,7 +395,7 @@ tbody tr:last-child td { border-bottom: 0; }
     .primary-control, .secondary-control { min-height: 48px; }
     .metric-strip article { min-height: 94px; padding: 14px 16px; }
     .metric-strip strong { font-size: 20px; }
-    .market-surface, .offers-surface { padding: 22px 16px; }
+    .market-surface, .credits-surface, .offers-surface { padding: 22px 16px; }
     .chart-block, .chart-block canvas { width: 220px; height: 220px; }
     .rate-stack { grid-template-columns: 1fr; }
     .rate-stack div { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -368,6 +406,18 @@ tbody tr:last-child td { border-bottom: 0; }
     .offer-card dl { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; margin: 0; }
     .offer-card dt { color: var(--muted); font-size: 10px; }
     .offer-card dd { margin: 2px 0 0; font-size: 12px; font-weight: 700; }
+    .credit-overall { grid-template-columns: 1fr; }
+    .credit-overall article, .credit-overall article:nth-child(n) { grid-column: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    .credit-overall article:last-child { border-bottom: 0; }
+    .credit-group-heading { grid-template-columns: 1fr 1fr; }
+    .credit-table-wrap { display: none; }
+    .credit-order-cards { display: grid; gap: 8px; padding: 10px; }
+    .credit-order-card { padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: var(--radius); }
+    .credit-order-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .credit-order-card header strong { font-size: 15px; }
+    .credit-order-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+    .credit-order-card dt { color: var(--muted); font-size: 9px; }
+    .credit-order-card dd { margin: 2px 0 0; font-size: 11px; font-weight: 700; }
     .strategy-form { gap: 10px; }
     .strategy-form fieldset { border-right: 0; border-left: 0; border-radius: 0; padding: 18px 16px; }
     .strategy-card { padding: 18px 16px; border-right: 0; border-left: 0; border-radius: 0; }
@@ -407,6 +457,15 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 
 /* Strategy V3 operational surface. */
+.v3-fixed-safety {
+    margin: 0 0 1rem;
+    padding: 0.8rem 1rem;
+    border: 1px solid rgba(0, 167, 167, 0.28);
+    border-radius: 0.7rem;
+    background: rgba(0, 167, 167, 0.08);
+    color: var(--ink, #173333);
+    line-height: 1.55;
+}
 .v3-strategy-surface { display: grid; gap: 12px; }
 .v3-mode-bar {
     display: grid;
@@ -430,7 +489,15 @@ tbody tr:last-child td { border-bottom: 0; }
     font-weight: 700;
     text-transform: uppercase;
 }
-.v3-mode-bar strong { margin-top: 3px; color: var(--text); font-size: 13px; }
+.v3-mode-bar strong {
+    min-width: 0;
+    overflow: hidden;
+    margin-top: 3px;
+    color: var(--text);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .v3-mode-actions { display: flex; align-items: center; gap: 7px; padding: 9px; }
 .v3-mode-actions .button { min-height: 38px; white-space: nowrap; }
 .v3-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; align-items: start; }

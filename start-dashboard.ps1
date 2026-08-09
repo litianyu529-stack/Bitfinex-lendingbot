@@ -29,11 +29,30 @@ function Get-Listener {
 function Get-DashboardLockMetadata {
     $path = Join-Path $Root ".state\lendingbot-dashboard.lock"
     if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $stream = $null
+    $reader = $null
     try {
-        $bytes = [IO.File]::ReadAllBytes($path)
-        if ($bytes.Length -le 1) { return $null }
-        return ([Text.Encoding]::UTF8.GetString($bytes, 1, $bytes.Length - 1).Trim([char[]]@(0, 13, 10, 32)) | ConvertFrom-Json)
-    } catch { return $null }
+        # Byte 0 is the Windows single-instance lock. Reading the whole file
+        # crosses that locked byte and fails even though the JSON metadata
+        # beginning at byte 1 is intentionally readable by the launcher.
+        $stream = [IO.FileStream]::new(
+            $path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
+        if ($stream.Length -le 1) { return $null }
+        [void]$stream.Seek(1, [IO.SeekOrigin]::Begin)
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 1024, $true)
+        $json = $reader.ReadToEnd().Trim([char[]]@(0, 13, 10, 32))
+        if (-not $json) { return $null }
+        return ($json | ConvertFrom-Json)
+    } catch {
+        return $null
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
 }
 
 try {
@@ -71,6 +90,24 @@ try {
             Start-Sleep -Milliseconds 250
         }
         if (-not $released) { throw "The old Dashboard did not release port 8000 within 10 seconds." }
+    } else {
+        # Recover an older/headless Dashboard whose HTTP thread died while its
+        # main process continued holding the single-instance lock.
+        $lock = Get-DashboardLockMetadata
+        if ($lock -and $lock.pid) {
+            $pidValue = [int]$lock.pid
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+            $headlessIdentity = $process -and $process.Name -match '^python(?:w)?\.exe$' -and
+                $process.CommandLine -match '(?i)lendingbot\.py' -and $process.CommandLine -match '(?i)--dashboard' -and
+                [string]$lock.role -eq "dashboard" -and [string]$lock.service -eq "mika-lending-dashboard-v3" -and
+                [IO.Path]::GetFullPath([string]$lock.configPath) -eq $ConfigPath -and
+                [IO.Path]::GetFullPath([string]$lock.projectRoot) -eq [IO.Path]::GetFullPath($Root)
+            if ($headlessIdentity) {
+                Write-Host "Safely replacing headless Dashboard PID $pidValue..."
+                Stop-Process -Id $pidValue -Force
+                Wait-Process -Id $pidValue -Timeout 10 -ErrorAction SilentlyContinue
+            }
+        }
     }
 
     $startArgs = @($Python.Prefix) + @("lendingbot.py", "--dashboard")

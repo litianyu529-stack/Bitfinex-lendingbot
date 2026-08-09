@@ -1,7 +1,6 @@
 import hashlib
 import json
 import math
-import random
 import time
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
@@ -9,10 +8,41 @@ from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 
 D = Decimal
 SATOSHI = D("0.00000001")
+USD_ORDER_CHUNK = D("150")
+POOL_SHIFT_CAP_PERCENTAGE_POINTS = D("10")
+PRIMARY_TERM_MAX_SHARE = D("0.70")
 RATE_TICK = D("0.0000001")
 RATE_COMPARISON_EPSILON = D("0.000000000000000001")
 POOLS = ("short", "medium", "long")
 LAYERS = ("quick", "balanced", "high")
+TERM_PERIOD_RANGES = {
+    "short": (2, 7),
+    "medium": (7, 30),
+    "long": (30, 120),
+}
+POPULAR_TERM_PERIODS = {
+    "short": (2, 7),
+    "medium": (14, 30),
+    "long": (120,),
+}
+PERIOD_DEMAND_WINDOW_WEIGHTS = {"1h": D("0.35"), "24h": D("0.40"), "7d": D("0.25")}
+PERIOD_DEMAND_COMPONENT_WEIGHTS = {"trade_count": D("0.60"), "volume": D("0.40")}
+PERIOD_FILL_COMPONENT_WEIGHTS = {"executable_depth": D("0.70"), "competitiveness": D("0.30")}
+PERIOD_FINAL_COMPONENT_WEIGHTS = {"market_demand": D("0.50"), "fill_probability": D("0.50")}
+PERIOD_FALLBACKS = {"short": 2, "medium": 14, "long": 120}
+PERIOD_SWITCH_ADVANTAGE = D("0.20")
+PERIOD_SWITCH_HOLD_MS = 600_000
+REPRICE_STAGE_DEFAULTS = {
+    "short": (10, 30, 60, 90, 120, 180),
+    "medium": (20, 60, 120, 180, 240, 360),
+    "long": (60, 180, 360, 480, 720, 1440),
+}
+REPRICE_STAGE_LEGACY_MULTIPLIERS = {
+    "short": (D("1.5"), D("2"), D("3")),
+    "medium": (D("1.5"), D("2"), D("3")),
+    "long": (D("1.333333333333333333"), D("2"), D("4")),
+}
+MAX_REPRICE_STAGE_MINUTES = 10_080
 WINDOWS_MS = {
     "1m": 60_000,
     "5m": 300_000,
@@ -57,6 +87,56 @@ def _tuple_of_ints(value, fallback):
     return tuple(int(item) for item in value)
 
 
+def normalize_term_period_range(value, pool):
+    """Parse editable discrete terms while migrating the former range syntax."""
+
+    minimum, maximum = TERM_PERIOD_RANGES[pool]
+    defaults = POPULAR_TERM_PERIODS[pool]
+    if value in (None, ""):
+        return defaults
+    if isinstance(value, str):
+        normalized = value.strip().replace("–", "-").replace("—", "-")
+        if "-" in normalized:
+            parts = tuple(part.strip() for part in normalized.split("-"))
+            try:
+                endpoints = tuple(int(part) for part in parts if part)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{pool} periods must be comma-separated days within {minimum}-{maximum}") from exc
+            if endpoints == (minimum, maximum):
+                return defaults
+            raise ValueError(f"{pool} periods must be comma-separated days within {minimum}-{maximum}")
+        else:
+            parts = tuple(
+                part.strip()
+                for part in normalized.replace("/", ",").replace("、", ",").split(",")
+            )
+    else:
+        parts = tuple(value)
+    try:
+        periods = tuple(int(part) for part in parts if str(part).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{pool} periods must be comma-separated days within {minimum}-{maximum}") from exc
+    if (
+        not periods
+        or len(set(periods)) != len(periods)
+        or any(period < minimum or period > maximum for period in periods)
+    ):
+        raise ValueError(f"{pool} periods must be unique days within {minimum}-{maximum}")
+    return tuple(sorted(periods))
+
+
+def normalize_reprice_stages(value, pool):
+    stages = _tuple_of_ints(value, REPRICE_STAGE_DEFAULTS[pool])
+    if len(stages) != 3:
+        return stages
+    last = D(stages[-1])
+    extension = tuple(
+        int((last * multiplier).to_integral_value(rounding=ROUND_CEILING))
+        for multiplier in REPRICE_STAGE_LEGACY_MULTIPLIERS[pool]
+    )
+    return stages + extension
+
+
 def ceil_rate_tick(value):
     value = D(value)
     if value <= 0:
@@ -74,23 +154,23 @@ class StrategyPolicyV3:
     version: int = 3
     currency: str = "USD"
     short_share: D = D("50")
-    medium_share: D = D("30")
-    long_share: D = D("20")
+    medium_share: D = D("35")
+    long_share: D = D("15")
     quick_share: D = D("40")
     balanced_share: D = D("40")
     high_share: D = D("20")
     short_floor_apr: D | None = None
     medium_floor_apr: D | None = None
     long_floor_apr: D | None = None
-    short_periods: tuple[int, ...] = (2, 3, 5, 7)
-    medium_periods: tuple[int, ...] = (8, 14, 21, 30)
-    long_periods: tuple[int, ...] = (120,)
-    target_slices: int = 50
-    min_order_amount: D = D("150")
+    short_periods: tuple[int, ...] = (2, 7)
+    medium_periods: tuple[int, ...] = POPULAR_TERM_PERIODS["medium"]
+    long_periods: tuple[int, ...] = POPULAR_TERM_PERIODS["long"]
     max_lend_amount: D | None = None
     max_lend_percent: D = D("100")
-    amount_jitter: D = D("0.03")
-    max_pool_shift: D = D("10")
+    # Kept in persisted policy records for Schema 6/9 compatibility. V3.1 fixes
+    # this safety boundary at ten percentage points and does not expose it as a
+    # configurable control.
+    max_pool_shift: D = POOL_SHIFT_CAP_PERCENTAGE_POINTS
     normal_fee_rate: D = D("0.15")
     hidden_fee_rate: D = D("0.18")
     enable_limit: bool = True
@@ -105,9 +185,9 @@ class StrategyPolicyV3:
     reprice_cooldown_minutes: int = 10
     max_reprices_per_hour: int = 6
     minimum_rate_change: D = D("0.00002")
-    short_reprice_stages_minutes: tuple[int, ...] = (10, 30, 60)
-    medium_reprice_stages_minutes: tuple[int, ...] = (20, 60, 120)
-    long_reprice_stages_minutes: tuple[int, ...] = (60, 180, 360)
+    short_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["short"]
+    medium_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["medium"]
+    long_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["long"]
     iqr_change_fraction: D = D("0.25")
     spike_volume_ratio: D = D("1.5")
     outlier_min_volume_share: D = D("0.005")
@@ -119,7 +199,7 @@ class StrategyPolicyV3:
         return getattr(self, f"{pool}_floor_apr")
 
     def periods(self, pool):
-        return getattr(self, f"{pool}_periods")
+        return tuple(getattr(self, f"{pool}_periods"))
 
     def pool_shares(self):
         return {pool: getattr(self, f"{pool}_share") for pool in POOLS}
@@ -143,15 +223,11 @@ V3_FIELD_CONVERTERS = {
     "short_floor_apr": lambda value: None if value in (None, "") else _d(value),
     "medium_floor_apr": lambda value: None if value in (None, "") else _d(value),
     "long_floor_apr": lambda value: None if value in (None, "") else _d(value),
-    "short_periods": lambda value: _tuple_of_ints(value, (2, 3, 5, 7)),
-    "medium_periods": lambda value: _tuple_of_ints(value, (8, 14, 21, 30)),
-    "long_periods": lambda value: _tuple_of_ints(value, (120,)),
-    "target_slices": int,
-    "min_order_amount": _d,
+    "short_periods": lambda value: normalize_term_period_range(value, "short"),
+    "medium_periods": lambda value: normalize_term_period_range(value, "medium"),
+    "long_periods": lambda value: normalize_term_period_range(value, "long"),
     "max_lend_amount": lambda value: None if value in (None, "") else _d(value),
     "max_lend_percent": _d,
-    "amount_jitter": _d,
-    "max_pool_shift": _d,
     "normal_fee_rate": _d,
     "hidden_fee_rate": _d,
     "enable_limit": _bool,
@@ -166,9 +242,9 @@ V3_FIELD_CONVERTERS = {
     "reprice_cooldown_minutes": int,
     "max_reprices_per_hour": int,
     "minimum_rate_change": _d,
-    "short_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (10, 30, 60)),
-    "medium_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (20, 60, 120)),
-    "long_reprice_stages_minutes": lambda value: _tuple_of_ints(value, (60, 180, 360)),
+    "short_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "short"),
+    "medium_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "medium"),
+    "long_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "long"),
     "iqr_change_fraction": _d,
     "spike_volume_ratio": _d,
     "outlier_min_volume_share": _d,
@@ -203,28 +279,21 @@ def validate_policy_v3(policy, require_live_floors=False):
         raise ValueError("net APR floors must be between 0 and 1000 percent")
     if require_live_floors and any(value is None or value <= 0 for value in floors):
         raise ValueError("LIVE requires positive short, medium, and long net APR floors")
-    if policy.target_slices < 1 or policy.target_slices > 100:
-        raise ValueError("target_slices must be 1-100")
-    if policy.min_order_amount < 150:
-        raise ValueError("USD min_order_amount must be at least 150")
     if policy.max_lend_amount is not None and policy.max_lend_amount < 0:
         raise ValueError("max_lend_amount must be non-negative or empty")
     if policy.max_lend_percent < 0 or policy.max_lend_percent > 100:
         raise ValueError("max_lend_percent must be 0-100")
-    if policy.amount_jitter < 0 or policy.amount_jitter > D("0.10"):
-        raise ValueError("amount_jitter must be 0-0.10")
-    if policy.max_pool_shift < 0 or policy.max_pool_shift > 25:
-        raise ValueError("max_pool_shift must be 0-25 percentage points")
-    for pool in POOLS:
-        periods = policy.periods(pool)
-        if not periods or any(period < 2 or period > 120 for period in periods):
-            raise ValueError(f"{pool} periods must be 2-120 days")
-    if any(period > 7 for period in policy.short_periods):
-        raise ValueError("short periods must be 2-7 days")
-    if any(period < 8 or period > 30 for period in policy.medium_periods):
-        raise ValueError("medium periods must be 8-30 days")
-    if policy.long_periods != (120,):
-        raise ValueError("long period must be exactly 120 days")
+    if policy.max_pool_shift != POOL_SHIFT_CAP_PERCENTAGE_POINTS:
+        raise ValueError("V3.1 fixes max_pool_shift at 10 percentage points")
+    for pool, (minimum, maximum) in TERM_PERIOD_RANGES.items():
+        periods = tuple(getattr(policy, f"{pool}_periods"))
+        if (
+            not periods
+            or tuple(sorted(periods)) != periods
+            or len(set(periods)) != len(periods)
+            or any(period < minimum or period > maximum for period in periods)
+        ):
+            raise ValueError(f"{pool} periods must be unique increasing days within {minimum}-{maximum}")
     for name in ("normal_fee_rate", "hidden_fee_rate"):
         value = getattr(policy, name)
         if value < 0 or value >= 1:
@@ -248,11 +317,14 @@ def validate_policy_v3(policy, require_live_floors=False):
     for pool in POOLS:
         stages = policy.reprice_stages(pool)
         if (
-            len(stages) != 3
-            or any(value < 1 or value > 1440 for value in stages)
-            or not (stages[0] < stages[1] < stages[2])
+            len(stages) != 6
+            or any(value < 1 or value > MAX_REPRICE_STAGE_MINUTES for value in stages)
+            or any(left >= right for left, right in zip(stages, stages[1:]))
         ):
-            raise ValueError(f"{pool} reprice stages must contain three increasing minutes between 1 and 1440")
+            raise ValueError(
+                f"{pool} reprice stages must contain six increasing minutes "
+                f"between 1 and {MAX_REPRICE_STAGE_MINUTES}"
+            )
     return policy
 
 
@@ -295,7 +367,7 @@ def pool_for_period(period):
         return "short"
     if 8 <= period <= 30:
         return "medium"
-    if period == 120:
+    if 31 <= period <= 120:
         return "long"
     return "external"
 
@@ -341,7 +413,7 @@ def filter_supported_trades(trades, policy):
         return []
     q95 = weighted_quantile(rows, D("0.95"))
     total = sum((row["amount"] for row in rows), D("0"))
-    support = max(policy.min_order_amount, total * policy.outlier_min_volume_share)
+    support = max(USD_ORDER_CHUNK, total * policy.outlier_min_volume_share)
     high_volume = sum((row["amount"] for row in rows if row["rate"] > q95), D("0"))
     if high_volume < support:
         rows = [row for row in rows if row["rate"] <= q95 or row["amount"] >= support]
@@ -365,6 +437,178 @@ def _weighted_std(rows, center):
     return D(str(math.sqrt(float(max(D("0"), variance)))))
 
 
+def _period_book_rows(book, period, borrower_side=None):
+    rows = []
+    for raw in book or []:
+        try:
+            if int(raw.get("period")) != int(period):
+                continue
+            amount = D(raw.get("amount", 0))
+            rate = D(raw.get("rate", 0))
+        except (TypeError, ValueError, ArithmeticError):
+            continue
+        if rate <= 0 or amount == 0:
+            continue
+        if borrower_side is True and amount >= 0:
+            continue
+        if borrower_side is False and amount <= 0:
+            continue
+        rows.append({"rate": rate, "amount": abs(amount)})
+    return rows
+
+
+def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
+    """Choose one market-supported term per pool and expose its full score basis."""
+
+    by_pool = {}
+    for pool in POOLS:
+        candidates = policy.periods(pool)
+        floor_apr = policy.floor_apr(pool)
+        floor_rate = (
+            D("0")
+            if floor_apr is None or floor_apr <= 0
+            else ceil_rate_tick(gross_daily_floor(floor_apr, policy.normal_fee_rate))
+        )
+        target_rate = competitive_rate_for_layer("balanced", signals, floor_rate)
+        period_rows = {}
+        demand_data_present = False
+        book_data_present = False
+
+        for period in candidates:
+            window_metrics = {}
+            for window in PERIOD_DEMAND_WINDOW_WEIGHTS:
+                selected = [
+                    row
+                    for row in _window_rows(filtered_trades, now_ms, window)
+                    if int(row["period"]) == int(period)
+                ]
+                window_metrics[window] = {
+                    "tradeCount": len(selected),
+                    "tradeVolume": sum((row["amount"] for row in selected), D("0")),
+                }
+                demand_data_present = demand_data_present or bool(selected)
+            bids = _period_book_rows(book, period, borrower_side=True)
+            offers = _period_book_rows(book, period, borrower_side=False)
+            book_data_present = book_data_present or bool(bids or offers)
+            best_bid = max((row["rate"] for row in bids), default=D("0"))
+            best_offer = min((row["rate"] for row in offers), default=D("0"))
+            executable_depth = sum(
+                (row["amount"] for row in bids if row["rate"] >= target_rate),
+                D("0"),
+            )
+            recent_rates = [
+                row["rate"]
+                for row in _window_rows(filtered_trades, now_ms, "7d")
+                if int(row["period"]) == int(period)
+            ]
+            supported_ceiling = max([best_bid, *recent_rates], default=D("0"))
+            period_rows[int(period)] = {
+                "period": int(period),
+                "windows": window_metrics,
+                "bestBorrowRate": best_bid,
+                "bestOfferRate": best_offer,
+                "executableBorrowDepth": executable_depth,
+                "supportedCeiling": supported_ceiling,
+                "targetRate": target_rate,
+            }
+
+        for window, window_weight in PERIOD_DEMAND_WINDOW_WEIGHTS.items():
+            total_count = sum(row["windows"][window]["tradeCount"] for row in period_rows.values())
+            total_volume = sum(
+                (row["windows"][window]["tradeVolume"] for row in period_rows.values()),
+                D("0"),
+            )
+            for row in period_rows.values():
+                metrics = row["windows"][window]
+                count_share = D(metrics["tradeCount"]) / D(total_count) if total_count else D("0")
+                volume_share = metrics["tradeVolume"] / total_volume if total_volume > 0 else D("0")
+                metrics["countShare"] = count_share
+                metrics["volumeShare"] = volume_share
+                metrics["score"] = (
+                    count_share * PERIOD_DEMAND_COMPONENT_WEIGHTS["trade_count"]
+                    + volume_share * PERIOD_DEMAND_COMPONENT_WEIGHTS["volume"]
+                )
+                row["demandScore"] = row.get("demandScore", D("0")) + metrics["score"] * window_weight
+
+        max_depth = max((row["executableBorrowDepth"] for row in period_rows.values()), default=D("0"))
+        insufficient_market_data = not demand_data_present and not book_data_present
+        fallback = PERIOD_FALLBACKS[pool] if PERIOD_FALLBACKS[pool] in candidates else min(candidates)
+        for row in period_rows.values():
+            depth_score = row["executableBorrowDepth"] / max_depth if max_depth > 0 else D("0")
+            best_bid = row["bestBorrowRate"]
+            if best_bid <= 0 or target_rate <= 0:
+                competitiveness = D("0")
+            elif target_rate <= best_bid:
+                competitiveness = D("1")
+            else:
+                competitiveness = max(D("0"), D("1") - (target_rate - best_bid) / best_bid)
+            fill_score = (
+                depth_score * PERIOD_FILL_COMPONENT_WEIGHTS["executable_depth"]
+                + competitiveness * PERIOD_FILL_COMPONENT_WEIGHTS["competitiveness"]
+            )
+            total_score = (
+                row["demandScore"] * PERIOD_FINAL_COMPONENT_WEIGHTS["market_demand"]
+                + fill_score * PERIOD_FINAL_COMPONENT_WEIGHTS["fill_probability"]
+            )
+            supported = row["supportedCeiling"] > 0 and row["supportedCeiling"] >= floor_rate
+            row.update(
+                {
+                    "depthScore": depth_score,
+                    "competitivenessScore": competitiveness,
+                    "fillScore": fill_score,
+                    "totalScore": total_score,
+                    "eligible": bool(floor_rate > 0 and supported and not insufficient_market_data),
+                    "eligibilityReason": (
+                        "INSUFFICIENT_MARKET_DATA"
+                        if insufficient_market_data
+                        else "MARKET_SUPPORTS_FLOOR"
+                        if floor_rate > 0 and supported
+                        else "FLOOR_NOT_CONFIGURED"
+                        if floor_rate <= 0
+                        else "MARKET_BELOW_FLOOR"
+                    ),
+                }
+            )
+
+        eligible = sorted(
+            (row for row in period_rows.values() if row["eligible"]),
+            key=lambda row: (row["totalScore"], row["fillScore"], row["demandScore"], -row["period"]),
+            reverse=True,
+        )
+        selected = eligible[0] if eligible else None
+        runner_up = eligible[1] if len(eligible) > 1 else None
+        reason = "HIGHEST_TOTAL_SCORE" if selected else "NO_ELIGIBLE_PERIOD"
+        by_pool[pool] = {
+            "candidates": list(candidates),
+            "selectedPeriod": None if selected is None else selected["period"],
+            "leaderPeriod": None if selected is None else selected["period"],
+            "runnerUpPeriod": None if runner_up is None else runner_up["period"],
+            "eligiblePeriods": [row["period"] for row in eligible],
+            "selectedSinceMs": None,
+            "selectionMature": False,
+            "selectionReason": reason,
+            "fallbackPeriod": fallback,
+            "insufficientMarketData": insufficient_market_data,
+            "grossDailyFloor": floor_rate,
+            "scores": [period_rows[period] for period in candidates],
+        }
+    result = {
+        "basis": (
+            "50% market demand (trades: count 60%/volume 40%; "
+            "windows: 1h 35%/24h 40%/7d 25%) + 50% fill probability "
+            "(book depth 70%/rate competitiveness 30%)"
+        ),
+        "weights": {
+            "final": PERIOD_FINAL_COMPONENT_WEIGHTS,
+            "demandWindows": PERIOD_DEMAND_WINDOW_WEIGHTS,
+            "demandComponents": PERIOD_DEMAND_COMPONENT_WEIGHTS,
+            "fillComponents": PERIOD_FILL_COMPONENT_WEIGHTS,
+        },
+        "byPool": by_pool,
+    }
+    return result
+
+
 def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
     validate_policy_v3(policy)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -381,6 +625,25 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
             "volume": volume,
             "count": len(selected),
             "volatility": _weighted_std(selected, median),
+        }
+    demand_rows = _window_rows(filtered, now, "7d")
+    total_demand_count = len(demand_rows)
+    total_demand_volume = sum((row["amount"] for row in demand_rows), D("0"))
+    demand_by_period = {}
+    for row in demand_rows:
+        period = int(row["period"])
+        entry = demand_by_period.setdefault(period, {"trade_count": 0, "volume": D("0")})
+        entry["trade_count"] += 1
+        entry["volume"] += row["amount"]
+    period_demand = {}
+    for period, entry in demand_by_period.items():
+        count_share = D(entry["trade_count"]) / D(total_demand_count) if total_demand_count else D("0")
+        volume_share = entry["volume"] / total_demand_volume if total_demand_volume > 0 else D("0")
+        period_demand[period] = {
+            **entry,
+            "count_share": count_share,
+            "volume_share": volume_share,
+            "score": count_share * D("0.60") + volume_share * D("0.40"),
         }
     asks = [row for row in book or [] if D(row.get("amount", 0)) > 0]
     bids = [row for row in book or [] if D(row.get("amount", 0)) < 0]
@@ -429,7 +692,7 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
             cumulative += abs(D(row["amount"]))
             levels.append({"rate": D(row["rate"]), "amount": abs(D(row["amount"])), "cumulative": cumulative})
         depth[side] = levels
-    return {
+    result = {
         "as_of": now,
         "regime": regime,
         "spike": spike,
@@ -444,46 +707,15 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
         "volume_ratio_5m": volume_ratio,
         "windows": windows,
         "depth": depth,
+        "period_demand": period_demand,
+        "period_demand_basis": "RECENT_TRADES_COUNT_60_VOLUME_40",
         "filtered_trade_count": len(filtered),
         "raw_trade_count": len(trades or []),
     }
-
-
-def dynamic_pool_shares(policy, signals):
-    base = policy.pool_shares()
-    shift = int(policy.max_pool_shift)
-    candidates = []
-    for short in range(max(0, int(base["short"]) - shift), min(100, int(base["short"]) + shift) + 1):
-        for medium in range(max(0, int(base["medium"]) - shift), min(100, int(base["medium"]) + shift) + 1):
-            long = 100 - short - medium
-            if long < 0 or abs(D(long) - base["long"]) > policy.max_pool_shift:
-                continue
-            if signals.get("regime") == "spike" and (
-                short > base["short"] or medium < base["medium"] or long < base["long"]
-            ):
-                continue
-            if signals.get("regime") == "low" and short < base["short"]:
-                continue
-            utility = D("0")
-            if signals.get("regime") == "spike":
-                utility = D(medium) * D("0.6") + D(long) - D(short) * D("0.2")
-            elif signals.get("regime") == "low":
-                utility = D(short) - D(medium) * D("0.2") - D(long) * D("0.6")
-            elif signals.get("regime") == "rising":
-                utility = D(medium) * D("0.4") + D(long) * D("0.6")
-            else:
-                utility = -sum(
-                    (
-                        abs(D(value) - base[name])
-                        for name, value in (("short", short), ("medium", medium), ("long", long))
-                    ),
-                    D("0"),
-                )
-            candidates.append((utility, -abs(D(short) - base["short"]), short, medium, long))
-    if not candidates:
-        return base
-    _, _, short, medium, long = max(candidates)
-    return {"short": D(short), "medium": D(medium), "long": D(long)}
+    period_selection = _build_period_selection(policy, result, filtered, book, now)
+    result["period_selection"] = period_selection
+    result["periodSelection"] = period_selection
+    return result
 
 
 def _largest_remainder_counts(total_count, weights):
@@ -501,38 +733,95 @@ def _largest_remainder_counts(total_count, weights):
     return counts
 
 
-def deterministic_amounts(total, count, minimum, jitter, seed):
-    total, minimum, jitter = D(total), D(minimum), D(jitter)
-    if count <= 0 or total < minimum:
-        return []
-    count = min(int(count), int(total // minimum))
-    if count <= 0:
-        return []
-    rng = random.Random(int(hashlib.sha256(str(seed).encode("utf-8")).hexdigest()[:16], 16))
-    factors = [D(str(1 + rng.uniform(-float(jitter), float(jitter)))) for _ in range(count)]
-    factor_sum = sum(factors, D("0"))
-    amounts = []
-    remaining = total
-    for index, factor in enumerate(factors):
-        slots_after = count - index - 1
-        if index == count - 1:
-            amount = remaining
-        else:
-            proposed = total * factor / factor_sum
-            upper = remaining - minimum * D(slots_after)
-            amount = min(upper, max(minimum, proposed))
-        amount = amount.quantize(SATOSHI, rounding=ROUND_DOWN)
-        amounts.append(amount)
-        remaining -= amount
-    if remaining > 0:
-        amounts[-1] += remaining
-    return amounts
+def _interleaved_keys(counts, keys):
+    """Expand integer counts without grouping one allocation dimension into blocks."""
+
+    remaining = {key: max(0, int(counts.get(key, 0))) for key in keys}
+    sequence = []
+    while any(remaining.values()):
+        for key in keys:
+            if remaining[key] <= 0:
+                continue
+            sequence.append(key)
+            remaining[key] -= 1
+    return sequence
 
 
-def _pool_deficits(total_principal, shares, exposure):
-    return {
-        pool: max(D("0"), D(total_principal) * shares[pool] / D("100") - D(exposure.get(pool, 0))) for pool in POOLS
+def evenly_distributed_amounts(total, count):
+    """Split an eight-decimal USD total as evenly as possible."""
+
+    total = max(D("0"), D(total)).quantize(SATOSHI, rounding=ROUND_DOWN)
+    count = max(0, int(count))
+    if count <= 0 or total < USD_ORDER_CHUNK * D(count):
+        return []
+    total_units = int(total / SATOSHI)
+    base_units, extra_units = divmod(total_units, count)
+    return [
+        D(base_units + (1 if index < extra_units else 0)) * SATOSHI
+        for index in range(count)
+    ]
+
+
+def _score_for_period(selection, period):
+    return next(
+        (
+            max(D("0"), D(row.get("totalScore") or 0))
+            for row in selection.get("scores", [])
+            if int(row.get("period")) == int(period)
+        ),
+        D("0"),
+    )
+
+
+def _weighted_capped_amounts(total, keys, weights, capacities):
+    """Distribute an amount by score without ever crossing a hard capacity."""
+
+    remaining = max(D("0"), D(total))
+    result = {key: D("0") for key in keys}
+    active = [key for key in keys if D(capacities.get(key, 0)) > 0]
+    while remaining > 0 and active:
+        active_weights = {key: max(D("0"), D(weights.get(key, 0))) for key in active}
+        if sum(active_weights.values(), D("0")) <= 0:
+            active_weights = {key: D("1") for key in active}
+        weight_total = sum(active_weights.values(), D("0"))
+        before = remaining
+        proposed = {key: remaining * active_weights[key] / weight_total for key in active}
+        for key in active:
+            room = max(D("0"), D(capacities[key]) - result[key])
+            award = min(room, proposed[key])
+            result[key] += award
+            remaining -= award
+        active = [key for key in active if D(capacities[key]) - result[key] > SATOSHI]
+        if before - remaining <= SATOSHI:
+            break
+    return result
+
+
+def _capped_weighted_counts(total_count, keys, weights, maximums):
+    """Largest-remainder count allocation with explicit per-key maxima."""
+
+    keys = list(keys)
+    total_count = max(0, int(total_count))
+    normalized = {key: max(D("0"), D(weights.get(key, 0))) for key in keys}
+    if sum(normalized.values(), D("0")) <= 0:
+        normalized = {key: D("1") for key in keys}
+    weight_total = sum(normalized.values(), D("0"))
+    raw = {key: D(total_count) * normalized[key] / weight_total for key in keys}
+    counts = {
+        key: min(max(0, int(maximums.get(key, 0))), int(raw[key])) for key in keys
     }
+    remaining = total_count - sum(counts.values())
+    while remaining > 0:
+        choices = [key for key in keys if counts[key] < int(maximums.get(key, 0))]
+        if not choices:
+            break
+        selected = max(
+            choices,
+            key=lambda key: (raw[key] - D(counts[key]), normalized[key], -keys.index(key)),
+        )
+        counts[selected] += 1
+        remaining -= 1
+    return counts
 
 
 def allocate_slices_v3(
@@ -545,111 +834,248 @@ def allocate_slices_v3(
     exposure_by_layer=None,
     offer_exposure_by_pool=None,
     offer_exposure_by_layer=None,
+    offer_exposure_by_period=None,
 ):
+    """Allocate only authoritative wallet cash, with pool and term concentration caps."""
+
     validate_policy_v3(policy)
     total_principal, available = max(D("0"), D(total_principal)), max(D("0"), D(available))
     offer_exposure = {pool: D((offer_exposure_by_pool or exposure_by_pool or {}).get(pool, 0)) for pool in POOLS}
+    period_exposure = {
+        int(period): max(D("0"), D(amount))
+        for period, amount in (offer_exposure_by_period or {}).items()
+    }
     offer_budget = sum(offer_exposure.values(), D("0")) + available
     shares = policy.pool_shares()
     target_offer_amounts = {pool: offer_budget * shares[pool] / D("100") for pool in POOLS}
+    pool_cap_percentages = {
+        pool: min(D("100"), shares[pool] + POOL_SHIFT_CAP_PERCENTAGE_POINTS) for pool in POOLS
+    }
+    pool_cap_amounts = {
+        pool: offer_budget * pool_cap_percentages[pool] / D("100") for pool in POOLS
+    }
     deviations = {pool: offer_exposure[pool] - target_offer_amounts[pool] for pool in POOLS}
-    tolerance = max(policy.min_order_amount, offer_budget * D("0.02"))
+    tolerance = max(USD_ORDER_CHUNK, offer_budget * D("0.02"))
+    period_selection = (signals.get("periodSelection") or signals.get("period_selection") or {}).get(
+        "byPool", {}
+    )
+    # Offline compatibility has no market-selection object. Production always
+    # supplies one, and an explicitly insufficient selection never falls back.
+    if not period_selection:
+        period_selection = {
+            pool: {
+                "selectedPeriod": policy.periods(pool)[0],
+                "runnerUpPeriod": policy.periods(pool)[1] if len(policy.periods(pool)) > 1 else None,
+                "eligiblePeriods": list(policy.periods(pool)),
+                "scores": [],
+            }
+            for pool in POOLS
+        }
+    eligible_pools = [
+        pool
+        for pool in POOLS
+        if shares[pool] > 0 and period_selection.get(pool, {}).get("selectedPeriod") is not None
+    ]
+    ineligible_pools = tuple(pool for pool in POOLS if pool not in eligible_pools)
+    released_amount = sum(
+        (max(D("0"), target_offer_amounts[pool] - offer_exposure[pool]) for pool in ineligible_pools),
+        D("0"),
+    )
+
+    desired_pool_amounts = {
+        pool: (
+            max(offer_exposure[pool], target_offer_amounts[pool])
+            if pool in eligible_pools
+            else offer_exposure[pool]
+        )
+        for pool in POOLS
+    }
+    redistribution_capacities = {
+        pool: max(D("0"), pool_cap_amounts[pool] - desired_pool_amounts[pool]) for pool in eligible_pools
+    }
+    pool_scores = {
+        pool: _score_for_period(period_selection[pool], period_selection[pool]["selectedPeriod"])
+        for pool in eligible_pools
+    }
+    redistributed = _weighted_capped_amounts(
+        released_amount,
+        eligible_pools,
+        pool_scores,
+        redistribution_capacities,
+    )
+    for pool in eligible_pools:
+        desired_pool_amounts[pool] += redistributed[pool]
+    pool_capacities = {
+        pool: max(D("0"), desired_pool_amounts[pool] - offer_exposure[pool]) for pool in eligible_pools
+    }
+    pool_additions = _weighted_capped_amounts(
+        available,
+        eligible_pools,
+        pool_capacities,
+        pool_capacities,
+    )
+
+    if offer_exposure_by_layer is not None:
+        layer_allocation_basis = "MANAGED_OPEN_OFFERS"
+        layer_budget = offer_budget
+        layer_exposure = {layer: D(offer_exposure_by_layer.get(layer, 0)) for layer in LAYERS}
+    else:
+        layer_allocation_basis = "MANAGED_TOTAL_EXPOSURE"
+        layer_budget = total_principal
+        layer_exposure = {layer: D((exposure_by_layer or {}).get(layer, 0)) for layer in LAYERS}
+    target_layer_amounts = {
+        layer: layer_budget * policy.layer_shares()[layer] / D("100") for layer in LAYERS
+    }
+    layer_deficits = {
+        layer: max(D("0"), target_layer_amounts[layer] - layer_exposure[layer]) for layer in LAYERS
+    }
+    if sum(layer_deficits.values(), D("0")) <= 0:
+        layer_deficits = policy.layer_shares()
+
     diagnostics = {
-        "allocation_basis": "MANAGED_OPEN_OFFERS",
+        "allocation_basis": "AUTHORITATIVE_WALLET_PLUS_MANAGED_OPEN_OFFERS",
+        "period_allocation_basis": "PRIMARY_MAX_70_PERCENT_RUNNER_UP_REMAINDER",
+        "pool_redistribution_basis": "SCORE_WEIGHTED_WITH_FIXED_10_POINT_CAP" if released_amount > 0 else "NONE",
+        "period_selection": signals.get("periodSelection") or signals.get("period_selection") or {},
         "shares": shares,
         "target_offer_amounts": target_offer_amounts,
         "current_offer_amounts": offer_exposure,
         "deviation_amounts": deviations,
         "ratio_tolerance": tolerance,
+        "pool_cap_percentages": pool_cap_percentages,
+        "pool_cap_amounts": pool_cap_amounts,
+        "desired_pool_amounts": desired_pool_amounts,
+        "planned_pool_additions": pool_additions,
+        "ineligible_pools": ineligible_pools,
+        "released_pool_amount": released_amount,
+        "redistributed_pool_amounts": redistributed,
+        "eligible_pool_weights": pool_scores,
+        "primary_term_max_share": PRIMARY_TERM_MAX_SHARE,
+        "minimum_order_amount": USD_ORDER_CHUNK,
+        "layer_allocation_basis": layer_allocation_basis,
+        "target_layer_amounts": target_layer_amounts,
+        "current_layer_amounts": layer_exposure,
+        "layer_deviation_amounts": {
+            layer: layer_exposure[layer] - target_layer_amounts[layer] for layer in LAYERS
+        },
     }
-    possible_slices = min(policy.target_slices, int(total_principal // policy.min_order_amount))
-    if possible_slices <= 0 or available < policy.min_order_amount:
+    if available < USD_ORDER_CHUNK:
         return {
-            "target_slice_count": possible_slices,
+            "target_slice_count": 0,
             "target_slice_amount": D("0"),
             "slices": [],
             "empty_reason": "NO_AVAILABLE_BALANCE" if available <= 0 else "BELOW_MINIMUM",
             **diagnostics,
         }
-    target_amount = (total_principal / D(possible_slices)).quantize(SATOSHI, rounding=ROUND_DOWN)
-    deficits = {pool: max(D("0"), target_offer_amounts[pool] - offer_exposure[pool]) for pool in POOLS}
-    allocatable = min(available, sum(deficits.values(), D("0")))
-    if allocatable < policy.min_order_amount:
+    if not eligible_pools:
         return {
-            "target_slice_count": possible_slices,
-            "target_slice_amount": target_amount,
+            "target_slice_count": 0,
+            "target_slice_amount": D("0"),
             "slices": [],
-            "empty_reason": "OFFER_RATIOS_SATISFIED",
+            "empty_reason": "MARKET_BELOW_FLOOR_OR_DATA_INSUFFICIENT",
             **diagnostics,
         }
-    new_count = min(
-        int(allocatable // policy.min_order_amount),
-        max(1, int((allocatable / target_amount).to_integral_value(rounding=ROUND_HALF_UP))),
+
+    target_deployable = min(available, sum(pool_additions.values(), D("0")))
+    target_count = int(target_deployable // USD_ORDER_CHUNK)
+    safe_unit = (
+        (target_deployable / D(target_count)).quantize(SATOSHI, rounding=ROUND_CEILING)
+        if target_count > 0
+        else D("0")
     )
-    pool_counts = _largest_remainder_counts(new_count, deficits)
-    active_pools = [pool for pool in POOLS if pool_counts[pool] > 0]
-    while active_pools and any(deficits[pool] < policy.min_order_amount * pool_counts[pool] for pool in active_pools):
-        invalid = min(active_pools, key=lambda pool: deficits[pool] / D(pool_counts[pool]))
-        pool_counts[invalid] -= 1
-        new_count -= 1
-        active_pools = [pool for pool in POOLS if pool_counts[pool] > 0]
-    if new_count <= 0:
+    pool_maximum_counts = {
+        pool: int(max(D("0"), pool_cap_amounts[pool] - offer_exposure[pool]) // safe_unit)
+        if safe_unit > 0 and pool in eligible_pools
+        else 0
+        for pool in POOLS
+    }
+    pool_counts = _capped_weighted_counts(
+        target_count,
+        POOLS,
+        pool_additions,
+        pool_maximum_counts,
+    )
+    term_buckets = []
+    term_diagnostics = {}
+    for pool in POOLS:
+        count = pool_counts.get(pool, 0)
+        if count <= 0:
+            continue
+        selection = period_selection[pool]
+        eligible_periods = [int(value) for value in selection.get("eligiblePeriods", [])]
+        primary = int(selection["selectedPeriod"])
+        if eligible_periods and primary not in eligible_periods:
+            continue
+        secondary = next((period for period in eligible_periods if period != primary), None)
+        single_long_exception = pool == "long" and len(policy.periods(pool)) == 1 and primary == policy.periods(pool)[0]
+        if single_long_exception:
+            primary_count = count
+            secondary_count = 0
+        elif secondary is None:
+            primary_count = 0
+            secondary_count = 0
+        else:
+            final_pool_amount = offer_exposure[pool] + D(count) * safe_unit
+            primary_room = max(
+                D("0"),
+                final_pool_amount * PRIMARY_TERM_MAX_SHARE
+                - period_exposure.get(primary, D("0")),
+            )
+            primary_max_count = int(primary_room // safe_unit)
+            primary_count = min(primary_max_count, int(D(count) * PRIMARY_TERM_MAX_SHARE))
+            secondary_count = count - primary_count
+        planned_by_period = {primary: D(primary_count) * safe_unit}
+        if secondary is not None:
+            planned_by_period[secondary] = D(secondary_count) * safe_unit
+        term_diagnostics[pool] = {
+            "primaryPeriod": primary,
+            "runnerUpPeriod": secondary,
+            "singleCandidateException": single_long_exception,
+            "idleReason": "NO_ELIGIBLE_RUNNER_UP" if secondary is None and not single_long_exception else None,
+            "plannedByPeriod": planned_by_period,
+            "primaryMaxShare": PRIMARY_TERM_MAX_SHARE,
+        }
+        if primary_count:
+            term_buckets.append((pool, primary, primary_count))
+        if secondary_count:
+            term_buckets.append((pool, secondary, secondary_count))
+
+    order_count = sum(count for _, _, count in term_buckets)
+    if order_count <= 0:
         return {
-            "target_slice_count": possible_slices,
-            "target_slice_amount": target_amount,
+            "target_slice_count": 0,
+            "target_slice_amount": D("0"),
             "slices": [],
-            "empty_reason": "OFFER_RATIOS_SATISFIED",
+            "empty_reason": "CONCENTRATION_CAP_OR_MINIMUM",
+            "term_allocations": term_diagnostics,
             **diagnostics,
         }
-    layer_exposure = offer_exposure_by_layer or exposure_by_layer or {}
-    layer_deficits = {
-        layer: max(
-            D("0"),
-            total_principal * policy.layer_shares()[layer] / D("100") - D(layer_exposure.get(layer, 0)),
-        )
-        for layer in LAYERS
-    }
-    if sum(layer_deficits.values(), D("0")) <= 0:
-        layer_deficits = policy.layer_shares()
-    layer_counts = _largest_remainder_counts(new_count, layer_deficits)
-    layer_sequence = [layer for layer in LAYERS for _ in range(layer_counts[layer])]
-    layer_cursor = 0
-    pool_amount_weights = {pool: deficits[pool] for pool in active_pools}
-    total_deficit = sum(pool_amount_weights.values(), D("0"))
-    remaining_amount = allocatable
+    deployable = min(target_deployable, D(order_count) * safe_unit).quantize(SATOSHI, rounding=ROUND_DOWN)
+    layer_counts = _largest_remainder_counts(order_count, layer_deficits)
+    layer_sequence = _interleaved_keys(layer_counts, LAYERS)
+    order_amounts = evenly_distributed_amounts(deployable, order_count)
     slices = []
-    for pool_index, pool in enumerate(active_pools):
-        count = pool_counts[pool]
-        minimum_for_rest = sum(
-            (policy.min_order_amount * pool_counts[other] for other in active_pools[pool_index + 1 :]), D("0")
-        )
-        if pool_index == len(active_pools) - 1:
-            pool_amount = remaining_amount
-        else:
-            pool_amount = min(deficits[pool], allocatable * pool_amount_weights[pool] / total_deficit)
-            pool_amount = max(policy.min_order_amount * count, min(pool_amount, remaining_amount - minimum_for_rest))
-        amounts = deterministic_amounts(
-            pool_amount, count, policy.min_order_amount, policy.amount_jitter, f"{strategy_version}:USD:{pool}"
-        )
-        periods = policy.periods(pool)
-        for index, amount in enumerate(amounts):
-            layer = layer_sequence[layer_cursor] if layer_cursor < len(layer_sequence) else "balanced"
-            layer_cursor += 1
+    amount_index = 0
+    for pool, period, count in term_buckets:
+        for _ in range(count):
+            amount = order_amounts[amount_index]
+            amount_index += 1
             slices.append(
                 {
                     "slice_index": len(slices),
                     "pool": pool,
-                    "layer": layer,
+                    "layer": layer_sequence[len(slices)] if len(slices) < len(layer_sequence) else "balanced",
                     "amount": amount,
-                    "period": periods[(index + pool_index) % len(periods)],
+                    "period": period,
                 }
             )
-        remaining_amount -= sum(amounts, D("0"))
+    planned_amount = sum((row["amount"] for row in slices), D("0"))
     return {
-        "target_slice_count": possible_slices,
-        "target_slice_amount": target_amount,
+        "target_slice_count": len(slices),
+        "target_slice_amount": (planned_amount / D(len(slices))).quantize(SATOSHI, rounding=ROUND_HALF_UP),
         "slices": slices,
         "empty_reason": None,
+        "term_allocations": term_diagnostics,
         **diagnostics,
     }
 
@@ -780,6 +1206,7 @@ def build_strategy_plan_v3(
     exposure_by_layer=None,
     offer_exposure_by_pool=None,
     offer_exposure_by_layer=None,
+    offer_exposure_by_period=None,
 ):
     validate_policy_v3(policy)
     total_principal = max(D("0"), D(total_principal))
@@ -802,6 +1229,7 @@ def build_strategy_plan_v3(
         exposure_by_layer=exposure_by_layer,
         offer_exposure_by_pool=offer_exposure_by_pool,
         offer_exposure_by_layer=offer_exposure_by_layer,
+        offer_exposure_by_period=offer_exposure_by_period,
     )
     plan = []
     variable_used = max(D("0"), D(existing_exposure.get("variable", 0)))
@@ -914,6 +1342,13 @@ def build_strategy_plan_v3(
             "currentOfferAmounts": response.get("current_offer_amounts", {}),
             "deviationAmounts": response.get("deviation_amounts", {}),
             "rebalanceCancellations": response["rebalance_cancellations"],
+            "periodSelection": response.get("period_selection", {}),
+            "poolRedistributionBasis": response.get("pool_redistribution_basis"),
+            "ineligiblePools": response.get("ineligible_pools", ()),
+            "releasedPoolAmount": response.get("released_pool_amount", D("0")),
+            "poolCapPercentages": response.get("pool_cap_percentages", {}),
+            "primaryTermMaxShare": response.get("primary_term_max_share"),
+            "termAllocations": response.get("term_allocations", {}),
         }
     )
     return response
@@ -976,37 +1411,53 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None,
         if book and cursor + step_ms >= now:
             return book
         recent = [row for row in history if int(row["mts"]) >= cursor - WINDOWS_MS["1h"]]
-        median = weighted_quantile(recent, D("0.5"))
-        q25 = weighted_quantile(recent, D("0.25"))
-        if median <= 0:
-            return []
-        volume = max(policy.min_order_amount, sum((abs(D(row["amount"])) for row in recent), D("0")))
-        return [
-            {"rate": median, "period": 2, "count": len(recent), "amount": volume},
-            {"rate": q25 or median, "period": 2, "count": len(recent), "amount": -volume},
-        ]
+        rows = []
+        for period in sorted({int(row.get("period", 2)) for row in recent}):
+            period_rows = [row for row in recent if int(row.get("period", 2)) == period]
+            median = weighted_quantile(period_rows, D("0.5"))
+            q25 = weighted_quantile(period_rows, D("0.25"))
+            if median <= 0:
+                continue
+            volume = max(
+                USD_ORDER_CHUNK,
+                sum((abs(D(row["amount"])) for row in period_rows), D("0")),
+            )
+            rows.extend(
+                (
+                    {"rate": median, "period": period, "count": len(period_rows), "amount": volume},
+                    {"rate": q25 or median, "period": period, "count": len(period_rows), "amount": -volume},
+                )
+            )
+        return rows
 
-    def aggregate_signal_trade(rows, mts):
-        weighted_rate = D("0")
-        total_volume = D("0")
-        for row in rows:
-            try:
-                volume = abs(D(row["amount"]))
-                rate = D(row["rate"])
-            except (KeyError, TypeError, ValueError, ArithmeticError):
-                continue
-            if volume <= 0 or rate <= 0:
-                continue
-            weighted_rate += rate * volume
-            total_volume += volume
-        if total_volume <= 0:
-            return None
-        return {
-            "mts": int(mts),
-            "rate": weighted_rate / total_volume,
-            "amount": total_volume,
-            "period": 2,
-        }
+    def aggregate_signal_trades(rows, mts):
+        aggregated = []
+        periods = sorted({int(row.get("period", 2)) for row in rows})
+        for period in periods:
+            weighted_rate = D("0")
+            total_volume = D("0")
+            for row in rows:
+                if int(row.get("period", 2)) != period:
+                    continue
+                try:
+                    volume = abs(D(row["amount"]))
+                    rate = D(row["rate"])
+                except (KeyError, TypeError, ValueError, ArithmeticError):
+                    continue
+                if volume <= 0 or rate <= 0:
+                    continue
+                weighted_rate += rate * volume
+                total_volume += volume
+            if total_volume > 0:
+                aggregated.append(
+                    {
+                        "mts": int(mts),
+                        "rate": weighted_rate / total_volume,
+                        "amount": total_volume,
+                        "period": period,
+                    }
+                )
+        return aggregated
 
     while cursor < now:
         interval_end = min(now, cursor + step_ms)
@@ -1039,7 +1490,7 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None,
                 break
             latest_stat = stat_rows[stat_index]
             stat_index += 1
-        if available >= policy.min_order_amount and signal_history and interval_trades:
+        if available >= USD_ORDER_CHUNK and signal_history and interval_trades:
             synthetic_book = replay_book(signal_history)
             replay_stats = [] if latest_stat is None else [latest_stat]
             last_signals = build_market_signals_v3(
@@ -1063,12 +1514,12 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None,
                     for key, volume in remaining_volume.items()
                     if volume > 0 and key[0] == int(order["period"]) and key[1] >= order["effective_rate"]
                 ]
-                if not eligible or available < policy.min_order_amount:
+                if not eligible or available < USD_ORDER_CHUNK:
                     continue
                 eligible.sort(key=lambda key: key[1])
                 volume = sum((remaining_volume[key] for key in eligible), D("0"))
                 fill_amount = min(order["amount"], available, volume)
-                if fill_amount < policy.min_order_amount:
+                if fill_amount < USD_ORDER_CHUNK:
                     continue
                 unconsumed = fill_amount
                 for key in eligible:
@@ -1086,9 +1537,7 @@ def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None,
                 active.append(credit)
                 fills.append(credit)
                 available -= fill_amount
-        aggregate = aggregate_signal_trade(interval_trades, interval_end - 1)
-        if aggregate is not None:
-            signal_history.append(aggregate)
+        signal_history.extend(aggregate_signal_trades(interval_trades, interval_end - 1))
         cursor = interval_end
 
     for credit in active:

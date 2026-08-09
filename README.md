@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.0
+# Bitfinex-lendingbot 0.3.1 / V3.1
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -102,7 +102,7 @@ python -m pip install -r requirements-dev.txt
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.0`
+- 应用/User-Agent：`0.3.1`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`

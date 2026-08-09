@@ -16,7 +16,7 @@ import StrategyV3
 import lendingbot
 from AppContext import AppContext
 from DomainTypes import AccountSnapshot, MarketSnapshot, StrategyPlan, WriteOutcome, WriteResult
-from ExchangeModels import parse_credit_rows, parse_offer_rows, parse_wallet_rows
+from ExchangeModels import parse_credit_rows, parse_loan_rows, parse_offer_rows, parse_wallet_rows
 from MarketDataStream import BitfinexMarketDataHub
 from RuntimeV3 import LendingRuntimeV3
 from StateStore import LendingStateStore, StateStoreError
@@ -163,12 +163,12 @@ def test_manual_safe_resolution_returns_only_to_paused():
     assert mode_after_ambiguous_resolution(0, "LIVE", False) == "LIVE"
 
 
-def test_schema_v6_is_explicit(tmp_path):
+def test_schema_v9_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "6"
+    assert version == "9"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
@@ -179,10 +179,49 @@ def test_schema_v6_is_explicit(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table' AND name='reprice_chains'"
         ).fetchone()
         reprice_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_events)")}
+        reprice_chain_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
+        offer_history_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(offer_history)")
+        }
     assert "attribution_state" in credit_columns
     assert ownership_table is not None
     assert reprice_chain_table is not None
+    assert "amount_original" in offer_history_columns
     assert {"chain_key", "stage", "benchmark_rate", "floor_rate"} <= reprice_columns
+    assert "market_anchor_rate" in reprice_chain_columns
+
+
+def test_schema_v9_migrates_offer_history_without_losing_rows(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("INSERT INTO schema_meta VALUES('schema_version', '7')")
+    connection.execute(
+        """CREATE TABLE offer_history(
+               offer_id INTEGER PRIMARY KEY, currency TEXT NOT NULL, amount TEXT NOT NULL,
+               rate TEXT NOT NULL, rate_real TEXT, period INTEGER NOT NULL,
+               offer_type TEXT NOT NULL, flags INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL, mts_created INTEGER, mts_updated INTEGER,
+               managed INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
+    connection.execute(
+        """INSERT INTO offer_history VALUES(
+               9001, 'USD', '150', '0.0003', NULL, 2, 'LIMIT', 0,
+               'EXECUTED', 1000, 2000, 1
+           )"""
+    )
+    connection.commit()
+    connection.close()
+
+    store = LendingStateStore(path)
+
+    with store.read_connection() as connection:
+        version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+        row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
+    assert version == "9"
+    assert row["amount"] == "150"
+    assert row["amount_original"] is None
 
 
 def test_schema_migration_creates_online_backup(tmp_path):
@@ -325,6 +364,18 @@ def test_unique_authoritative_offer_reconciles_to_paused(tmp_path):
     assert store.offers(active_only=True)[0]["managed"] == 1
 
 
+def test_partially_filled_offer_matches_ambiguous_intent_by_original_amount(tmp_path):
+    store, intent = ambiguous_store(tmp_path)
+    partial = matching_offer(9001)
+    partial["amount"] = D("75")
+    store.reconcile_offers([partial])
+
+    resolved = store.reconcile_ambiguous_candidates()
+
+    assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
+    assert store.intent(intent["id"])["resolution"] == "AUTO_UNIQUE_MATCH"
+
+
 def test_multiple_authoritative_matches_stay_manual_safe(tmp_path):
     store, intent = ambiguous_store(tmp_path)
     store.reconcile_offers([matching_offer(9001), matching_offer(9002)])
@@ -364,6 +415,79 @@ def test_ambiguous_submit_absence_requires_two_authoritative_history_snapshots(t
     assert store.runtime()["mode"] == "LIVE"
     assert store.intent(intent["id"])["state"] == "CLOSED"
     assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
+
+
+def test_unrelated_same_period_history_does_not_block_absence_recovery(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    _, intent = store.reserve_intent(order(), D("500"))
+    intent = store.mark_submitting(intent["id"])
+    store.mark_ambiguous(intent["id"], "connection reset")
+    request_ms = int(intent["request_started_at_ms"])
+    store.upsert_offer_history(
+        [
+            {
+                **matching_offer(9001, request_ms + 1_000),
+                "amount": D("175"),
+                "amount_original": D("175"),
+            }
+        ]
+    )
+    with store.transaction(immediate=True) as connection:
+        connection.execute(
+            """INSERT INTO funding_trades(
+                   trade_id, currency, offer_id, amount, rate, period, mts, managed
+               ) VALUES(1, 'USD', 9002, '150', '0.0004', 2, ?, 0)""",
+            (request_ms + 2_000,),
+        )
+
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 60_000)
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 90_000)
+
+    assert store.runtime()["mode"] == "LIVE"
+    assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
+
+
+def test_submit_plan_persists_sixty_attempt_rolling_limit_and_resumes(tmp_path):
+    now_seconds = [1_900_000_000]
+
+    def clock():
+        return now_seconds[0]
+
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=clock)
+
+    class ConfirmingClient:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.calls = 0
+
+        def submit_funding_offer_result(self, *_args, **_kwargs):
+            self.calls += 1
+            return WriteResult(
+                WriteOutcome.CONFIRMED,
+                response=[0, "ok", None, None, [10_000 + self.calls]],
+            )
+
+    client = ConfirmingClient()
+    runtime = LendingRuntimeV3(client, policy(), store, hub=NullHub(), clock=clock)
+    plan = {
+        "plan_hash": "large-plan",
+        "plan": [order(slice_index=index) for index in range(61)],
+    }
+
+    first = runtime._submit_plan(plan, D("9150"), "v")
+    second = runtime._submit_plan(plan, D("9150"), "v")
+    assert len(first) == 60
+    assert second == []
+    assert client.calls == 60
+
+    now_seconds[0] += 60.001
+    third = runtime._submit_plan(plan, D("9150"), "v")
+    assert len(third) == 1
+    assert client.calls == 61
+    assert len({intent["slice_key"] for intent in store.intents()}) == 61
 
 
 def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path):
@@ -426,6 +550,115 @@ def test_ambiguous_submit_history_uses_request_window_not_capped_90_day_window(t
     assert [call[0] for call in client.calls] == ["trades", "offers"]
     assert all(call[2]["start"] == request_ms - 300_000 for call in client.calls)
     assert all(call[2]["end"] == request_ms + 60_000 for call in client.calls)
+    assert all(call[2]["limit"] == 500 for call in client.calls)
+
+
+def test_ambiguous_submit_history_keeps_offer_evidence_when_trades_endpoint_fails(tmp_path):
+    request_ms = 2_000_000
+
+    class PartialHistoryClient:
+        api_key = ""
+        api_secret = ""
+
+        def funding_trades_history(self, _symbol, **_kwargs):
+            raise BitfinexApiError("temporary trades failure")
+
+        def funding_offers_history(self, _symbol, **kwargs):
+            return [
+                [
+                    9001,
+                    "fUSD",
+                    request_ms + 1_000,
+                    request_ms + 2_000,
+                    "0",
+                    "150",
+                    "LIMIT",
+                    None,
+                    None,
+                    0,
+                    "EXECUTED",
+                    None,
+                    None,
+                    None,
+                    "0.0003",
+                    2,
+                ]
+            ]
+
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    runtime = LendingRuntimeV3(PartialHistoryClient(), policy(), store, hub=NullHub())
+
+    complete = runtime.sync_ambiguous_write_history(
+        [{"request_started_at_ms": request_ms, "updated_at_ms": request_ms}],
+        request_ms + 60_000,
+    )
+
+    assert complete is False
+    with store.read_connection() as connection:
+        saved = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
+    assert saved["amount_original"] == "150"
+
+
+def test_regular_authenticated_funding_history_respects_endpoint_limit(tmp_path):
+    class HistoryLimitsClient:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.calls = []
+
+        def funding_trades_history(self, _symbol, **kwargs):
+            self.calls.append(("trades", kwargs))
+            return []
+
+        def funding_offers_history(self, _symbol, **kwargs):
+            self.calls.append(("offers", kwargs))
+            return []
+
+        def funding_credits_history(self, _symbol, **kwargs):
+            self.calls.append(("credits", kwargs))
+            return []
+
+    client = HistoryLimitsClient()
+    runtime = LendingRuntimeV3(
+        client,
+        policy(),
+        LendingStateStore(tmp_path / "state.sqlite3"),
+        hub=NullHub(),
+    )
+
+    assert runtime.sync_history(now_ms=100 * DAY_MS) is True
+    assert [name for name, _kwargs in client.calls] == ["trades", "offers", "credits"]
+    assert all(kwargs["limit"] == 500 for _name, kwargs in client.calls)
+
+
+def test_empty_authoritative_histories_automatically_resume_live(tmp_path):
+    class EmptyHistoryClient:
+        api_key = ""
+        api_secret = ""
+
+        def funding_trades_history(self, _symbol, **_kwargs):
+            return []
+
+        def funding_offers_history(self, _symbol, **_kwargs):
+            return []
+
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    _, intent = store.reserve_intent(order(), D("500"))
+    intent = store.mark_submitting(intent["id"])
+    store.mark_ambiguous(intent["id"], "connection reset")
+    request_ms = int(intent["request_started_at_ms"])
+    runtime = LendingRuntimeV3(EmptyHistoryClient(), policy(), store, hub=NullHub())
+
+    assert runtime.sync_ambiguous_write_history([intent], request_ms + 60_000) is True
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 60_000)
+    assert store.runtime()["mode"] == "SAFE"
+    assert runtime.sync_ambiguous_write_history([intent], request_ms + 90_000) is True
+    store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 90_000)
+
+    assert store.runtime()["mode"] == "LIVE"
+    assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
 
 
 def test_rollout_stages_are_restricted(tmp_path):
@@ -460,10 +693,32 @@ def test_websocket_live_readiness_requires_all_account_snapshots():
     hub.handle_auth_message([0, "fos", []])
     hub.handle_auth_message([0, "fcs", []])
     assert hub.snapshot()["source"] != "WEBSOCKET"
-    hub.handle_auth_message([0, "ws", []])
+    hub.handle_auth_message([0, "fls", []])
+    assert hub.snapshot()["source"] != "WEBSOCKET"
+    hub.handle_auth_message([0, "ws", [["funding", "USD", "0", "0", None]]])
+    assert hub.snapshot()["source"] != "WEBSOCKET"
+    hub.handle_auth_message([0, "wu", ["funding", "USD", "0", "0", "0"]])
     snapshot = hub.snapshot()
     assert snapshot["source"] == "WEBSOCKET"
     assert snapshot["accountSnapshotsReady"] is True
+    assert snapshot["walletAvailableReady"] is True
+
+
+def test_websocket_funding_loan_snapshot_and_updates_are_tracked_without_stale_rows():
+    hub = BitfinexMarketDataHub("key", "secret")
+    first = [11, "fUSD", 1, 1000, 1000, "200", None, "ACTIVE", "FIXED", None, None, "0.0002", 2]
+    second = [12, "fUSD", 1, 1000, 1000, "266.5", None, "ACTIVE", "FIXED", None, None, "0.0003", 14]
+    updated = [12, "fUSD", 1, 1000, 2000, "250", None, "ACTIVE", "FIXED", None, None, "0.0003", 14]
+    replacement = [13, "fUSD", 1, 3000, 3000, "100", None, "ACTIVE", "FIXED", None, None, "0.0004", 30]
+
+    hub.handle_auth_message([0, "fls", [first]])
+    hub.handle_auth_message([0, "fln", second])
+    hub.handle_auth_message([0, "flu", updated])
+    hub.handle_auth_message([0, "flc", first])
+    assert [(row["id"], row["amount"]) for row in hub.snapshot()["loans"]] == [(12, D("250"))]
+
+    hub.handle_auth_message([0, "fls", [replacement]])
+    assert [row["id"] for row in hub.snapshot()["loans"]] == [13]
 
 
 def test_rest_fallback_is_explicit():
@@ -585,6 +840,35 @@ class PublicPages:
         return []
 
 
+def test_live_market_context_requests_latest_trades_before_applying_limit():
+    now = 200 * DAY_MS
+
+    class LatestClient:
+        def __init__(self):
+            self.trade_kwargs = None
+
+        def funding_book(self, _symbol, _limit):
+            return []
+
+        def funding_trades(self, _symbol, **kwargs):
+            self.trade_kwargs = kwargs
+            return [
+                [2, now - 100, "1", "0.0003", 3],
+                [1, now - 200, "1", "0.0002", 2],
+            ]
+
+        def funding_stats(self, _symbol, **_kwargs):
+            return []
+
+    client = LatestClient()
+    _book, trades, _stats, _signals, warnings = lendingbot.load_v3_market_context(
+        client, policy(), now
+    )
+    assert warnings == []
+    assert client.trade_kwargs["sort"] == -1
+    assert [row["id"] for row in trades] == ["1", "2"]
+
+
 def test_public_backfill_pages_and_upserts_without_auth_writes(tmp_path):
     end = 200 * DAY_MS
     start = end - 90 * DAY_MS
@@ -596,6 +880,36 @@ def test_public_backfill_pages_and_upserts_without_auth_writes(tmp_path):
     assert result["bookHistory"]["backfillable"] is False
     assert len(store.market_trades(start, end)) == 3
     assert limiter.calls == client.trade_calls + client.stats_calls
+
+
+def test_market_retention_prunes_all_market_time_series(tmp_path):
+    now = 200 * DAY_MS
+    old = now - 91 * DAY_MS
+    recent = now - 89 * DAY_MS
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.upsert_market_trades(
+        [
+            {"id": "old", "mts": old, "amount": D("1"), "rate": D("0.0002"), "period": 2},
+            {"id": "recent", "mts": recent, "amount": D("1"), "rate": D("0.0003"), "period": 3},
+        ]
+    )
+    store.upsert_funding_stats(
+        [
+            {"mts": old, "frr_daily_rate": D("0.0002"), "utilization": D("0.5")},
+            {"mts": recent, "frr_daily_rate": D("0.0003"), "utilization": D("0.6")},
+        ]
+    )
+    store.record_book_snapshot([], now_ms=old)
+    store.record_book_snapshot([], now_ms=recent)
+    store.record_market_bars({"1h": {"median": 1, "q25": 1, "q75": 1}}, now_ms=old)
+    store.record_market_bars({"1h": {"median": 2, "q25": 2, "q75": 2}}, now_ms=recent)
+
+    deleted = store.prune_market_data(retention_days=90, now_ms=now)
+
+    assert deleted == {"trades": 1, "bars": 1, "books": 1, "stats": 1}
+    assert [row["id"] for row in store.market_trades()] == ["recent"]
+    assert [row["mts"] for row in store.funding_stats()] == [recent]
+    assert [row["mts"] for row in store.book_snapshots()] == [recent - (recent % 60_000)]
 
 
 def test_public_backfill_rejects_short_research_window(tmp_path):
@@ -677,7 +991,6 @@ def test_research_variants_preserve_hard_user_boundaries():
         assert variant.max_lend_amount == base.max_lend_amount
         assert variant.max_lend_percent == base.max_lend_percent
         assert variant.short_floor_apr == base.short_floor_apr
-        assert variant.min_order_amount == base.min_order_amount
 
 
 def test_score_weights_are_versioned_research_data_not_policy_fields():
@@ -751,7 +1064,97 @@ def test_exchange_account_parsers_share_symbol_normalization():
         [[1, "fUSD", 1, 2, "3", "4", "LIMIT", None, None, 0, "ACTIVE", None, None, None, "0.1", 2]]
     )[0]
     credit = parse_credit_rows([[2, "fUSD", None, 1, 2, "3", None, "ACTIVE", "FIXED", None, None, "0.1", 2]])[0]
-    assert (wallet["currency"], offer["currency"], credit["currency"]) == ("USD", "USD", "USD")
+    loan = parse_loan_rows([[3, "fUSD", 1, 1, 2, "4", None, "ACTIVE", "FIXED", None, None, "0.1", 2]])[0]
+    assert (wallet["currency"], offer["currency"], credit["currency"], loan["currency"]) == (
+        "USD",
+        "USD",
+        "USD",
+        "USD",
+    )
+    assert loan["side"] == 1
+    assert loan["funding_state"] == "loan"
+
+
+def test_unknown_websocket_available_balance_is_not_promoted_to_wallet_balance():
+    wallet = parse_wallet_rows([["funding", "USD", "1000", "0", None]])[0]
+
+    assert wallet["balance"] == D("1000")
+    assert wallet["available"] is None
+
+    account = LendingRuntimeV3._account(
+        {
+            "wallets": [wallet],
+            "offers": [{"currency": "USD", "amount": D("600"), "period": 2}],
+            "credits": [
+                {
+                    "id": 2,
+                    "currency": "USD",
+                    "amount": D("400"),
+                    "period": 2,
+                    "side": 1,
+                    "funding_state": "credit",
+                }
+            ],
+            "loans": [],
+        }
+    )
+    assert account["wallet"] == D("0")
+    assert account["walletAvailableKnown"] is False
+    assert account["componentTotal"] is None
+    assert account["reconciliationStatus"] == "UNAVAILABLE"
+
+
+def test_account_total_includes_provider_funding_loans_and_matches_wallet_balance():
+    snapshot = {
+        "wallets": [
+            {
+                "wallet_type": "funding",
+                "currency": "USD",
+                "balance": D("13635.96811969"),
+                "available": D("0"),
+            }
+        ],
+        "offers": [{"id": 1, "currency": "USD", "amount": D("663.97229357"), "period": 2}],
+        "credits": [
+            {
+                "id": 2,
+                "currency": "USD",
+                "amount": D("12505.49582612"),
+                "period": 14,
+                "side": 1,
+                "funding_state": "credit",
+            }
+        ],
+        "loans": [
+            {
+                "id": 3,
+                "currency": "USD",
+                "amount": D("466.5"),
+                "period": 2,
+                "side": 1,
+                "funding_state": "loan",
+            },
+            {
+                "id": 4,
+                "currency": "USD",
+                "amount": D("999"),
+                "period": 2,
+                "side": -1,
+                "funding_state": "loan",
+            },
+        ],
+    }
+
+    account = LendingRuntimeV3._account(snapshot)
+
+    assert account["creditPrincipal"] == D("12505.49582612")
+    assert account["loanPrincipal"] == D("466.5")
+    assert account["credits"] == D("12971.99582612")
+    assert account["componentTotal"] == D("13635.96811969")
+    assert account["total"] == D("13635.96811969")
+    assert account["walletAvailableKnown"] is True
+    assert account["reconciliationDifference"] == D("0")
+    assert account["reconciliationStatus"] == "MATCHED"
 
 
 def test_public_rate_limiter_uses_injected_clock_and_sleep():

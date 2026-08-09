@@ -82,7 +82,7 @@ class FakePreflightClient:
         ["ui_withdraw", 0, 0],
     ]
     wallet_rows = [
-        ["funding", "USD", "500", None, "450"],
+        ["funding", "USD", "500", None, "500"],
         ["exchange", "USD", "80", None, "75"],
     ]
 
@@ -249,14 +249,48 @@ class BitfinexBotTests(unittest.TestCase):
         self.assertTrue(args.dashboard)
         self.assertFalse(args.live)
 
+    def test_frontend_change_updates_dashboard_build_without_invalidating_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for relative in lendingbot.DASHBOARD_BUILD_FILES:
+                path = os.path.join(directory, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as file:
+                    file.write(relative)
+            worker_before = lendingbot.worker_build_id(directory)
+            dashboard_before = lendingbot.dashboard_build_id(directory)
+            css_path = os.path.join(directory, "www", "lendingbot.css")
+            with open(css_path, "a", encoding="utf-8") as file:
+                file.write("\n/* visual-only change */")
+            self.assertEqual(lendingbot.worker_build_id(directory), worker_before)
+            self.assertNotEqual(lendingbot.dashboard_build_id(directory), dashboard_before)
+
+    def test_internal_worker_status_detects_build_loaded_at_process_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = lendingbot.AppContext.for_project(directory)
+            process = mock.Mock(pid=os.getpid())
+            process.poll.return_value = None
+            context.process_state.process = process
+            lock = lendingbot.LiveProcessLock(context.live_lock_path)
+            self.assertTrue(
+                lock.acquire(
+                    context.config_path,
+                    {"role": "live_worker", "service": "mika-lending-worker-v3", "buildId": "loaded-build"},
+                )
+            )
+            try:
+                with mock.patch.object(lendingbot, "worker_build_id", return_value="current-build"):
+                    status = lendingbot.controlled_bot_status(context.config_path, context)
+            finally:
+                lock.release()
+            self.assertEqual(status["workerBuildId"], "loaded-build")
+            self.assertTrue(status["buildMismatch"])
+
     def test_dashboard_main_never_constructs_trading_client(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "test.cfg")
             write_test_config(path, {"statedbfile": os.path.join(directory, "state.sqlite3")})
-            fake_thread = mock.Mock()
             with (
-                mock.patch.object(lendingbot.threading, "Thread", return_value=fake_thread),
-                mock.patch.object(lendingbot.time, "sleep", side_effect=KeyboardInterrupt),
+                mock.patch.object(lendingbot, "start_web_server") as start_web_server,
                 mock.patch.object(lendingbot, "stop_controlled_bot"),
                 mock.patch.object(lendingbot, "stop_web_server"),
                 mock.patch.object(lendingbot, "reconcile_orphaned_live_runtime"),
@@ -267,7 +301,41 @@ class BitfinexBotTests(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(lendingbot.main(["--dashboard", "--config", path]), 0)
-        fake_thread.start.assert_called_once_with()
+        start_web_server.assert_called_once()
+
+    def test_dashboard_main_releases_lock_and_fails_when_web_server_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "test.cfg")
+            write_test_config(path, {"statedbfile": os.path.join(directory, "state.sqlite3")})
+            with (
+                mock.patch.object(lendingbot, "start_web_server", side_effect=OSError("bind failed")),
+                mock.patch.object(lendingbot, "stop_web_server"),
+                mock.patch.object(lendingbot, "reconcile_orphaned_live_runtime"),
+                mock.patch.object(lendingbot.LiveProcessLock, "acquire", return_value=True),
+                mock.patch.object(lendingbot.LiveProcessLock, "release") as release,
+            ):
+                self.assertEqual(lendingbot.main(["--dashboard", "--config", path]), 1)
+        release.assert_called_once_with()
+
+    def test_web_server_failure_closes_socket_and_clears_process_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = lendingbot.AppContext.for_project(directory)
+            server = mock.Mock()
+            server.serve_forever.side_effect = OSError("serve failed")
+            with (
+                mock.patch.object(lendingbot, "websocket_dependency_available", return_value=False),
+                mock.patch.object(lendingbot, "ThreadingHTTPServer", return_value=server),
+                self.assertRaisesRegex(OSError, "serve failed"),
+            ):
+                lendingbot.start_web_server(
+                    CaptureLog(),
+                    context.config_path,
+                    context.status_path,
+                    context,
+                    raise_errors=True,
+                )
+            server.server_close.assert_called_once_with()
+            self.assertIsNone(context.process_state.dashboard_server)
 
     def test_preflight_permission_parser(self):
         permissions = lendingbot.parse_key_permissions([["wallets", "1", "0"], ["funding", 1, 1]])
@@ -289,6 +357,8 @@ class BitfinexBotTests(unittest.TestCase):
             preflight = lendingbot.evaluate_live_preflight(path, FakePreflightClient)
         self.assertEqual(preview["proposedVersion"], preflight["summary"]["activeStrategyVersion"])
         self.assertEqual(preview["plan"]["plan_hash"], preflight["summary"]["planHash"])
+        self.assertEqual(preview["orderSizing"], preflight["summary"]["orderSizing"])
+        self.assertEqual(preview["orderSizing"]["remainderPolicy"], "EVENLY_DISTRIBUTE")
         preview_orders = [
             (row["display_type"], row["amount"], row["period"], row["submitted_rate"], row["flags"])
             for row in preview["plan"]["plan"]
@@ -305,7 +375,7 @@ class BitfinexBotTests(unittest.TestCase):
             write_test_config(path)
             config_before = open(path, "rb").read()
             payload = lendingbot.config_api_payload(path)["strategyV3"]
-            payload["target_slices"] = 12
+            payload["max_lend_percent"] = "90"
             preview = lendingbot.strategy_v3_preview(path, {"strategyV3": payload}, FakePreflightClient)
             saved = lendingbot.save_strategy_v3_draft(
                 path,
@@ -351,7 +421,7 @@ class BitfinexBotTests(unittest.TestCase):
             path = os.path.join(directory, "test.cfg")
             write_test_config(path)
             policy = lendingbot.config_api_payload(path)["strategyV3"]
-            policy["target_slices"] = 12
+            policy["max_lend_percent"] = "90"
             preview = lendingbot.strategy_v3_preview(path, {"strategyV3": policy}, FakePreflightClient)
             saved = lendingbot.save_strategy_v3_draft(
                 path,
@@ -409,6 +479,9 @@ class BitfinexBotTests(unittest.TestCase):
             raw.pop("max_lend_percent", None)
             raw.pop("max_lend_amount", None)
             raw["enable_frr"] = True
+            raw["short_reprice_stages_minutes"] = [10, 30, 60]
+            raw["medium_reprice_stages_minutes"] = [20, 60, 120]
+            raw["long_reprice_stages_minutes"] = [60, 180, 360]
             store = lendingbot.LendingStateStore(database)
             old_version = store.save_strategy(raw, status="ACTIVE")
             result = lendingbot.normalize_current_active_strategy(path)
@@ -420,6 +493,9 @@ class BitfinexBotTests(unittest.TestCase):
         self.assertEqual(result["fromVersion"], old_version)
         self.assertTrue(active["policy"]["enable_frr"])
         self.assertEqual(active["policy"]["max_lend_percent"], "100")
+        self.assertEqual(active["policy"]["short_reprice_stages_minutes"], [10, 30, 60, 90, 120, 180])
+        self.assertEqual(active["policy"]["medium_reprice_stages_minutes"], [20, 60, 120, 180, 240, 360])
+        self.assertEqual(active["policy"]["long_reprice_stages_minutes"], [60, 180, 360, 480, 720, 1440])
         self.assertTrue(backups_exist)
         self.assertEqual([event["event_type"] for event in events], ["SCHEMA_NORMALIZATION"])
 
@@ -430,8 +506,8 @@ class BitfinexBotTests(unittest.TestCase):
             result = lendingbot.evaluate_live_preflight(path, FakePreflightClient)
         self.assertTrue(all(check["status"] == "pass" for check in result["checks"]))
         self.assertEqual(result["summary"]["strategyVersion"], 3)
-        self.assertEqual(result["summary"]["account"]["wallet"], "450")
-        self.assertEqual(result["summary"]["fundingLimit"]["effectiveCap"], "450.00000000")
+        self.assertEqual(result["summary"]["account"]["wallet"], "500")
+        self.assertEqual(result["summary"]["fundingLimit"]["effectiveCap"], "500.00000000")
         self.assertNotIn("strategyProfile", result["summary"])
         self.assertNotIn("UNLIMITED_EXPOSURE", [warning["code"] for warning in result["warnings"]])
 
@@ -506,6 +582,7 @@ class BitfinexBotTests(unittest.TestCase):
         now_ms = 2_000_000_000_000
 
         class ExternalOfferClient(FakePreflightClient):
+            wallet_rows = [["funding", "USD", "675", None, "500"]]
             offer_rows = [
                 [
                     9001,
@@ -636,7 +713,7 @@ class BitfinexBotTests(unittest.TestCase):
                 first.release()
             self.assertFalse(lendingbot.LiveProcessLock.inspect(lock_path)["locked"])
 
-    def test_safe_status_is_persisted_immediately(self):
+    def test_unexpected_error_pauses_and_is_persisted_immediately(self):
         with tempfile.TemporaryDirectory() as directory:
             status_path = os.path.join(directory, "botlog.json")
             store = lendingbot.LendingStateStore(os.path.join(directory, "state.sqlite3"))
@@ -646,10 +723,36 @@ class BitfinexBotTests(unittest.TestCase):
             with open(status_path, "r", encoding="utf-8") as file:
                 status = json.load(file)
             self.assertEqual(status["schemaVersion"], 3)
-            self.assertEqual(status["operationMode"], "SAFE")
-            self.assertEqual(status["runtime"]["mode"], "SAFE")
+            self.assertEqual(status["operationMode"], "PAUSED")
+            self.assertEqual(status["runtime"]["mode"], "PAUSED")
             self.assertIn("RuntimeError", status["last_status"])
             self.assertTrue(status["last_update"])
+
+    def test_stopped_pending_strategy_can_be_discarded_but_running_pending_cannot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "test.cfg")
+            context = lendingbot.AppContext.for_project(directory, config_path=config_path)
+            store = lendingbot.LendingStateStore(os.path.join(directory, "state.sqlite3"))
+            store.save_strategy({"name": "active"}, "ACTIVE")
+            store.save_strategy({"name": "replacement"}, "DRAFT")
+            store.promote_draft_to_pending()
+            with (
+                mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+                mock.patch.object(lendingbot, "controlled_bot_running", return_value=False),
+            ):
+                result = lendingbot.discard_strategy_v3_draft(config_path, context)
+            self.assertEqual(result["discarded"], ["PENDING"])
+            self.assertIsNone(store.strategy("PENDING"))
+
+            store.save_strategy({"name": "replacement-2"}, "PENDING")
+            store.set_mode("LIVE", "test")
+            with (
+                mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+                mock.patch.object(lendingbot, "controlled_bot_running", return_value=True),
+                self.assertRaisesRegex(lendingbot.ApiRequestError, "先停止机器人"),
+            ):
+                lendingbot.discard_strategy_v3_draft(config_path, context)
+            self.assertIsNotNone(store.strategy("PENDING"))
 
     def test_dashboard_reconciles_orphaned_live_runtime_and_overlays_status(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -667,6 +770,7 @@ class BitfinexBotTests(unittest.TestCase):
                         "operationMode": "LIVE",
                         "last_update": "2026-07-21 15:00:00",
                         "account": {"total": "123"},
+                        "log": ["last worker line"],
                     },
                     file,
                 )
@@ -677,6 +781,49 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(payload["operationMode"], "PAUSED")
             self.assertNotIn("account", payload)
             self.assertEqual(payload["last_update"], "")
+            self.assertFalse(payload["snapshotAvailable"])
+            self.assertEqual(payload["log"], ["last worker line"])
+            self.assertEqual(payload["process"]["stopReason"], "dashboard_started_without_live_process")
+            self.assertEqual(payload["lastStopReason"], "dashboard_started_without_live_process")
+            self.assertIn("控制台启动时未发现实盘进程", payload["last_status"])
+
+    def test_dashboard_status_failure_hides_stale_account_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = os.path.join(directory, "botlog.json")
+            with open(status_path, "w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "schemaVersion": 3,
+                        "operationMode": "LIVE",
+                        "account": {"total": "9999"},
+                        "openOffers": [{"id": 123}],
+                        "log": ["preserved diagnostic"],
+                    },
+                    file,
+                )
+            with mock.patch.object(lendingbot, "v3_store_for_config", side_effect=OSError("database unavailable")):
+                payload = lendingbot.dashboard_status_payload(status_path, os.path.join(directory, "test.cfg"))
+            self.assertEqual(payload["operationMode"], "UNKNOWN")
+            self.assertTrue(payload["statusUnavailable"])
+            self.assertFalse(payload["snapshotAvailable"])
+            self.assertNotIn("account", payload)
+            self.assertEqual(payload["openOffers"], [])
+            self.assertEqual(payload["log"], ["preserved diagnostic"])
+
+    def test_expired_strategy_tokens_are_pruned_and_cache_is_bounded(self):
+        with lendingbot.strategy_token_lock:
+            lendingbot.strategy_preview_tokens.clear()
+            lendingbot.strategy_apply_tokens.clear()
+            lendingbot.strategy_preview_tokens["expired"] = {"expiresAt": 10}
+            for index in range(lendingbot.STRATEGY_TOKEN_CACHE_LIMIT + 5):
+                lendingbot.strategy_apply_tokens[str(index)] = {"expiresAt": 1_000 + index}
+        removed = lendingbot._prune_strategy_tokens(100)
+        self.assertEqual(removed, 6)
+        self.assertNotIn("expired", lendingbot.strategy_preview_tokens)
+        self.assertEqual(len(lendingbot.strategy_apply_tokens), lendingbot.STRATEGY_TOKEN_CACHE_LIMIT)
+        with lendingbot.strategy_token_lock:
+            lendingbot.strategy_preview_tokens.clear()
+            lendingbot.strategy_apply_tokens.clear()
 
 
 if __name__ == "__main__":

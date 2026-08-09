@@ -12,6 +12,7 @@ from ExchangeModels import (
     parse_funding_stats,
     parse_funding_trade_history as parse_funding_trade_rows_v3,
     parse_funding_trades,
+    parse_loan_rows as parse_loan_rows_v3,
     parse_offer_rows as parse_offer_rows_v3,
     parse_wallet_rows as parse_wallet_rows_v3,
 )
@@ -19,6 +20,7 @@ from StrategyV3 import (
     D,
     POOLS,
     StrategyPolicyV3,
+    USD_ORDER_CHUNK,
     build_market_signals_v3,
     build_strategy_plan_v3,
     ceil_rate_tick,
@@ -31,6 +33,180 @@ from StrategyV3 import (
     replay_strategy_v3,
     validate_policy_v3,
 )
+
+REPRICE_STAGE_FRACTIONS = (D("1") / D("3"), D("2") / D("3"), D("1"))
+CREDIT_DISPLAY_GROUPS = ("short", "medium", "long")
+AUTH_FUNDING_HISTORY_LIMIT = 500
+AMBIGUOUS_HISTORY_MIN_AGE_MS = 60_000
+FUNDING_SUBMISSION_WINDOW_MS = 60_000
+MAX_FUNDING_SUBMISSIONS_PER_WINDOW = 60
+
+
+def order_sizing_payload():
+    return {
+        "chunkBaseAmount": format(USD_ORDER_CHUNK, "f"),
+        "remainderPolicy": "EVENLY_DISTRIBUTE",
+        "maxSubmissionsPer60Seconds": MAX_FUNDING_SUBMISSIONS_PER_WINDOW,
+    }
+
+
+def _active_lending_rows(credits, loans):
+    """Return provider-side funding exactly once across credit/loan states."""
+
+    merged = {}
+    for row in [*(credits or []), *(loans or [])]:
+        if str(row.get("currency") or "USD").upper() != "USD":
+            continue
+        # Bitfinex SIDE=-1 is borrower exposure and is not an asset in this
+        # funding wallet. Historical/local rows predate SIDE and default to 0.
+        if int(row.get("side") or 0) < 0:
+            continue
+        row_id = row.get("id", row.get("credit_id"))
+        key = str(row_id) if row_id is not None else f"{row.get('funding_state')}:{len(merged)}"
+        merged[key] = row
+    return list(merged.values())
+
+
+def _reprice_stage_type(stage):
+    return "FLOOR" if int(stage) >= 4 else "MARKET"
+
+
+def _age_stage_target(stage, chain, benchmark, floor_rate, fallback_anchor=None):
+    stage = int(stage)
+    floor_rate = D(floor_rate)
+    if stage <= 3:
+        fraction = REPRICE_STAGE_FRACTIONS[stage - 1]
+        origin_rate = D(chain["origin_rate"])
+        gap = max(D("0"), origin_rate - D(benchmark))
+        return ceil_rate_tick(max(floor_rate, origin_rate - gap * fraction))
+    anchor_value = chain.get("market_anchor_rate")
+    if anchor_value is None:
+        anchor_value = fallback_anchor
+    anchor_rate = max(floor_rate, D(anchor_value if anchor_value is not None else chain["origin_rate"]))
+    fraction = REPRICE_STAGE_FRACTIONS[stage - 4]
+    return ceil_rate_tick(max(floor_rate, anchor_rate - (anchor_rate - floor_rate) * fraction))
+
+
+def _credit_display_group(credit):
+    pool = str(credit.get("pool") or "").lower()
+    if pool in CREDIT_DISPLAY_GROUPS:
+        return pool
+    period = int(credit.get("period") or 0)
+    if period <= 7:
+        return "short"
+    if period <= 30:
+        return "medium"
+    return "long"
+
+
+def build_active_credit_dashboard(credits, total_principal, policy, now_ms):
+    """Build JSON-safe active-credit rows and amount-weighted dashboard summaries."""
+
+    now = int(now_ms)
+    total_principal = max(D("0"), D(total_principal))
+    records = []
+    rows = []
+    for raw in credits or []:
+        if str(raw.get("currency") or "USD").upper() != "USD":
+            continue
+        if str(raw.get("status") or "").upper() == "CLOSED":
+            continue
+        amount = abs(D(raw.get("amount") or 0))
+        if amount <= 0:
+            continue
+        effective_rate = D(raw.get("rate_real") if raw.get("rate_real") is not None else raw.get("rate") or 0)
+        period = max(0, int(raw.get("period") or 0))
+        opening = int(raw.get("mts_opening") or raw.get("mts_created") or 0)
+        elapsed_days = None
+        contract_end = None
+        if opening > 0:
+            elapsed_days = D(max(0, now - opening)) / D("86400000")
+            contract_end = opening + period * 86_400_000
+        hidden = bool(raw.get("hidden"))
+        fee_rate = policy.hidden_fee_rate if hidden else policy.normal_fee_rate
+        net_daily_income = amount * effective_rate * (D("1") - fee_rate)
+        display_group = _credit_display_group(raw)
+        row = {
+            **raw,
+            "displayPool": display_group,
+            "effectiveRate": effective_rate,
+            "dailyRatePercent": effective_rate * D("100"),
+            "feeRatePercent": fee_rate * D("100"),
+            "netAprPercent": effective_rate * (D("1") - fee_rate) * D("36500"),
+            "elapsedDays": elapsed_days,
+            "contractEndAtMs": contract_end,
+            "managedByBot": bool(raw.get("managed")),
+        }
+        rows.append(row)
+        records.append(
+            {
+                "amount": amount,
+                "rate": effective_rate,
+                "period": D(period),
+                "elapsedDays": elapsed_days,
+                "netDailyIncome": net_daily_income,
+                "displayPool": display_group,
+            }
+        )
+
+    def summarize(selected):
+        principal = sum((record["amount"] for record in selected), D("0"))
+        elapsed = [record for record in selected if record["elapsedDays"] is not None]
+        elapsed_principal = sum((record["amount"] for record in elapsed), D("0"))
+        net_daily_income = sum((record["netDailyIncome"] for record in selected), D("0"))
+        return {
+            "orderCount": len(selected),
+            "principal": principal,
+            "utilizationPercent": (
+                None if total_principal <= 0 else principal / total_principal * D("100")
+            ),
+            "shareOfLentPercent": (
+                None
+                if not records
+                else principal / sum((record["amount"] for record in records), D("0")) * D("100")
+            ),
+            "averageDailyRatePercent": (
+                None
+                if principal <= 0
+                else sum((record["amount"] * record["rate"] for record in selected), D("0"))
+                / principal
+                * D("100")
+            ),
+            "estimatedNetAprPercent": (
+                None if principal <= 0 else net_daily_income / principal * D("36500")
+            ),
+            "averageContractDays": (
+                None
+                if principal <= 0
+                else sum((record["amount"] * record["period"] for record in selected), D("0"))
+                / principal
+            ),
+            "averageElapsedDays": (
+                None
+                if elapsed_principal <= 0
+                else sum(
+                    (record["amount"] * record["elapsedDays"] for record in elapsed),
+                    D("0"),
+                )
+                / elapsed_principal
+            ),
+            "estimatedNetIncomePerDay": net_daily_income,
+        }
+
+    overall = summarize(records)
+    groups = {
+        group: summarize([record for record in records if record["displayPool"] == group])
+        for group in CREDIT_DISPLAY_GROUPS
+    }
+    return json_decimal(
+        {
+            "credits": rows,
+            "summary": {
+                "overall": overall,
+                "groups": groups,
+            },
+        }
+    )
 
 
 def _write_result(client, result_method, legacy_method, *args, **kwargs):
@@ -254,13 +430,22 @@ class LendingRuntimeV3:
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         symbol = currency_to_symbol("USD")
         raw_book = self.client.funding_book(symbol, 250)
-        raw_trades = self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=1)
+        # The public endpoint applies ``limit`` before we build the short market
+        # windows.  On busy markets an ascending seven-day query can therefore
+        # contain only the oldest part of the range and silently omit the latest
+        # five-minute/hour signals.  Fetch newest-first; the parser restores
+        # chronological order for signal construction.
+        raw_trades = self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=-1)
         raw_stats = self.client.funding_stats(symbol, start=now - 7 * 86_400_000, end=now, limit=250)
         raw_wallets = self.client.wallets()
         if self.auto_transfer_wallets and self.store.runtime()["mode"] == "LIVE":
             transferred = False
             for wallet in parse_wallet_rows_v3(raw_wallets):
-                if wallet["wallet_type"] not in self.auto_transfer_wallets or wallet["available"] <= 0:
+                if (
+                    wallet["wallet_type"] not in self.auto_transfer_wallets
+                    or wallet.get("available") is None
+                    or wallet["available"] <= 0
+                ):
                     continue
                 result = _write_result(
                     self.client,
@@ -285,11 +470,17 @@ class LendingRuntimeV3:
                 raw_wallets = self.client.wallets()
         raw_offers = self.client.active_funding_offers(symbol)
         raw_credits = self.client.active_funding_credits(symbol)
+        try:
+            raw_loans = self.client.active_funding_loans(symbol)
+        except AttributeError:
+            raw_loans = []
         book = parse_book_v3(raw_book)
         trades = parse_funding_trades(raw_trades)
         self._stats = parse_funding_stats(raw_stats)
         offers = parse_offer_rows_v3(raw_offers)
         credits = parse_credit_rows_v3(raw_credits)
+        loans = parse_loan_rows_v3(raw_loans)
+        active_lending = _active_lending_rows(credits, loans)
         previously_managed = {int(row["offer_id"]) for row in self.store.offers(active_only=True) if row["managed"]}
         managed_ids = {int(row["offer_id"]) for row in self.store.offers() if row["managed"]}
         for offer in offers:
@@ -298,7 +489,9 @@ class LendingRuntimeV3:
             offer["display_type"] = self._offer_display_type(offer)
         active_offer_ids = {int(row["id"]) for row in offers}
         known_credit_ids = {int(row["credit_id"]) for row in self.store.credits()}
-        if (previously_managed - active_offer_ids) and any(int(row["id"]) not in known_credit_ids for row in credits):
+        if (previously_managed - active_offer_ids) and any(
+            int(row["id"]) not in known_credit_ids for row in active_lending
+        ):
             try:
                 recent_rows = self.client.funding_trades_history(
                     symbol, start=now - 600_000, end=now, limit=250, sort=1
@@ -308,9 +501,9 @@ class LendingRuntimeV3:
                 self._log(f"成交归属即时同步失败，将保持待归属并安全重试：{exc}")
         self.store.reconcile_offers(offers, now)
         self._pending_cancel_requested.intersection_update(active_offer_ids)
-        self.store.reconcile_credits(credits, now)
+        self.store.reconcile_credits(active_lending, now)
         stored_credits = {int(row["credit_id"]): row for row in self.store.credits(active_only=True)}
-        for credit in credits:
+        for credit in active_lending:
             stored = stored_credits.get(int(credit["id"]))
             if stored:
                 credit["managed"] = bool(stored["managed"])
@@ -326,6 +519,7 @@ class LendingRuntimeV3:
             wallets=raw_wallets,
             offers=offers,
             credits=credits,
+            loans=loans,
             synced_at_ms=now,
         )
         self._last_rest_sync_ms = now
@@ -345,7 +539,7 @@ class LendingRuntimeV3:
             # was bound. Refresh ownership in both durable state and this cycle's
             # in-memory snapshot before LIVE planning resumes.
             self.store.reconcile_offers(offers, now)
-            self.store.reconcile_credits(credits, now)
+            self.store.reconcile_credits(active_lending, now)
             stored_offers = {int(row["offer_id"]): row for row in self.store.offers(active_only=True)}
             for offer in offers:
                 stored = stored_offers.get(int(offer["id"]))
@@ -355,22 +549,31 @@ class LendingRuntimeV3:
                     offer["layer"] = stored.get("layer")
                     offer["display_type"] = stored.get("display_type") or offer.get("display_type")
             stored_credits = {int(row["credit_id"]): row for row in self.store.credits(active_only=True)}
-            for credit in credits:
+            for credit in active_lending:
                 stored = stored_credits.get(int(credit["id"]))
                 if stored:
                     credit["managed"] = bool(stored["managed"])
                     credit["pool"] = stored.get("pool") or credit.get("pool")
                     credit["layer"] = stored.get("layer")
                     credit["display_type"] = stored.get("display_type") or credit.get("display_type")
-            self.hub.apply_rest_snapshot(offers=offers, credits=credits, synced_at_ms=now)
+            self.hub.apply_rest_snapshot(offers=offers, credits=credits, loans=loans, synced_at_ms=now)
+        snapshot = self.hub.snapshot(now)
+        account = self._account(snapshot)
         current = self.store.runtime()
         if current["mode"] == "SAFE" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
             self.store.observe_ambiguous_cancel(active_offer_ids, now)
-        else:
+        elif account["reconciliationStatus"] == "MATCHED":
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
             self.store.record_consistent_sync(now)
-        return self.hub.snapshot(now)
+        elif current["mode"] == "LIVE":
+            reason = (
+                "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN"
+                if not account["walletAvailableKnown"]
+                else "ACCOUNT_RECONCILIATION_MISMATCH"
+            )
+            self.store.enter_safe(reason)
+        return snapshot
 
     def sync_ambiguous_write_history(self, intents, now_ms=None):
         """Fetch the narrow authoritative history window for uncertain submits.
@@ -386,15 +589,37 @@ class LendingRuntimeV3:
             start = request_ms - 300_000
             end = min(now, request_ms + 600_000)
             try:
-                funding_rows = self.client.funding_trades_history(symbol, start=start, end=end, limit=2500, sort=1)
-                offer_rows = self.client.funding_offers_history(symbol, start=start, end=end, limit=2500)
+                funding_rows = self.client.funding_trades_history(
+                    symbol,
+                    start=start,
+                    end=end,
+                    limit=AUTH_FUNDING_HISTORY_LIMIT,
+                    sort=1,
+                ) or []
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
-                self._log(f"未知挂单对账历史同步失败，将保持 SAFE 并重试：{exc}")
-                continue
-            self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
-            self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
-            if now - request_ms < 60_000:
+                self._log(f"未知挂单 Funding Trades 对账失败，将保持 SAFE 并重试：{exc}")
+            else:
+                self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
+                if len(funding_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
+                    complete = False
+                    self._log("未知挂单 Funding Trades 达到 500 条上限，无法证明历史窗口完整。")
+            try:
+                offer_rows = self.client.funding_offers_history(
+                    symbol,
+                    start=start,
+                    end=end,
+                    limit=AUTH_FUNDING_HISTORY_LIMIT,
+                ) or []
+            except (BitfinexApiError, AttributeError) as exc:
+                complete = False
+                self._log(f"未知挂单 Funding Offers 对账失败，将保持 SAFE 并重试：{exc}")
+            else:
+                self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
+                if len(offer_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
+                    complete = False
+                    self._log("未知挂单 Funding Offers 达到 500 条上限，无法证明历史窗口完整。")
+            if now - request_ms < AMBIGUOUS_HISTORY_MIN_AGE_MS:
                 complete = False
         return complete
 
@@ -427,19 +652,29 @@ class LendingRuntimeV3:
         symbol = currency_to_symbol("USD")
         start = now - 90 * 86_400_000
         try:
-            funding_rows = self.client.funding_trades_history(symbol, start=start, end=now, limit=2500, sort=1)
+            funding_rows = self.client.funding_trades_history(
+                symbol,
+                start=start,
+                end=now,
+                limit=AUTH_FUNDING_HISTORY_LIMIT,
+                sort=1,
+            ) or []
         except BitfinexApiError:
             funding_rows = []
             funding_history_complete = False
         else:
-            funding_history_complete = True
+            funding_history_complete = len(funding_rows) < AUTH_FUNDING_HISTORY_LIMIT
         self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
         try:
-            offer_rows = self.client.funding_offers_history(symbol, start=start, end=now, limit=2500)
+            offer_rows = self.client.funding_offers_history(
+                symbol, start=start, end=now, limit=AUTH_FUNDING_HISTORY_LIMIT
+            )
         except (BitfinexApiError, AttributeError):
             offer_rows = []
         try:
-            credit_rows = self.client.funding_credits_history(symbol, start=start, end=now, limit=2500)
+            credit_rows = self.client.funding_credits_history(
+                symbol, start=start, end=now, limit=AUTH_FUNDING_HISTORY_LIMIT
+            )
         except (BitfinexApiError, AttributeError):
             credit_rows = []
         self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
@@ -450,23 +685,68 @@ class LendingRuntimeV3:
 
     @staticmethod
     def _account(snapshot):
-        wallet = sum(
-            (
-                D(row["available"])
-                for row in snapshot["wallets"]
-                if row.get("wallet_type") == "funding" and row.get("currency") == "USD"
-            ),
+        funding_wallets = [
+            row
+            for row in snapshot.get("wallets", [])
+            if row.get("wallet_type") == "funding" and row.get("currency") == "USD"
+        ]
+        wallet_available_known = bool(funding_wallets) and all(
+            row.get("available") is not None for row in funding_wallets
+        )
+        wallet = (
+            sum((D(row["available"]) for row in funding_wallets), D("0"))
+            if wallet_available_known
+            else D("0")
+        )
+        wallet_balance_available = bool(funding_wallets) and all(
+            row.get("balance") is not None for row in funding_wallets
+        )
+        wallet_balance = (
+            sum((D(row["balance"]) for row in funding_wallets), D("0"))
+            if wallet_balance_available
+            else None
+        )
+        offers = [row for row in snapshot.get("offers", []) if row.get("currency") == "USD"]
+        lending_rows = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []))
+        offer_total = sum((D(row["amount"]) for row in offers), D("0"))
+        credit_total = sum(
+            (D(row["amount"]) for row in lending_rows if row.get("funding_state") != "loan"),
             D("0"),
         )
-        offer_total = sum((D(row["amount"]) for row in snapshot["offers"] if row.get("currency") == "USD"), D("0"))
-        credit_total = sum((D(row["amount"]) for row in snapshot["credits"] if row.get("currency") == "USD"), D("0"))
+        loan_total = sum(
+            (D(row["amount"]) for row in lending_rows if row.get("funding_state") == "loan"),
+            D("0"),
+        )
+        lent_total = credit_total + loan_total
+        component_total = wallet + offer_total + lent_total if wallet_available_known else None
+        total = (
+            wallet_balance
+            if wallet_balance is not None
+            else component_total
+            if component_total is not None
+            else offer_total + lent_total
+        )
+        reconciliation_difference = (
+            wallet_balance - component_total
+            if wallet_balance is not None and component_total is not None
+            else None
+        )
+        reconciliation_status = (
+            "UNAVAILABLE"
+            if reconciliation_difference is None
+            else "MATCHED"
+            if abs(reconciliation_difference) <= D("0.01")
+            else "MISMATCH"
+        )
         exposure = {pool: D("0") for pool in POOLS}
         managed_offer_exposure = {pool: D("0") for pool in POOLS}
+        managed_offer_period_exposure = {}
         exposure_by_layer = {layer: D("0") for layer in ("quick", "balanced", "high")}
         managed_offer_layer_exposure = {layer: D("0") for layer in ("quick", "balanced", "high")}
         variable = D("0")
         hidden = D("0")
-        for row in [*snapshot["offers"], *snapshot["credits"]]:
+        offer_objects = {id(row) for row in offers}
+        for row in [*offers, *lending_rows]:
             pool = row.get("pool") or pool_for_period(row.get("period", 0))
             if pool in exposure:
                 exposure[pool] += D(row["amount"])
@@ -480,22 +760,34 @@ class LendingRuntimeV3:
                 layer = row.get("layer") or "balanced"
                 if layer in exposure_by_layer:
                     exposure_by_layer[layer] += amount
-                if row in snapshot["offers"]:
+                if id(row) in offer_objects:
                     if pool in managed_offer_exposure:
                         managed_offer_exposure[pool] += amount
+                    period = int(row.get("period") or 0)
+                    managed_offer_period_exposure[period] = (
+                        managed_offer_period_exposure.get(period, D("0")) + amount
+                    )
                     if layer in managed_offer_layer_exposure:
                         managed_offer_layer_exposure[layer] += amount
         return {
             "wallet": wallet,
+            "walletAvailableKnown": wallet_available_known,
+            "walletBalance": wallet_balance,
             "offers": offer_total,
-            "credits": credit_total,
-            "total": wallet + offer_total + credit_total,
+            "credits": lent_total,
+            "creditPrincipal": credit_total,
+            "loanPrincipal": loan_total,
+            "componentTotal": component_total,
+            "total": total,
+            "reconciliationDifference": reconciliation_difference,
+            "reconciliationStatus": reconciliation_status,
             "exposure": exposure,
             "exposureByLayer": exposure_by_layer,
             "managedOfferExposure": managed_offer_exposure,
+            "managedOfferPeriodExposure": managed_offer_period_exposure,
             "managedOfferLayerExposure": managed_offer_layer_exposure,
             "existingExposure": {
-                "total": offer_total + credit_total,
+                "total": offer_total + lent_total,
                 "variable": variable,
                 "hidden": hidden,
             },
@@ -514,10 +806,51 @@ class LendingRuntimeV3:
             exposure_by_layer=account.get("exposureByLayer"),
             offer_exposure_by_pool=account.get("managedOfferExposure"),
             offer_exposure_by_layer=account.get("managedOfferLayerExposure"),
+            offer_exposure_by_period=account.get("managedOfferPeriodExposure"),
         )
 
     def _net_interest_total(self):
         return self.store.realized_income("USD")
+
+    def _persist_period_selection(self, signals, strategy_version, now_ms):
+        selection = signals.get("periodSelection") or signals.get("period_selection") or {}
+        for pool, payload in selection.get("byPool", {}).items():
+            state = self.store.observe_period_selection(
+                strategy_version,
+                pool,
+                payload.get("leaderPeriod", payload.get("selectedPeriod")),
+                payload.get("scores", []),
+                now_ms,
+            )
+            payload["leaderPeriod"] = state["leaderPeriod"]
+            payload["selectedPeriod"] = state["selectedPeriod"]
+            since = int(state["selectedSinceMs"])
+            payload["selectedSinceMs"] = since
+            payload["selectedDurationMs"] = max(0, int(now_ms) - since)
+            payload["challengerPeriod"] = state["challengerPeriod"]
+            payload["challengerSinceMs"] = state["challengerSinceMs"]
+            payload["challengerDurationMs"] = state["challengerDurationMs"]
+            payload["selectionMature"] = bool(state["promoted"])
+            ranked_eligible = [
+                int(row["period"])
+                for row in sorted(
+                    (row for row in payload.get("scores", []) if row.get("eligible")),
+                    key=lambda row: (
+                        D(row.get("totalScore") or 0),
+                        D(row.get("fillScore") or 0),
+                        D(row.get("demandScore") or 0),
+                        -int(row["period"]),
+                    ),
+                    reverse=True,
+                )
+            ]
+            payload["runnerUpPeriod"] = next(
+                (period for period in ranked_eligible if period != payload["selectedPeriod"]),
+                None,
+            )
+        signals["period_selection"] = selection
+        signals["periodSelection"] = selection
+        return signals
 
     def _record_variable_floor_violations(self, now_ms):
         violations = []
@@ -566,12 +899,29 @@ class LendingRuntimeV3:
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
             benchmark = competitive_rate_for_layer(layer, signals, floor_rate)
+            observed_rate = D(offer.get("rate_real") or offer["rate"])
+            floor_gap = max(D("0"), observed_rate - floor_rate)
+            final_due_at = int(chain["started_at_ms"]) + int(stages[-1]) * 60_000
+            pending_action = chain.get("pending_action")
+            if pending_action == "AGE_STAGE" and stage >= len(stages):
+                floor_state = "REPRICE_PENDING"
+            elif floor_gap < self.policy.minimum_rate_change:
+                floor_state = "SATISFIED_WITHIN_TOLERANCE"
+            elif now_ms >= final_due_at:
+                floor_state = "REPRICE_REQUIRED"
+            else:
+                floor_state = "NOT_DUE"
+            market_anchor = chain.get("market_anchor_rate")
+            if market_anchor is None and stage >= 3:
+                market_anchor = offer.get("rate_real") or offer["rate"]
             next_target = None
             if next_stage is not None:
-                fraction = (D("1") / D("3"), D("2") / D("3"), D("1"))[next_stage - 1]
-                origin_rate = D(chain["origin_rate"])
-                next_target = ceil_rate_tick(
-                    max(floor_rate, origin_rate - max(D("0"), origin_rate - benchmark) * fraction)
+                next_target = _age_stage_target(
+                    next_stage,
+                    chain,
+                    benchmark,
+                    floor_rate,
+                    fallback_anchor=D(offer.get("rate_real") or offer["rate"]),
                 )
             rows.append(
                 {
@@ -584,6 +934,10 @@ class LendingRuntimeV3:
                     "nextTargetRate": next_target,
                     "benchmarkRate": benchmark,
                     "floorRate": floor_rate,
+                    "floorState": floor_state,
+                    "marketAnchorRate": market_anchor,
+                    "stageType": _reprice_stage_type(stage),
+                    "nextStageType": None if next_stage is None else _reprice_stage_type(next_stage),
                     "pendingAction": chain.get("pending_action"),
                 }
             )
@@ -598,6 +952,13 @@ class LendingRuntimeV3:
         repricing = self._repricing_status(signals, now)
         repricing_by_offer = {int(row["offerId"]): row for row in repricing}
         open_offers = json_decimal(snapshot["offers"])
+        active_lending = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []))
+        active_credit_dashboard = build_active_credit_dashboard(
+            active_lending,
+            account["total"],
+            self.policy,
+            now,
+        )
         for offer in open_offers:
             offer_id = int(offer.get("id") or offer.get("offer_id") or 0)
             if offer_id in repricing_by_offer:
@@ -605,6 +966,18 @@ class LendingRuntimeV3:
         strategy_payload = None if result is None else json_decimal(result)
         if strategy_payload is not None:
             strategy_payload["repricing"] = repricing
+            strategy_payload["orderSizing"] = order_sizing_payload()
+            selection_payload = json_decimal(
+                signals.get("periodSelection") or signals.get("period_selection") or {}
+            )
+            for pool, payload in selection_payload.get("byPool", {}).items():
+                payload["poolCapPercent"] = strategy_payload.get("poolCapPercentages", {}).get(pool)
+                payload["termAllocation"] = strategy_payload.get("termAllocations", {}).get(pool, {})
+                payload["primaryTermMaxPercent"] = "70"
+            strategy_payload["periodSelection"] = selection_payload
+            strategy_payload["periodActivity"] = json_decimal(
+                self.store.period_activity(now - 86_400_000, "USD")
+            )
         status = {
             "schemaVersion": 3,
             "operationMode": runtime["mode"],
@@ -612,12 +985,13 @@ class LendingRuntimeV3:
             "marketData": {
                 key: value
                 for key, value in snapshot.items()
-                if key not in {"book", "trades", "wallets", "offers", "credits", "fundingTrades"}
+                if key not in {"book", "trades", "wallets", "offers", "credits", "loans", "fundingTrades"}
             },
             "market": json_decimal(signals),
             "account": json_decimal(account),
             "openOffers": open_offers,
-            "credits": json_decimal(snapshot["credits"]),
+            "credits": active_credit_dashboard["credits"],
+            "activeCreditSummary": active_credit_dashboard["summary"],
             "realizedIncome": realized_income,
             "incomeHistorySync": income_sync,
             "strategyV3": strategy_payload,
@@ -641,14 +1015,27 @@ class LendingRuntimeV3:
             if runtime["mode"] == "SAFE":
                 self.log.refreshStatus(f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}")
             else:
-                self.log.refreshStatus(f"V3 {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"V3.1 {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(self, plan_result, wallet_available, strategy_version):
         submitted = []
         remaining = D(wallet_available)
+        now = int(self.clock() * 1000)
+        recent_attempts = self.store.submission_attempt_count_since(
+            now - FUNDING_SUBMISSION_WINDOW_MS,
+            "USD",
+        )
+        attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
+        attempts = 0
+        plan_hash = str(plan_result.get("plan_hash") or "unhashed")
         for row in plan_result["plan"]:
-            base_slice_key = f"{strategy_version}:{row['pool']}:{row['layer']}:{row['slice_index']}"
+            if attempts >= attempt_budget:
+                break
+            base_slice_key = (
+                f"{strategy_version}:{plan_hash}:"
+                f"{row['pool']}:{row['layer']}:{row['slice_index']}"
+            )
             pending_reprice = self.store.pending_reprice_for_base(base_slice_key, strategy_version)
             submit_row = self._apply_pending_reprice(row, pending_reprice)
             if submit_row["amount"] > remaining:
@@ -665,6 +1052,7 @@ class LendingRuntimeV3:
                 break
             if not created:
                 continue
+            attempts += 1
             self.store.mark_submitting(intent["id"])
             result = _write_result(
                 self.client,
@@ -747,6 +1135,11 @@ class LendingRuntimeV3:
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
             benchmark = competitive_rate_for_layer(layer, signals, floor_rate)
+            if target is not None:
+                # A4 reprices the existing order in place conceptually. Ranking
+                # changes apply only to new wallet cash and must never change the
+                # term of a replacement order.
+                target = {**target, "period": int(offer["period"])}
             if target is None:
                 target = {
                     "display_type": str(offer.get("display_type") or self._offer_display_type(offer)).upper(),
@@ -754,7 +1147,8 @@ class LendingRuntimeV3:
                     "flags": int(offer.get("flags") or 0),
                     "effective_rate": benchmark,
                 }
-            threshold = max(self.policy.minimum_rate_change, D(signals.get("trend_threshold") or 0))
+            market_threshold = max(self.policy.minimum_rate_change, D(signals.get("trend_threshold") or 0))
+            age_threshold = self.policy.minimum_rate_change
             display_type = str(offer.get("display_type") or self._offer_display_type(offer)).upper()
             compatible_shape = (
                 display_type == str(target["display_type"]).upper()
@@ -771,41 +1165,62 @@ class LendingRuntimeV3:
                 if offer_age < self.policy.minimum_offer_minutes * 60_000:
                     continue
                 action = "SHAPE_CHANGE"
-                reason = "shape_change"
+                reason = "shape_change_preserve_period"
                 desired_rate = ceil_rate_tick(max(floor_rate, D(target["effective_rate"])))
-            elif benchmark - old_rate >= threshold:
+            elif benchmark - old_rate >= market_threshold:
                 if offer_age < self.policy.minimum_offer_minutes * 60_000:
                     continue
                 action = "MARKET_RISE"
                 reason = "market_rise"
                 desired_rate = benchmark
             else:
-                next_stage = int(chain.get("current_stage") or 0) + 1
+                current_stage = int(chain.get("current_stage") or 0)
                 stages = self.policy.reprice_stages(pool)
-                if next_stage > len(stages):
-                    continue
-                due_at = int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
-                if now < due_at:
-                    continue
-                fraction = (D("1") / D("3"), D("2") / D("3"), D("1"))[next_stage - 1]
-                origin_rate = D(chain["origin_rate"])
-                gap = max(D("0"), origin_rate - benchmark)
-                desired_rate = ceil_rate_tick(max(floor_rate, origin_rate - gap * fraction))
+                if current_stage >= len(stages):
+                    next_stage = len(stages)
+                    desired_rate = floor_rate
+                else:
+                    next_stage = current_stage + 1
+                    due_at = int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
+                    if now < due_at:
+                        continue
+                    if next_stage > 3 and chain.get("market_anchor_rate") is None:
+                        chain = self.store.set_reprice_market_anchor(chain["chain_key"], old_rate, now)
+                    desired_rate = _age_stage_target(
+                        next_stage,
+                        chain,
+                        benchmark,
+                        floor_rate,
+                        fallback_anchor=old_rate,
+                    )
                 if (
                     display_type == "FRR"
                     or old_rate <= desired_rate
-                    or old_rate - desired_rate < threshold
+                    or old_rate - desired_rate < age_threshold
                 ):
-                    self.store.complete_reprice_stage(chain["chain_key"], next_stage, now)
-                    self.store.record_ownership_event(
-                        "REPRICE_STAGE_SKIPPED",
-                        offer_id=offer_id,
-                        details={
-                            "stage": next_stage,
-                            "benchmarkRate": format(benchmark, "f"),
-                            "targetRate": format(desired_rate, "f"),
-                        },
-                    )
+                    if current_stage < len(stages):
+                        self.store.complete_reprice_stage(
+                            chain["chain_key"],
+                            next_stage,
+                            now,
+                            market_anchor_rate=old_rate if next_stage == 3 else None,
+                        )
+                        self.store.record_ownership_event(
+                            "REPRICE_STAGE_SKIPPED",
+                            offer_id=offer_id,
+                            details={
+                                "stage": next_stage,
+                                "stageType": _reprice_stage_type(next_stage),
+                                "benchmarkRate": format(benchmark, "f"),
+                                "targetRate": format(desired_rate, "f"),
+                                "marketAnchorRate": format(
+                                    D(chain.get("market_anchor_rate") or old_rate),
+                                    "f",
+                                )
+                                if next_stage >= 3
+                                else None,
+                            },
+                        )
                     continue
                 action = "AGE_STAGE"
                 stage = next_stage
@@ -843,6 +1258,7 @@ class LendingRuntimeV3:
                 desired_rate,
                 stage=stage,
                 now_ms=now,
+                market_anchor_rate=desired_rate if action == "AGE_STAGE" and stage == 3 else None,
             )
             self.store.record_reprice(
                 offer_id,
@@ -878,31 +1294,9 @@ class LendingRuntimeV3:
 
     @staticmethod
     def ratio_rebalance_candidates(offers, plan_result, policy, now_ms, pending_ids=None):
-        pending_ids = set(pending_ids or ())
-        tolerance = D(plan_result.get("ratio_tolerance") or policy.min_order_amount)
-        deviations = plan_result.get("deviation_amounts") or {}
-        candidates = []
-        for pool in POOLS:
-            excess = D(deviations.get(pool, 0)) - tolerance
-            if excess <= 0:
-                continue
-            pool_offers = [
-                row
-                for row in offers
-                if row.get("managed")
-                and row.get("currency") == "USD"
-                and (row.get("pool") or pool_for_period(row["period"])) == pool
-                and int(row.get("offer_id") or row.get("id")) not in pending_ids
-                and now_ms - int(row.get("mts_created") or now_ms) >= policy.minimum_offer_minutes * 60_000
-            ]
-            pool_offers.sort(key=lambda row: (D(row.get("rate_real") or row["rate"]), int(row.get("mts_created") or 0)))
-            removed = D("0")
-            for offer in pool_offers:
-                candidates.append(offer)
-                removed += D(offer["amount"])
-                if removed >= excess:
-                    break
-        return candidates
+        # V3.1 converges passively: an overweight pool or term receives no new
+        # money, but ranking/cap drift alone never cancels a valid existing offer.
+        return []
 
     def _cancel_ratio_rebalance(self, plan_result, now_ms, strategy_version):
         if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
@@ -1048,7 +1442,11 @@ class LendingRuntimeV3:
             policy_v3_with_overrides(StrategyPolicyV3(), pending["policy"]),
             require_live_floors=True,
         )
-        pending_result = self._build_plan(account, pending_policy, signals, pending["version_id"])
+        pending_signals = build_market_signals_v3(
+            snapshot["book"], snapshot["trades"], self._stats, pending_policy, now_ms
+        )
+        self._persist_period_selection(pending_signals, pending["version_id"], now_ms)
+        pending_result = self._build_plan(account, pending_policy, pending_signals, pending["version_id"])
         adjustments = self._pending_adjustments(snapshot, account, pending_policy, pending_result, now_ms)
         if not adjustments:
             self.store.activate_pending_strategy(
@@ -1063,7 +1461,7 @@ class LendingRuntimeV3:
                 except Exception as exc:
                     self._log(f"V3 ACTIVE 已切换，但配置镜像写入失败：{exc}")
             self._log(f"v3 策略 {pending['version_id']} 已完成调整并生效。")
-            return {"activated": pending["version_id"], "pending": False}
+            return {"activated": pending["version_id"], "pending": False, "signals": pending_signals}
         canceled = self._cancel_hard_adjustments(
             adjustments,
             now_ms,
@@ -1076,6 +1474,7 @@ class LendingRuntimeV3:
             "versionId": pending["version_id"],
             "remainingAdjustments": max(0, len(adjustments) - len(canceled)),
             "canceled": canceled,
+            "signals": pending_signals,
         }
 
     def cycle(self, now_ms=None):
@@ -1093,6 +1492,14 @@ class LendingRuntimeV3:
         if snapshot["safeRequired"]:
             self.store.enter_safe("MARKET_DATA_STALE")
         account = self._account(snapshot)
+        runtime = self.store.runtime()
+        if runtime["mode"] == "LIVE" and account["reconciliationStatus"] != "MATCHED":
+            reason = (
+                "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN"
+                if not account["walletAvailableKnown"]
+                else "ACCOUNT_RECONCILIATION_MISMATCH"
+            )
+            self.store.enter_safe(reason)
         signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
         self.store.record_market_bars(signals.get("windows"), now)
         self._record_variable_floor_violations(now)
@@ -1106,6 +1513,7 @@ class LendingRuntimeV3:
                     policy_v3_with_overrides(StrategyPolicyV3(), pending["policy"]),
                     require_live_floors=True,
                 )
+                signals = pending_status.get("signals") or signals
                 result = self._build_plan(account, pending_policy, signals, pending["version_id"])
                 result["pendingStrategy"] = pending_status
                 result["submitted"] = []
@@ -1122,6 +1530,7 @@ class LendingRuntimeV3:
                     self._apply_policy_runtime_settings()
                 version = strategy["version_id"] if strategy else "3"
                 signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
+                self._persist_period_selection(signals, version, now)
                 result = self._build_plan(account, self.policy, signals, version)
                 hard_adjustments = self._pending_adjustments(snapshot, account, self.policy, result, now)
                 canceled = self._cancel_hard_adjustments(
@@ -1156,6 +1565,7 @@ class LendingRuntimeV3:
         else:
             strategy = self.store.strategy("ACTIVE")
             version = strategy["version_id"] if strategy else "3"
+            self._persist_period_selection(signals, version, now)
             result = self._build_plan(account, self.policy, signals, version)
         self.store.record_account_sample(
             account["total"], account["wallet"], account["offers"], account["credits"], self._net_interest_total(), now

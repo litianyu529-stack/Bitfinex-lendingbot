@@ -44,7 +44,10 @@ def parse_wallet_rows(rows, currency="USD"):
                     "wallet_type": str(row[0]).lower(),
                     "currency": row_currency,
                     "balance": balance,
-                    "available": balance if len(row) < 5 or row[4] is None else D(str(row[4])),
+                    # Bitfinex explicitly uses null when BALANCE_AVAILABLE has
+                    # not been calculated yet. Treating that as the full wallet
+                    # balance can authorize writes against reserved funds.
+                    "available": None if len(row) < 5 or row[4] is None else D(str(row[4])),
                     "unsettled_interest": D(str(row[3] or 0)) if len(row) > 3 else D("0"),
                 }
             )
@@ -85,7 +88,7 @@ def parse_offer_rows(rows, currency="USD"):
     return result
 
 
-def parse_credit_rows(rows, currency="USD"):
+def _parse_active_funding_rows(rows, currency="USD", funding_state="credit"):
     result = []
     wanted = str(currency).upper()
     for row in rows or []:
@@ -99,6 +102,7 @@ def parse_credit_rows(rows, currency="USD"):
                 {
                     "id": int(row[0]),
                     "currency": row_currency,
+                    "side": int(row[2] or 0),
                     "mts_created": int(row[3] or 0),
                     "mts_updated": int(row[4] or 0),
                     "amount": abs(D(str(row[5]))),
@@ -109,11 +113,20 @@ def parse_credit_rows(rows, currency="USD"):
                     "mts_opening": int(row[13] or 0) if len(row) > 13 else 0,
                     "hidden": bool(row[16]) if len(row) > 16 else False,
                     "rate_real": D(str(row[19])) if len(row) > 19 and row[19] is not None else None,
+                    "funding_state": str(funding_state),
                 }
             )
         except (TypeError, ValueError, ArithmeticError):
             continue
     return result
+
+
+def parse_credit_rows(rows, currency="USD"):
+    return _parse_active_funding_rows(rows, currency=currency, funding_state="credit")
+
+
+def parse_loan_rows(rows, currency="USD"):
+    return _parse_active_funding_rows(rows, currency=currency, funding_state="loan")
 
 
 def parse_funding_trade_history(rows, currency="USD"):
