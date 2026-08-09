@@ -629,9 +629,9 @@ function renderStatus() {
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.2 · ${mode}`);
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.3 · ${mode}`);
     badge.classList.toggle("invalid", !valid || stale || mode === "SAFE" || recovery.active);
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.2 · 已过期" : `V3.2 · ${mode}`);
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.3 · 已过期" : `V3.3 · ${mode}`);
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
     const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
@@ -825,7 +825,7 @@ function renderPreflight(data) {
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3.2 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    items.push(["实际 V3.3 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );

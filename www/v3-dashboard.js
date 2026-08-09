@@ -15,7 +15,7 @@
     const groups = [
         {
             title: "目标期限资金池",
-            description: "范围作为风险边界；实际挂单按近期 USD 成交笔数 60% + 成交金额 40% 自动加权，优先 2、7、30、120 等活跃期限，不再平均铺到冷门天数。已成交 Credits 不参与挂单配比。",
+            description: "配置比例是短、中、长的正常目标；全市场需求和成交概率决定池内期限与低需求池的最低150美元保留额。已成交 Credits 不参与新挂单配比。",
             fields: [
                 ["short_share", "短期比例", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["medium_share", "中期比例", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -41,14 +41,13 @@
         },
         {
             title: "订单类型与费用",
-            description: "外部挂单接管默认关闭；开启后仍须停止 Worker，并在 LIVE 预检中逐笔确认，确认后机器人可撤销或重定价。",
+            description: "V3.3 自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
             fields: [
                 ["enable_limit", "LIMIT", "checkbox", "", {}],
                 ["enable_frr", "FRR", "checkbox", "", {}],
                 ["enable_frr_delta_fixed", "FRR Delta Fixed", "checkbox", "", {}],
                 ["enable_frr_delta_variable", "FRR Delta Variable", "checkbox", "", {}],
                 ["enable_hidden", "Hidden", "checkbox", "", {}],
-                ["adopt_external_offers", "预检确认后接管外部 USD 挂单", "checkbox", "", {}],
                 ["variable_max_share", "Variable最高占比", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["hidden_max_share", "Hidden最高占比", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["normal_fee_rate", "普通手续费", "number", "%", { min: 0, max: 99, step: 0.1 }],
@@ -166,7 +165,7 @@
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
-        fixedSafety.textContent = "V3.2 固定安全规则：最低订单 150 USD · 单池最多高于基础比例 10 个百分点 · 第一期限最多占池 70% · 每 60 秒最多提交 60 单 · 系统故障自动只读修复。";
+        fixedSafety.textContent = "V3.3 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
         form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");
@@ -325,13 +324,20 @@
             const challenger = data.challengerPeriod == null
                 ? "无挑战期限"
                 : `挑战 ${data.challengerPeriod} 天已持续 ${challengerMinutes}/10 分钟`;
-            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 池上限 ${data.poolCapPercent ?? "--"}% · 70/30 · ${challenger}`;
+            const allocation = data.poolAllocation || {};
+            const minimum = allocation.minimumApplied ? " · 最低150 USD" : "";
+            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 配置 ${allocation.configuredShare ?? "--"}% · 全市场需求 ${scorePercent(allocation.absoluteDemandShare)} · 目标 ${Number(allocation.targetAmount || 0).toFixed(2)} / 当前 ${Number(allocation.currentManagedOffers || 0).toFixed(2)} USD${minimum} · ${challenger}`;
             block.append(title);
             for (const row of data.scores || []) {
                 const item = document.createElement("div");
                 item.className = "v3-period-score";
                 const windows = row.windows || {};
-                item.textContent = `${row.period}天｜需求 ${scorePercent(row.demandScore)}｜成交可能 ${scorePercent(row.fillScore)}｜总分 ${scorePercent(row.totalScore)}｜1h ${windows["1h"]?.tradeCount || 0}笔/${Number(windows["1h"]?.tradeVolume || 0).toFixed(2)}｜24h ${windows["24h"]?.tradeCount || 0}笔/${Number(windows["24h"]?.tradeVolume || 0).toFixed(2)}｜7d ${windows["7d"]?.tradeCount || 0}笔/${Number(windows["7d"]?.tradeVolume || 0).toFixed(2)}｜可成交深度 ${Number(row.executableBorrowDepth || 0).toFixed(2)} USD｜最佳借款价 ${percentDaily(row.bestBorrowRate)}｜${row.eligible ? "合格" : row.eligibilityReason || "不合格"}`;
+                const demandState = row.lowDemandConfirmed
+                    ? "低于5%，分配为0"
+                    : row.lowDemandCycles
+                        ? `低需求确认 ${row.lowDemandCycles}/2`
+                        : "参与分配";
+                item.textContent = `${row.period}天｜池内需求 ${scorePercent(row.relativeDemandShare)}｜全市场需求 ${scorePercent(row.absoluteDemandShare)}｜成交概率 ${scorePercent(row.fillScore)}｜综合评分 ${scorePercent(row.totalScore)}｜${demandState}｜1h ${windows["1h"]?.tradeCount || 0}笔/${Number(windows["1h"]?.tradeVolume || 0).toFixed(2)}｜24h ${windows["24h"]?.tradeCount || 0}笔/${Number(windows["24h"]?.tradeVolume || 0).toFixed(2)}｜7d ${windows["7d"]?.tradeCount || 0}笔/${Number(windows["7d"]?.tradeVolume || 0).toFixed(2)}｜最佳借款价 ${percentDaily(row.bestBorrowRate)}｜${row.marketEligible ? "市场支持底线" : row.eligibilityReason || "最低单等待"}`;
                 block.append(item);
             }
             container.append(block);
@@ -431,8 +437,22 @@
         if (market.best_offer != null) byId("v3BestOffer").textContent = percentDaily(market.best_offer);
         if (market.utilization != null) byId("v3Utilization").textContent = `${(Number(market.utilization) * 100).toFixed(1)}%`;
         if (status?.account?.total != null) byId("v3Principal").textContent = `${Number(status.account.total).toLocaleString("zh-CN")} USD`;
+        const dust = status?.strategyV3?.dustConsolidation || {};
+        const takeoverRows = status?.strategyV3?.externalTakeover?.offers || [];
+        const activeTakeovers = takeoverRows.filter((row) => !["CLOSED", "ERROR"].includes(row.state));
         if (runtime.mode === "SAFE" && runtime.safe_reason) {
             byId("v3FormMessage").textContent = `SAFE：${runtime.safe_reason}`;
+        } else if (dust.state && dust.state !== "IDLE") {
+            const labels = {
+                PLANNED: "小额余额等待合并",
+                CANCELLING: "正在撤销最小短期单",
+                READY: `准备按 ${dust.target_period || "当前赢家"} 天重新挂出`,
+                SUBMITTING: `正在按 ${dust.target_period || "当前赢家"} 天重新挂出`,
+                AMBIGUOUS: "小额复投写入待安全对账",
+            };
+            byId("v3FormMessage").textContent = labels[dust.state] || `小额复投：${dust.state}`;
+        } else if (activeTakeovers.length) {
+            byId("v3FormMessage").textContent = `外部挂单接管中：${activeTakeovers.length} 笔`;
         }
         byId("v3ApplyButton").disabled = !data.draftStrategy;
         const canDiscardPending = Boolean(

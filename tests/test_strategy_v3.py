@@ -21,6 +21,7 @@ from StateStore import InsufficientReservedBalance, LendingStateStore, StateStor
 from StrategyV3 import (
     StrategyPolicyV3,
     _candidate_types,
+    _winner_target_shares,
     build_market_signals_v3,
     build_strategy_plan_v3,
     ceil_rate_tick,
@@ -33,7 +34,7 @@ from StrategyV3 import (
     replay_strategy_v3,
     validate_policy_v3,
 )
-from bitfinex import Bitfinex, BitfinexApiError
+from bitfinex import Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError
 
 
 D = Decimal
@@ -66,6 +67,34 @@ def signals(**overrides):
     }
     result.update(overrides)
     return result
+
+
+def selection_row(periods, selected, demands, *, qualified=True, low_confirmed=False):
+    scores = []
+    for period, demand in zip(periods, demands):
+        demand = D(str(demand))
+        scores.append(
+            {
+                "period": period,
+                "relativeDemandShare": demand,
+                "absoluteDemandShare": demand,
+                "demandScore": demand,
+                "fillScore": demand,
+                "totalScore": demand,
+                "marketQualified": qualified,
+                "additionalQualified": qualified,
+                "lowDemandConfirmed": low_confirmed and period != selected,
+            }
+        )
+    return {
+        "selectedPeriod": selected,
+        "eligiblePeriods": list(periods) if selected is not None else [],
+        "scores": scores,
+        "marketQualified": qualified,
+        "additionalQualified": qualified,
+        "lowDemandConfirmed": low_confirmed and not qualified,
+        "totalScore": max((row["totalScore"] for row in scores), default=D("0")),
+    }
 
 
 def limit_policy(**overrides):
@@ -221,7 +250,9 @@ def test_fixed_150_base_creates_maximum_even_slices_and_conserves_amount():
     assert [row["amount"] for row in first["plan"]] == [row["amount"] for row in second["plan"]]
     assert sum((row["amount"] for row in first["plan"]), D("0")) == D("10000.00000000")
     assert all(row["amount"] >= D("150") for row in first["plan"])
-    assert max(row["amount"] for row in first["plan"]) - min(row["amount"] for row in first["plan"]) <= D("0.00000001")
+    for pool in ("short", "medium", "long"):
+        amounts = [row["amount"] for row in first["plan"] if row["pool"] == pool]
+        assert max(amounts) - min(amounts) <= D("0.00000001")
 
 
 def test_insufficient_balance_reduces_slice_count_and_never_overallocates():
@@ -235,11 +266,11 @@ def test_insufficient_balance_reduces_slice_count_and_never_overallocates():
     ("available", "expected_count", "expected_pools"),
     [
         ("149.99", 0, set()),
-        ("150", 0, set()),
-        ("299.99", 0, set()),
-        ("300", 1, {"short"}),
-        ("449.99", 1, {"short"}),
-        ("450", 2, {"short", "medium"}),
+        ("150", 1, {"short"}),
+        ("299.99", 1, {"short"}),
+        ("300", 2, {"short", "medium"}),
+        ("449.99", 2, {"short", "medium"}),
+        ("450", 3, {"short", "medium", "long"}),
     ],
 )
 def test_small_balance_respects_minimum_and_pool_caps(available, expected_count, expected_pools):
@@ -325,22 +356,18 @@ def test_pool_and_layer_splits_use_primary_runner_up_and_long_exception():
     result = build_strategy_plan_v3(D("10000"), D("10000"), {}, limit_policy(), signals(), "split")
     pools = {name: [row for row in result["plan"] if row["pool"] == name] for name in ("short", "medium", "long")}
     assert [len(pools[name]) for name in ("short", "medium", "long")] == [33, 23, 10]
-    assert {row["period"] for row in pools["short"]} == {2, 7}
-    assert {row["period"] for row in pools["medium"]} == {14, 30}
+    assert {row["period"] for row in pools["short"]} == {2}
+    assert {row["period"] for row in pools["medium"]} == {14}
     assert {row["period"] for row in pools["long"]} == {120}
-    for pool, primary in (("short", 2), ("medium", 14)):
-        pool_total = sum((row["amount"] for row in pools[pool]), D("0"))
-        primary_total = sum((row["amount"] for row in pools[pool] if row["period"] == primary), D("0"))
-        assert primary_total / pool_total <= D("0.70")
     assert len({row["effective_rate"] for row in result["plan"]}) > 1
 
 
 def test_selected_period_is_capped_and_runner_up_receives_remainder():
     period_selection = {
         "byPool": {
-            "short": {"selectedPeriod": 2, "eligiblePeriods": [2, 7]},
-            "medium": {"selectedPeriod": 30, "eligiblePeriods": [30, 14]},
-            "long": {"selectedPeriod": 120, "eligiblePeriods": [120]},
+            "short": selection_row((2, 7), 2, ("0.80", "0.20")),
+            "medium": selection_row((30, 14), 30, ("0.80", "0.20")),
+            "long": selection_row((120,), 120, ("1",)),
         }
     }
     result = build_strategy_plan_v3(
@@ -352,62 +379,45 @@ def test_selected_period_is_capped_and_runner_up_receives_remainder():
         "market-weighted",
     )
     pools = {
-        name: [row["period"] for row in result["plan"] if row["pool"] == name]
-        for name in ("short", "medium", "long")
+        name: [row["period"] for row in result["plan"] if row["pool"] == name] for name in ("short", "medium", "long")
     }
     assert set(pools["short"]) == {2, 7}
     assert set(pools["medium"]) == {14, 30}
     assert set(pools["long"]) == {120}
 
 
-def test_blocked_long_pool_redistributes_available_balance_to_qualified_short_and_medium():
+def test_low_demand_pools_keep_150_and_release_the_rest_to_short():
     period_selection = {
         "byPool": {
-                "short": {
-                    "selectedPeriod": 2,
-                    "eligiblePeriods": [2, 7],
-                    "scores": [
-                        {"period": 2, "totalScore": D("0.40")},
-                        {"period": 7, "totalScore": D("0.20")},
-                    ],
-                },
-                "medium": {
-                    "selectedPeriod": 30,
-                    "eligiblePeriods": [30, 14],
-                    "scores": [
-                        {"period": 30, "totalScore": D("0.60")},
-                        {"period": 14, "totalScore": D("0.20")},
-                    ],
-                },
-            "long": {"selectedPeriod": None, "scores": []},
+            "short": selection_row((2, 7), 2, ("0.986", "0.014"), low_confirmed=True),
+            "medium": selection_row((14, 30), 14, ("0.03", "0.01"), qualified=False, low_confirmed=True),
+            "long": selection_row((120,), 120, ("0.01",), qualified=False, low_confirmed=True),
         }
     }
 
     result = build_strategy_plan_v3(
         D("10000"),
-        D("555"),
+        D("1000"),
         {},
-        limit_policy(short_share=D("40"), medium_share=D("35"), long_share=D("25")),
+        limit_policy(),
         signals(periodSelection=period_selection),
         "redistribute-blocked-long",
     )
 
-    assert result["pool_redistribution_basis"] == "SCORE_WEIGHTED_WITH_FIXED_10_POINT_CAP"
-    assert result["ineligible_pools"] == ("long",)
-    assert result["released_pool_amount"] == D("138.75")
-    assert result["planned_amount"] <= D("555")
-    assert result["idle_amount"] > D("0")
-    assert all(
-        sum((row["amount"] for row in result["plan"] if row["pool"] == pool), D("0"))
-        <= result["pool_cap_amounts"][pool]
-        for pool in ("short", "medium")
-    )
+    assert result["pool_redistribution_basis"] == "CONFIGURED_TARGET_WITH_150_MINIMUM_AND_GLOBAL_SCORE_RELEASE"
+    assert result["target_offer_amounts"] == {
+        "short": D("700.00000000"),
+        "medium": D("150.00000000"),
+        "long": D("150.00000000"),
+    }
+    assert {row["period"] for row in result["plan"] if row["pool"] == "short"} == {2}
+    assert result["planned_amount"] == D("1000.00000000")
 
 
 def test_blocked_pool_does_not_redistribute_when_no_pool_has_an_eligible_period():
     period_selection = {
         "byPool": {
-            pool: {"selectedPeriod": None, "scores": []}
+            pool: {"selectedPeriod": None, "scores": [], "insufficientMarketData": True}
             for pool in ("short", "medium", "long")
         }
     }
@@ -422,61 +432,48 @@ def test_blocked_pool_does_not_redistribute_when_no_pool_has_an_eligible_period(
     )
 
     assert result["plan"] == []
-    assert result["empty_reason"] == "MARKET_BELOW_FLOOR_OR_DATA_INSUFFICIENT"
+    assert result["empty_reason"] == "MARKET_DATA_INSUFFICIENT"
 
 
-def test_only_short_pool_eligible_stays_below_sixty_percent_and_primary_below_seventy():
+def test_two_day_986_percent_demand_gets_all_new_short_money():
     selection = {
         "byPool": {
-            "short": {
-                "selectedPeriod": 2,
-                "eligiblePeriods": [2, 7],
-                "scores": [
-                    {"period": 2, "totalScore": D("0.80")},
-                    {"period": 7, "totalScore": D("0.40")},
-                ],
-            },
-            "medium": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
-            "long": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
+            "short": selection_row((2, 7), 2, ("0.986", "0.014"), low_confirmed=True),
+            "medium": selection_row((14, 30), 14, ("0.03", "0.01"), qualified=False, low_confirmed=True),
+            "long": selection_row((120,), 120, ("0.01",), qualified=False, low_confirmed=True),
         }
     }
     result = build_strategy_plan_v3(
         D("1000"), D("1000"), {}, limit_policy(), signals(periodSelection=selection), "short-only"
     )
-    short_total = sum((row["amount"] for row in result["plan"]), D("0"))
+    short_total = sum((row["amount"] for row in result["plan"] if row["pool"] == "short"), D("0"))
     two_day = sum((row["amount"] for row in result["plan"] if row["period"] == 2), D("0"))
 
-    assert short_total <= D("600")
-    assert two_day <= short_total * D("0.70")
-    assert result["idle_amount"] >= D("400")
+    assert short_total == D("700.00000000")
+    assert two_day == short_total
+    assert not any(row["period"] == 7 for row in result["plan"])
+    assert result["idle_amount"] == D("0")
 
 
-def test_single_short_candidate_stays_idle_but_single_long_candidate_is_allowed():
+def test_single_configured_short_candidate_can_receive_its_pool():
     short_only = {
         "byPool": {
-            "short": {"selectedPeriod": 2, "eligiblePeriods": [2], "scores": []},
+            "short": selection_row((2,), 2, ("1",)),
             "medium": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
             "long": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
         }
     }
-    long_only = {
-        "byPool": {
-            "short": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
-            "medium": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
-            "long": {"selectedPeriod": 120, "eligiblePeriods": [120], "scores": []},
-        }
-    }
-
     short_result = build_strategy_plan_v3(
-        D("1000"), D("1000"), {}, limit_policy(), signals(periodSelection=short_only), "one-short"
-    )
-    long_result = build_strategy_plan_v3(
-        D("1000"), D("1000"), {}, limit_policy(), signals(periodSelection=long_only), "one-long"
+        D("1000"),
+        D("1000"),
+        {},
+        limit_policy(short_share=D("100"), medium_share=D("0"), long_share=D("0")),
+        signals(periodSelection=short_only),
+        "one-short",
     )
 
-    assert short_result["plan"] == []
-    assert {row["period"] for row in long_result["plan"]} == {120}
-    assert long_result["planned_amount"] <= D("250")
+    assert {row["period"] for row in short_result["plan"]} == {2}
+    assert short_result["planned_amount"] == D("1000.00000000")
 
 
 def test_existing_overweight_term_receives_no_new_money_and_is_not_canceled():
@@ -683,7 +680,9 @@ def test_legacy_order_sizing_fields_are_ignored_and_not_serialized():
 
     assert not {"target_slices", "min_order_amount", "amount_jitter"} & set(api_values)
     assert "max_pool_shift" not in api_values
-    assert api_values["fixedSafety"]["primaryTermMaxPercent"] == "70"
+    assert api_values["fixedSafety"]["demandWeightPercent"] == "70"
+    assert api_values["fixedSafety"]["fillProbabilityWeightPercent"] == "30"
+    assert api_values["fixedSafety"]["lowDemandThresholdPercent"] == "5"
     result = build_strategy_plan_v3(D("1000"), D("1000"), {}, parsed, signals(), "legacy-fields")
     assert result["target_slice_count"] == 6
     assert len(result["plan"]) == 6
@@ -731,9 +730,7 @@ def test_tiered_reprice_stages_default_parse_and_validate():
     assert parsed.reprice_stages("medium") == (20, 60, 120, 180, 240, 360)
     assert parsed.reprice_stages("long") == (60, 180, 360, 480, 720, 1440)
     with pytest.raises(Exception):
-        lendingbot.strategy_v3_from_api_payload(
-            {"short_reprice_stages_minutes": [10, 10, 60, 90, 120, 180]}
-        )
+        lendingbot.strategy_v3_from_api_payload({"short_reprice_stages_minutes": [10, 10, 60, 90, 120, 180]})
 
 
 def test_six_stage_targets_preserve_market_stages_then_converge_to_floor():
@@ -743,10 +740,7 @@ def test_six_stage_targets_preserve_market_stages_then_converge_to_floor():
     }
     benchmark = D("0.00045")
     floor = D("0.0003")
-    assert [
-        _age_stage_target(stage, chain, benchmark, floor)
-        for stage in range(1, 7)
-    ] == [
+    assert [_age_stage_target(stage, chain, benchmark, floor) for stage in range(1, 7)] == [
         D("0.00055"),
         D("0.00050"),
         D("0.00045"),
@@ -760,12 +754,12 @@ def result_floor(pool_name):
     return {"short": D("0.05"), "medium": D("0.06"), "long": D("0.07")}[pool_name]
 
 
-def test_unsupported_long_floor_stays_idle_without_breaking_other_pools():
+def test_unsupported_long_floor_keeps_only_the_150_dollar_minimum():
     selection = {
         "byPool": {
-            "short": {"selectedPeriod": 2, "eligiblePeriods": [2, 7], "scores": []},
-            "medium": {"selectedPeriod": 14, "eligiblePeriods": [14, 30], "scores": []},
-            "long": {"selectedPeriod": None, "eligiblePeriods": [], "scores": []},
+            "short": selection_row((2, 7), 2, ("0.8", "0.2")),
+            "medium": selection_row((14, 30), 14, ("0.8", "0.2")),
+            "long": selection_row((120,), 120, ("1",), qualified=False, low_confirmed=True),
         }
     }
     result = build_strategy_plan_v3(
@@ -776,7 +770,9 @@ def test_unsupported_long_floor_stays_idle_without_breaking_other_pools():
         signals(periodSelection=selection),
         "idle-long",
     )
-    assert all(row["pool"] != "long" for row in result["plan"])
+    long_rows = [row for row in result["plan"] if row["pool"] == "long"]
+    assert sum((row["amount"] for row in long_rows), D("0")) == D("150.00000000")
+    assert all(row["effective_rate"] >= gross_daily_floor(D("1"), D("0.15")) for row in long_rows)
     assert result["planned_amount"] == D("10000.00000000")
     assert result["idle_amount"] == D("0")
 
@@ -889,7 +885,42 @@ def test_period_selection_combines_windowed_demand_and_exact_period_book_scores(
     assert rows[2]["fillScore"] == D("1.00")
     assert rows[4]["fillScore"] == D("0.650")
     assert rows[7]["fillScore"] == D("0.370")
-    assert rows[2]["totalScore"] == D("0.755")
+    assert rows[2]["totalScore"] == D("0.6570")
+
+
+@pytest.mark.parametrize(
+    ("runner_demand", "winner_share"),
+    [
+        ("0.0499", "1"),
+        ("0.05", "0.90"),
+        ("0.1999", "0.90"),
+        ("0.20", "0.75"),
+        ("0.3499", "0.75"),
+        ("0.35", "0.60"),
+    ],
+)
+def test_v33_term_allocation_curve_boundaries(runner_demand, winner_share):
+    runner = D(runner_demand)
+    selection = selection_row((2, 7), 2, (D("1") - runner, runner))
+    shares = _winner_target_shares(selection)
+    assert shares[2] == D(winner_share)
+    assert shares.get(7, D("0")) == D("1") - D(winner_share)
+
+
+def test_global_absolute_demand_prevents_single_candidate_pool_from_looking_dominant():
+    now = 1_900_000_000_000
+    trades = [
+        {"mts": now - index * 1_000, "rate": D("0.0005"), "amount": D("100"), "period": 2} for index in range(100)
+    ] + [{"mts": now - index * 1_000, "rate": D("0.0005"), "amount": D("100"), "period": 120} for index in range(2)]
+    book = [{"period": period, "rate": D("0.0005"), "amount": D("-100")} for period in (2, 7, 14, 30, 120)]
+    by_pool = build_market_signals_v3(book, trades, [], limit_policy(), now)["periodSelection"]["byPool"]
+    short_two = next(row for row in by_pool["short"]["scores"] if row["period"] == 2)
+    long_120 = by_pool["long"]["scores"][0]
+
+    assert short_two["absoluteDemandShare"] > D("0.95")
+    assert long_120["absoluteDemandShare"] < D("0.05")
+    assert short_two["totalScore"] > long_120["totalScore"]
+    assert by_pool["long"]["belowDemandThreshold"] is True
 
 
 def test_period_selection_filters_candidates_below_pool_floor():
@@ -920,10 +951,7 @@ def test_period_selection_blocks_empty_market_and_uses_shorter_tie_break():
     assert all(row["insufficientMarketData"] for row in empty.values())
 
     configured = policy(short_periods=(2, 4, 7))
-    equal_book = [
-        {"period": period, "rate": D("0.0005"), "amount": D("-100")}
-        for period in (2, 4, 7, 14, 30, 120)
-    ]
+    equal_book = [{"period": period, "rate": D("0.0005"), "amount": D("-100")} for period in (2, 4, 7, 14, 30, 120)]
     tied = build_market_signals_v3(equal_book, [], [], configured, now)["periodSelection"]["byPool"]
     assert tied["short"]["selectedPeriod"] == 2
     assert tied["medium"]["selectedPeriod"] == 14
@@ -984,9 +1012,7 @@ def test_period_selection_hold_time_survives_restart(tmp_path):
         {"period": 7, "totalScore": D("0.61"), "eligible": True},
     ]
     changed = restarted.observe_period_selection("strategy-a", "short", 7, challenge_scores, 700_000)
-    promoted = LendingStateStore(path).observe_period_selection(
-        "strategy-a", "short", 7, challenge_scores, 1_300_000
-    )
+    promoted = LendingStateStore(path).observe_period_selection("strategy-a", "short", 7, challenge_scores, 1_300_000)
 
     assert unchanged["selectedSinceMs"] == 1_000
     assert changed["selectedPeriod"] == 4
@@ -1097,16 +1123,16 @@ def test_pending_limit_switch_never_submits_old_frr_plan_and_waits_for_confirmat
                 "as_of": at,
                 "source": "WEBSOCKET",
                 "safeRequired": False,
-                    "book": [
-                        {"rate": D("0.0004"), "period": 2, "count": 1, "amount": D("5000")},
-                        {"rate": D("0.0003"), "period": 2, "count": 1, "amount": D("-5000")},
-                        {"rate": D("0.0004"), "period": 7, "count": 1, "amount": D("5000")},
-                        {"rate": D("0.0003"), "period": 7, "count": 1, "amount": D("-5000")},
-                    ],
-                    "trades": [
-                        {"id": 1, "mts": at, "rate": D("0.0004"), "amount": D("1000"), "period": 2},
-                        {"id": 2, "mts": at, "rate": D("0.0004"), "amount": D("1000"), "period": 7},
-                    ],
+                "book": [
+                    {"rate": D("0.0004"), "period": 2, "count": 1, "amount": D("5000")},
+                    {"rate": D("0.0003"), "period": 2, "count": 1, "amount": D("-5000")},
+                    {"rate": D("0.0004"), "period": 7, "count": 1, "amount": D("5000")},
+                    {"rate": D("0.0003"), "period": 7, "count": 1, "amount": D("-5000")},
+                ],
+                "trades": [
+                    {"id": 1, "mts": at, "rate": D("0.0004"), "amount": D("1000"), "period": 2},
+                    {"id": 2, "mts": at, "rate": D("0.0004"), "amount": D("1000"), "period": 7},
+                ],
                 "wallets": [
                     {
                         "wallet_type": "funding",
@@ -1354,8 +1380,8 @@ def test_period_switch_requires_20_percent_advantage_without_canceling_old_offer
             "short": {
                 "selectedPeriod": 4,
                 "scores": [
-                        {"period": 2, "totalScore": D("0.50"), "eligible": True},
-                        {"period": 4, "totalScore": D("0.61"), "eligible": True},
+                    {"period": 2, "totalScore": D("0.50"), "eligible": True},
+                    {"period": 4, "totalScore": D("0.61"), "eligible": True},
                 ],
             }
         },
@@ -1527,12 +1553,15 @@ def test_stage_six_respects_minimum_change_threshold(tmp_path):
     client = Client()
     exact_floor_policy = limit_policy(short_floor_apr=D("0.093075"))
     runtime = LendingRuntimeV3(client, exact_floor_policy, store, hub=object())
-    assert runtime._cancel_reprice_candidates(
-        {"market": signals(best_bid=D("0.0003"), anchor_rate=D("0.0003"))},
-        {"plan_hash": "stage-six-threshold", "plan": []},
-        now,
-        "v3",
-    ) == []
+    assert (
+        runtime._cancel_reprice_candidates(
+            {"market": signals(best_bid=D("0.0003"), anchor_rate=D("0.0003"))},
+            {"plan_hash": "stage-six-threshold", "plan": []},
+            now,
+            "v3",
+        )
+        == []
+    )
     updated = store.reprice_chain_for_offer(offer["id"])
     assert client.canceled == []
     assert updated["current_stage"] == 6
@@ -1868,10 +1897,7 @@ def test_schema_normalization_preserves_active_reprice_chain_state(tmp_path):
             (new_version,),
         )
     assert store.repair_normalized_reprice_chains(new_version, now_ms=now + 2) == 1
-    repaired = [
-        row for row in store.reprice_chains(active_only=True)
-        if row["strategy_version"] == new_version
-    ][0]
+    repaired = [row for row in store.reprice_chains(active_only=True) if row["strategy_version"] == new_version][0]
     assert repaired["current_stage"] == 3
     assert repaired["started_at_ms"] == offer["mts_created"]
     assert D(repaired["market_anchor_rate"]) == D("0.00045")
@@ -2434,3 +2460,235 @@ def test_variable_floor_violation_tracks_start_update_and_end():
         assert rows[0]["started_at_ms"] == 1000
         assert rows[0]["ended_at_ms"] == 3000
         assert rows[0]["observed_rate"] == "0.00009"
+
+
+def test_low_demand_confirmation_requires_two_distinct_cycles_and_resets(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    first = store.observe_demand_confirmation("v3.3", "term", "7", D("0.014"), True, 300_000)
+    duplicate = store.observe_demand_confirmation("v3.3", "term", "7", D("0.014"), True, 301_000)
+    second = store.observe_demand_confirmation("v3.3", "term", "7", D("0.014"), True, 600_000)
+    reset = store.observe_demand_confirmation("v3.3", "term", "7", None, None, 900_000)
+
+    assert first == {"cycles": 1, "confirmed": False, "cycle": 1}
+    assert duplicate == first
+    assert second["cycles"] == 2 and second["confirmed"] is True
+    assert reset["cycles"] == 0 and reset["confirmed"] is False
+
+
+def _managed_short_offer(store, offer_id, amount, period, now_ms):
+    order = {
+        **intent_order(amount=str(amount)),
+        "slice_key": f"managed-short:{offer_id}",
+        "period": int(period),
+        "strategy_version": "v3.3",
+    }
+    _, intent = store.reserve_intent(order, D("1000"))
+    store.confirm_intent(intent["id"], offer_id)
+    offer = {
+        "id": offer_id,
+        "currency": "USD",
+        "amount": D(str(amount)),
+        "amount_original": D(str(amount)),
+        "rate": D("0.0004"),
+        "rate_real": D("0.0004"),
+        "period": int(period),
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "balanced",
+        "mts_created": now_ms - 20 * 60_000,
+    }
+    store.reconcile_offers(
+        [
+            *[
+                {
+                    "id": int(row["offer_id"]),
+                    "currency": row["currency"],
+                    "amount": D(row["amount"]),
+                    "amount_original": D(row["amount_original"]),
+                    "rate": D(row["rate"]),
+                    "rate_real": D(row["rate_real"] or row["rate"]),
+                    "period": int(row["period"]),
+                    "offer_type": row["offer_type"],
+                    "display_type": row["display_type"],
+                    "flags": int(row["flags"]),
+                    "status": "ACTIVE",
+                    "managed": True,
+                    "pool": row["pool"],
+                    "layer": row["layer"],
+                    "mts_created": row["mts_created"],
+                }
+                for row in store.offers(active_only=True)
+            ],
+            offer,
+        ],
+        now_ms,
+    )
+    return offer
+
+
+def test_dust_reinvestment_cancels_smallest_short_and_relists_for_current_winner(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: now / 1000)
+    _managed_short_offer(store, 7101, "170", 2, now)
+    _managed_short_offer(store, 7102, "160", 7, now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+            self.submitted = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+        def submit_funding_offer(self, symbol, amount, rate, period, offer_type, flags=0):
+            self.submitted.append((symbol, D(amount), D(rate), int(period), offer_type, flags))
+            return [0, "on-req", None, None, [7201]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(
+        periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.986", "0.014"), low_confirmed=True)}}
+    )
+    account = {"wallet": D("1"), "reconciliationStatus": "MATCHED"}
+
+    first = runtime._dust_consolidation(account, market, now, "v3.3")
+    assert first["state"] == "CANCELLING"
+    assert client.canceled == [7102]
+
+    store.reconcile_offers(
+        [
+            {
+                "id": 7101,
+                "currency": "USD",
+                "amount": D("170"),
+                "amount_original": D("170"),
+                "rate": D("0.0004"),
+                "rate_real": D("0.0004"),
+                "period": 2,
+                "offer_type": "LIMIT",
+                "display_type": "LIMIT",
+                "flags": 0,
+                "status": "ACTIVE",
+                "managed": True,
+                "pool": "short",
+                "layer": "balanced",
+                "mts_created": now - 20 * 60_000,
+            }
+        ],
+        now + 30_000,
+    )
+    ready = runtime._dust_consolidation(
+        {"wallet": D("161"), "reconciliationStatus": "MATCHED"}, market, now + 30_000, "v3.3"
+    )
+    assert ready["state"] == "READY"
+    submitted = runtime._dust_consolidation(
+        {"wallet": D("161"), "reconciliationStatus": "MATCHED"}, market, now + 60_000, "v3.3"
+    )
+    assert submitted["submitted"][0]["amount"] == D("161")
+    assert client.submitted[0][1] == D("161")
+    assert client.submitted[0][3] == 2
+    assert store.consolidation_status()["state"] == "IDLE"
+
+
+@pytest.mark.parametrize("wallet", ("0.99", "150"))
+def test_dust_reinvestment_does_not_cancel_outside_the_one_to_14999_range(tmp_path, wallet):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / f"dust-{wallet}.sqlite3")
+    _managed_short_offer(store, 7301, "160", 2, now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(offer_id)
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    result = runtime._dust_consolidation(
+        {"wallet": D(wallet), "reconciliationStatus": "MATCHED"},
+        signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}}),
+        now,
+        "v3.3",
+    )
+    assert result["state"] == "IDLE"
+    assert client.canceled == []
+
+
+def test_dust_unknown_cancel_enters_safe_without_replacement(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    _managed_short_offer(store, 7401, "160", 7, now)
+    store.set_mode("LIVE", "test")
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def cancel_funding_offer(self, _offer_id):
+            raise BitfinexAmbiguousWriteError("connection ended after send")
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    result = runtime._dust_consolidation(
+        {"wallet": D("1"), "reconciliationStatus": "MATCHED"},
+        signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}}),
+        now,
+        "v3.3",
+    )
+    assert result["state"] == "AMBIGUOUS"
+    assert store.runtime()["mode"] == "SAFE"
+    assert store.consolidation_status()["state"] == "AMBIGUOUS"
+    assert store.intents(states={"PLANNED", "SUBMITTING", "AMBIGUOUS"}) == []
+
+
+def test_external_takeover_requires_two_matching_snapshots_and_cancels_exact_id(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 5074345865,
+        "currency": "USD",
+        "amount": D("368.94"),
+        "amount_original": D("368.94"),
+        "rate": D("0.000301"),
+        "rate_real": D("0.000301"),
+        "period": 120,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "pool": "long",
+        "mts_created": now - 60_000,
+    }
+    store.reconcile_offers([offer], now)
+    assert store.observe_external_takeover(offer, now)["state"] == "OBSERVED"
+    assert store.observe_external_takeover(offer, now + 30_000)["state"] == "CONFIRMED"
+    assert store.adopt_external_offers([offer], "v3.3") == [5074345865]
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    assert runtime._cancel_external_takeovers(now + 60_000, "v3.3") == [5074345865]
+    assert client.canceled == [5074345865]
+    assert store.external_takeovers()[0]["state"] == "CANCELLING"

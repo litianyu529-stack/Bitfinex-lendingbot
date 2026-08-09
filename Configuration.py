@@ -141,7 +141,7 @@ V3_LIST_FIELDS = {
     "long_reprice_stages_minutes",
 }
 V3_PERIOD_FIELDS = {"short_periods", "medium_periods", "long_periods"}
-V3_FIXED_FIELDS = {"max_pool_shift"}
+V3_FIXED_FIELDS = {"max_pool_shift", "adopt_external_offers"}
 V3_CONFIG_FIELDS = tuple(
     name
     for name in StrategyPolicyV3.__dataclass_fields__
@@ -225,8 +225,13 @@ def strategy_v3_api_values(policy):
     }
     payload["fixedSafety"] = {
         "minimumOrderUsd": "150",
-        "poolShiftCapPercentagePoints": "10",
-        "primaryTermMaxPercent": "70",
+        "dustReinvestMinimumUsd": "1",
+        "demandWeightPercent": "70",
+        "fillProbabilityWeightPercent": "30",
+        "lowDemandThresholdPercent": "5",
+        "lowDemandConfirmationCycles": 2,
+        "allocationCurve": "100/0,90/10,75/25,60/40",
+        "automaticExternalTakeover": True,
         "submissionLimitPer60Seconds": 60,
     }
     return payload

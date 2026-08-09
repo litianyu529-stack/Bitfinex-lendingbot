@@ -19,6 +19,7 @@ from ExchangeModels import (
 )
 from StrategyV3 import (
     D,
+    DUST_REINVEST_MINIMUM,
     POOLS,
     StrategyPolicyV3,
     USD_ORDER_CHUNK,
@@ -158,29 +159,20 @@ def build_active_credit_dashboard(credits, total_principal, policy, now_ms):
         return {
             "orderCount": len(selected),
             "principal": principal,
-            "utilizationPercent": (
-                None if total_principal <= 0 else principal / total_principal * D("100")
-            ),
+            "utilizationPercent": (None if total_principal <= 0 else principal / total_principal * D("100")),
             "shareOfLentPercent": (
-                None
-                if not records
-                else principal / sum((record["amount"] for record in records), D("0")) * D("100")
+                None if not records else principal / sum((record["amount"] for record in records), D("0")) * D("100")
             ),
             "averageDailyRatePercent": (
                 None
                 if principal <= 0
-                else sum((record["amount"] * record["rate"] for record in selected), D("0"))
-                / principal
-                * D("100")
+                else sum((record["amount"] * record["rate"] for record in selected), D("0")) / principal * D("100")
             ),
-            "estimatedNetAprPercent": (
-                None if principal <= 0 else net_daily_income / principal * D("36500")
-            ),
+            "estimatedNetAprPercent": (None if principal <= 0 else net_daily_income / principal * D("36500")),
             "averageContractDays": (
                 None
                 if principal <= 0
-                else sum((record["amount"] * record["period"] for record in selected), D("0"))
-                / principal
+                else sum((record["amount"] * record["period"] for record in selected), D("0")) / principal
             ),
             "averageElapsedDays": (
                 None
@@ -284,6 +276,7 @@ class LendingRuntimeV3:
         self._income_sync_stop = threading.Event()
         self._income_sync_thread = None
         self._pending_cancel_requested = set()
+        self._last_dust_check_bucket = None
 
     def _log(self, message):
         if self.log is not None:
@@ -493,6 +486,14 @@ class LendingRuntimeV3:
             offer["managed"] = offer["id"] in managed_ids
             offer["pool"] = pool_for_period(offer["period"])
             offer["display_type"] = self._offer_display_type(offer)
+        authoritative_account = self._account(
+            {
+                "wallets": parse_wallet_rows_v3(raw_wallets),
+                "offers": offers,
+                "credits": credits,
+                "loans": loans,
+            }
+        )
         active_offer_ids = {int(row["id"]) for row in offers}
         known_credit_ids = {int(row["credit_id"]) for row in self.store.credits()}
         if (previously_managed - active_offer_ids) and any(
@@ -506,6 +507,31 @@ class LendingRuntimeV3:
             except (BitfinexApiError, AttributeError) as exc:
                 self._log(f"成交归属即时同步失败，将保持待归属并安全重试：{exc}")
         self.store.reconcile_offers(offers, now)
+        takeover_snapshot_safe = (
+            authoritative_account["walletAvailableKnown"] and authoritative_account["reconciliationStatus"] == "MATCHED"
+        )
+        if self.policy.adopt_external_offers and takeover_snapshot_safe:
+            active_strategy = self.store.strategy("ACTIVE")
+            strategy_version = active_strategy["version_id"] if active_strategy else "3"
+            confirmed_external = []
+            for offer in offers:
+                if offer.get("managed") or str(offer.get("currency") or "USD").upper() != "USD":
+                    continue
+                takeover = self.store.observe_external_takeover(offer, now)
+                if takeover.get("state") == "CONFIRMED":
+                    confirmed_external.append(offer)
+            adopted = self.store.adopt_external_offers(confirmed_external, strategy_version)
+            if adopted:
+                adopted_ids = set(adopted)
+                for offer in offers:
+                    if int(offer["id"]) in adopted_ids:
+                        offer["managed"] = True
+                self.store.reconcile_offers(offers, now)
+        elif self.policy.adopt_external_offers:
+            self.store.reset_unconfirmed_external_takeovers()
+        for takeover in self.store.external_takeovers(states={"CANCELLING"}):
+            if int(takeover["offer_id"]) not in active_offer_ids:
+                self.store.update_external_takeover(takeover["offer_id"], "CLOSED", now_ms=now)
         self._pending_cancel_requested.intersection_update(active_offer_ids)
         self.store.reconcile_credits(active_lending, now)
         stored_credits = {int(row["credit_id"]): row for row in self.store.credits(active_only=True)}
@@ -567,7 +593,21 @@ class LendingRuntimeV3:
         account = self._account(snapshot)
         current = self.store.runtime()
         if current["mode"] == "SAFE" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
-            self.store.observe_ambiguous_cancel(active_offer_ids, now)
+            resolved_runtime = self.store.observe_ambiguous_cancel(active_offer_ids, now)
+            if resolved_runtime["mode"] != "SAFE":
+                consolidation = self.store.consolidation_status()
+                if consolidation.get("state") == "AMBIGUOUS" and consolidation.get("offer_id") is not None:
+                    if int(consolidation["offer_id"]) in active_offer_ids:
+                        self.store.clear_consolidation(now)
+                    else:
+                        self.store.update_consolidation("READY", now_ms=now)
+                for takeover in self.store.external_takeovers(states={"AMBIGUOUS"}):
+                    offer_id = int(takeover["offer_id"])
+                    self.store.update_external_takeover(
+                        offer_id,
+                        "ADOPTED" if offer_id in active_offer_ids else "CLOSED",
+                        now_ms=now,
+                    )
         elif account["reconciliationStatus"] == "MATCHED" and not snapshot.get("safeRequired"):
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
@@ -604,13 +644,16 @@ class LendingRuntimeV3:
             start = request_ms - 300_000
             end = min(now, request_ms + 600_000)
             try:
-                funding_rows = self.client.funding_trades_history(
-                    symbol,
-                    start=start,
-                    end=end,
-                    limit=AUTH_FUNDING_HISTORY_LIMIT,
-                    sort=1,
-                ) or []
+                funding_rows = (
+                    self.client.funding_trades_history(
+                        symbol,
+                        start=start,
+                        end=end,
+                        limit=AUTH_FUNDING_HISTORY_LIMIT,
+                        sort=1,
+                    )
+                    or []
+                )
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
                 self._log(f"未知挂单 Funding Trades 对账失败，将保持 SAFE 并重试：{exc}")
@@ -620,12 +663,15 @@ class LendingRuntimeV3:
                     complete = False
                     self._log("未知挂单 Funding Trades 达到 500 条上限，无法证明历史窗口完整。")
             try:
-                offer_rows = self.client.funding_offers_history(
-                    symbol,
-                    start=start,
-                    end=end,
-                    limit=AUTH_FUNDING_HISTORY_LIMIT,
-                ) or []
+                offer_rows = (
+                    self.client.funding_offers_history(
+                        symbol,
+                        start=start,
+                        end=end,
+                        limit=AUTH_FUNDING_HISTORY_LIMIT,
+                    )
+                    or []
+                )
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
                 self._log(f"未知挂单 Funding Offers 对账失败，将保持 SAFE 并重试：{exc}")
@@ -667,13 +713,16 @@ class LendingRuntimeV3:
         symbol = currency_to_symbol("USD")
         start = now - 90 * 86_400_000
         try:
-            funding_rows = self.client.funding_trades_history(
-                symbol,
-                start=start,
-                end=now,
-                limit=AUTH_FUNDING_HISTORY_LIMIT,
-                sort=1,
-            ) or []
+            funding_rows = (
+                self.client.funding_trades_history(
+                    symbol,
+                    start=start,
+                    end=now,
+                    limit=AUTH_FUNDING_HISTORY_LIMIT,
+                    sort=1,
+                )
+                or []
+            )
         except BitfinexApiError:
             funding_rows = []
             funding_history_complete = False
@@ -708,18 +757,12 @@ class LendingRuntimeV3:
         wallet_available_known = bool(funding_wallets) and all(
             row.get("available") is not None for row in funding_wallets
         )
-        wallet = (
-            sum((D(row["available"]) for row in funding_wallets), D("0"))
-            if wallet_available_known
-            else D("0")
-        )
+        wallet = sum((D(row["available"]) for row in funding_wallets), D("0")) if wallet_available_known else D("0")
         wallet_balance_available = bool(funding_wallets) and all(
             row.get("balance") is not None for row in funding_wallets
         )
         wallet_balance = (
-            sum((D(row["balance"]) for row in funding_wallets), D("0"))
-            if wallet_balance_available
-            else None
+            sum((D(row["balance"]) for row in funding_wallets), D("0")) if wallet_balance_available else None
         )
         offers = [row for row in snapshot.get("offers", []) if row.get("currency") == "USD"]
         lending_rows = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []))
@@ -742,9 +785,7 @@ class LendingRuntimeV3:
             else offer_total + lent_total
         )
         reconciliation_difference = (
-            wallet_balance - component_total
-            if wallet_balance is not None and component_total is not None
-            else None
+            wallet_balance - component_total if wallet_balance is not None and component_total is not None else None
         )
         reconciliation_status = (
             "UNAVAILABLE"
@@ -779,9 +820,7 @@ class LendingRuntimeV3:
                     if pool in managed_offer_exposure:
                         managed_offer_exposure[pool] += amount
                     period = int(row.get("period") or 0)
-                    managed_offer_period_exposure[period] = (
-                        managed_offer_period_exposure.get(period, D("0")) + amount
-                    )
+                    managed_offer_period_exposure[period] = managed_offer_period_exposure.get(period, D("0")) + amount
                     if layer in managed_offer_layer_exposure:
                         managed_offer_layer_exposure[layer] += amount
         return {
@@ -830,6 +869,52 @@ class LendingRuntimeV3:
     def _persist_period_selection(self, signals, strategy_version, now_ms):
         selection = signals.get("periodSelection") or signals.get("period_selection") or {}
         for pool, payload in selection.get("byPool", {}).items():
+            insufficient = bool(payload.get("insufficientMarketData"))
+            pool_confirmation = self.store.observe_demand_confirmation(
+                strategy_version,
+                "pool",
+                pool,
+                payload.get("absoluteDemandShare"),
+                None if insufficient else payload.get("belowDemandThreshold", False),
+                now_ms,
+            )
+            payload["lowDemandCycles"] = pool_confirmation["cycles"]
+            payload["lowDemandConfirmed"] = pool_confirmation["confirmed"]
+            for row in payload.get("scores", []):
+                term_confirmation = self.store.observe_demand_confirmation(
+                    strategy_version,
+                    "period",
+                    f"{pool}:{int(row['period'])}",
+                    row.get("relativeDemandShare"),
+                    None if insufficient else row.get("belowDemandThreshold", False),
+                    now_ms,
+                )
+                row["lowDemandCycles"] = term_confirmation["cycles"]
+                row["lowDemandConfirmed"] = term_confirmation["confirmed"]
+                row["allocationEligible"] = not term_confirmation["confirmed"]
+            ranked_for_leader = sorted(
+                (row for row in payload.get("scores", []) if not row.get("lowDemandConfirmed")),
+                key=lambda row: (
+                    D(row.get("totalScore") or 0),
+                    D(row.get("fillScore") or 0),
+                    D(row.get("demandScore") or 0),
+                    -int(row["period"]),
+                ),
+                reverse=True,
+            )
+            if not ranked_for_leader:
+                ranked_for_leader = sorted(
+                    payload.get("scores", []),
+                    key=lambda row: (D(row.get("totalScore") or 0), -int(row["period"])),
+                    reverse=True,
+                )
+            payload["leaderPeriod"] = (
+                None
+                if insufficient
+                else ranked_for_leader[0]["period"]
+                if ranked_for_leader
+                else payload.get("fallbackPeriod")
+            )
             state = self.store.observe_period_selection(
                 strategy_version,
                 pool,
@@ -849,7 +934,7 @@ class LendingRuntimeV3:
             ranked_eligible = [
                 int(row["period"])
                 for row in sorted(
-                    (row for row in payload.get("scores", []) if row.get("eligible")),
+                    (row for row in payload.get("scores", []) if not row.get("lowDemandConfirmed")),
                     key=lambda row: (
                         D(row.get("totalScore") or 0),
                         D(row.get("fillScore") or 0),
@@ -906,9 +991,7 @@ class LendingRuntimeV3:
             stages = self.policy.reprice_stages(pool)
             next_stage = stage + 1 if stage < len(stages) else None
             next_at = (
-                int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
-                if next_stage is not None
-                else None
+                int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000 if next_stage is not None else None
             )
             hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
@@ -982,19 +1065,21 @@ class LendingRuntimeV3:
         if strategy_payload is not None:
             strategy_payload["repricing"] = repricing
             strategy_payload["orderSizing"] = order_sizing_payload()
-            selection_payload = json_decimal(
-                signals.get("periodSelection") or signals.get("period_selection") or {}
-            )
+            selection_payload = json_decimal(signals.get("periodSelection") or signals.get("period_selection") or {})
             for pool, payload in selection_payload.get("byPool", {}).items():
                 payload["poolCapPercent"] = strategy_payload.get("poolCapPercentages", {}).get(pool)
+                payload["poolAllocation"] = strategy_payload.get("poolAllocation", {}).get(pool, {})
                 payload["termAllocation"] = strategy_payload.get("termAllocations", {}).get(pool, {})
-                payload["primaryTermMaxPercent"] = "70"
+                payload["allocationCurve"] = "100/0,90/10,75/25,60/40"
             strategy_payload["periodSelection"] = selection_payload
-            strategy_payload["periodActivity"] = json_decimal(
-                self.store.period_activity(now - 86_400_000, "USD")
+            strategy_payload["dustConsolidation"] = json_decimal(self.store.consolidation_status())
+            strategy_payload["externalTakeover"] = json_decimal(
+                {"automatic": bool(self.policy.adopt_external_offers), "offers": self.store.external_takeovers()}
             )
+            strategy_payload["periodActivity"] = json_decimal(self.store.period_activity(now - 86_400_000, "USD"))
         status = {
             "schemaVersion": 3,
+            "stateSchemaVersion": 11,
             "operationMode": runtime["mode"],
             "runtime": runtime,
             "recovery": self.store.recovery_status(),
@@ -1031,7 +1116,7 @@ class LendingRuntimeV3:
             if runtime["mode"] == "SAFE":
                 self.log.refreshStatus(f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}")
             else:
-                self.log.refreshStatus(f"V3.2 {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"V3.3 {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(self, plan_result, wallet_available, strategy_version):
@@ -1048,10 +1133,7 @@ class LendingRuntimeV3:
         for row in plan_result["plan"]:
             if attempts >= attempt_budget:
                 break
-            base_slice_key = (
-                f"{strategy_version}:{plan_hash}:"
-                f"{row['pool']}:{row['layer']}:{row['slice_index']}"
-            )
+            base_slice_key = f"{strategy_version}:{plan_hash}:{row['pool']}:{row['layer']}:{row['slice_index']}"
             pending_reprice = self.store.pending_reprice_for_base(base_slice_key, strategy_version)
             submit_row = self._apply_pending_reprice(row, pending_reprice)
             if submit_row["amount"] > remaining:
@@ -1219,11 +1301,7 @@ class LendingRuntimeV3:
                         floor_rate,
                         fallback_anchor=old_rate,
                     )
-                if (
-                    display_type == "FRR"
-                    or old_rate <= desired_rate
-                    or old_rate - desired_rate < age_threshold
-                ):
+                if display_type == "FRR" or old_rate <= desired_rate or old_rate - desired_rate < age_threshold:
                     if current_stage < len(stages):
                         self.store.complete_reprice_stage(
                             chain["chain_key"],
@@ -1301,9 +1379,7 @@ class LendingRuntimeV3:
             )
             canceled.append(offer_id)
             self._pending_cancel_requested.add(offer_id)
-            self.store.record_ownership_event(
-                "CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": reason}
-            )
+            self.store.record_ownership_event("CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": reason})
             if action == "AGE_STAGE":
                 self._log(
                     f"挂单 {offer_id} 累计等待达到第 {stage} 阶段，"
@@ -1365,6 +1441,194 @@ class LendingRuntimeV3:
             self._pending_cancel_requested.add(offer_id)
             canceled.append(offer_id)
         return canceled
+
+    def _cancel_external_takeovers(self, now_ms, strategy_version, plan_hash=None):
+        """Cancel only explicitly adopted external offers before global replanning."""
+
+        if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
+            return []
+        active = {int(row["offer_id"]): row for row in self.store.offers(active_only=True)}
+        canceled = []
+        remaining = max(0, self.policy.max_reprices_per_hour - self.store.reprice_count_since(now_ms - 3_600_000))
+        for takeover in self.store.external_takeovers(states={"ADOPTED"})[:remaining]:
+            offer_id = int(takeover["offer_id"])
+            offer = active.get(offer_id)
+            if offer is None:
+                self.store.update_external_takeover(offer_id, "CLOSED", now_ms=now_ms)
+                continue
+            if offer_id in self._pending_cancel_requested:
+                continue
+            result = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
+            if result.outcome == WriteOutcome.UNKNOWN:
+                self.store.update_external_takeover(offer_id, "AMBIGUOUS", result.error, now_ms)
+                self.store.record_ownership_event(
+                    "CANCEL_UNKNOWN", offer_id=offer_id, details={"reason": "external_takeover", "error": result.error}
+                )
+                self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}")
+                break
+            if result.outcome == WriteOutcome.DEFINITE_REJECT:
+                self.store.update_external_takeover(offer_id, "ERROR", result.error, now_ms)
+                continue
+            self.store.record_reprice(
+                offer_id,
+                "external_takeover",
+                offer.get("rate_real") or offer["rate"],
+                None,
+                created_at_ms=now_ms,
+                strategy_version=strategy_version,
+                plan_hash=plan_hash,
+                display_type=offer.get("display_type"),
+            )
+            self.store.record_ownership_event(
+                "CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": "external_takeover"}
+            )
+            self.store.update_external_takeover(offer_id, "CANCELLING", now_ms=now_ms)
+            self._pending_cancel_requested.add(offer_id)
+            canceled.append(offer_id)
+        return canceled
+
+    def _dust_consolidation(self, account, signals, now_ms, strategy_version):
+        """Merge 1-149.99 USD wallet dust into the smallest safe short offer."""
+
+        status = self.store.consolidation_status()
+        state = status.get("state", "IDLE")
+        active_offers = {int(row["offer_id"]): row for row in self.store.offers(active_only=True)}
+        if state == "CANCELLING":
+            if int(status["offer_id"]) not in active_offers and account["reconciliationStatus"] == "MATCHED":
+                self.store.update_consolidation("READY", now_ms=now_ms)
+                return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
+            return {"blocking": True, "state": state, "canceled": [], "submitted": []}
+        if state == "READY":
+            wallet = D(account["wallet"])
+            expected = D(status["captured_wallet"]) + D(status["captured_offer_amount"])
+            if wallet >= expected + USD_ORDER_CHUNK:
+                self.store.clear_consolidation(now_ms)
+                return {"blocking": False, "state": "ABORTED_ACCOUNT_CHANGE", "canceled": [], "submitted": []}
+            if wallet < USD_ORDER_CHUNK:
+                return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
+            selection = (
+                (signals.get("periodSelection") or signals.get("period_selection") or {})
+                .get("byPool", {})
+                .get("short", {})
+            )
+            period = int(selection.get("selectedPeriod") or status.get("target_period") or 2)
+            floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.short_floor_apr, self.policy.normal_fee_rate))
+            target_rate = competitive_rate_for_layer("quick", signals, floor_rate)
+            dust_hash = f"dust-{status.get('started_at_ms')}-{status.get('offer_id')}"
+            dust_plan = {
+                "plan_hash": dust_hash,
+                "plan": [
+                    {
+                        "slice_index": 0,
+                        "pool": "short",
+                        "layer": "quick",
+                        "amount": wallet,
+                        "period": period,
+                        "offer_type": "LIMIT",
+                        "display_type": "LIMIT",
+                        "flags": 0,
+                        "submitted_rate": target_rate,
+                        "effective_rate": target_rate,
+                        "target_rate": target_rate,
+                        "gross_daily_floor": floor_rate,
+                        "plan_hash": dust_hash,
+                    }
+                ],
+            }
+            self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
+            submitted = self._submit_plan(dust_plan, wallet, strategy_version)
+            if submitted:
+                self.store.clear_consolidation(now_ms)
+            elif self.store.intents(states={"AMBIGUOUS"}):
+                self.store.update_consolidation("AMBIGUOUS", "unknown replacement submit", now_ms)
+            else:
+                self.store.update_consolidation("READY", now_ms=now_ms)
+            return {"blocking": True, "state": "SUBMITTING", "canceled": [], "submitted": submitted}
+        if state in {"SUBMITTING", "AMBIGUOUS"}:
+            dust_hash = f"dust-{status.get('started_at_ms')}-{status.get('offer_id')}"
+            related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
+            if any(row["state"] == "CONFIRMED" for row in related):
+                self.store.clear_consolidation(now_ms)
+                return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
+            if related and all(row["state"] in {"CLOSED", "REJECTED"} for row in related):
+                self.store.update_consolidation("READY", now_ms=now_ms)
+                return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
+            return {"blocking": True, "state": state, "canceled": [], "submitted": []}
+
+        wallet = D(account["wallet"])
+        bucket = now_ms // 300_000
+        if self._last_dust_check_bucket == bucket:
+            return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
+        self._last_dust_check_bucket = bucket
+        if wallet < DUST_REINVEST_MINIMUM or wallet >= USD_ORDER_CHUNK:
+            return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
+        if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
+            return {"blocking": False, "state": "RATE_LIMITED", "canceled": [], "submitted": []}
+        selection = (
+            (signals.get("periodSelection") or signals.get("period_selection") or {}).get("byPool", {}).get("short", {})
+        )
+        winner = selection.get("selectedPeriod")
+        if winner is None or selection.get("insufficientMarketData"):
+            return {"blocking": False, "state": "NO_WINNER", "canceled": [], "submitted": []}
+        last_family = self.store.last_reprice_for_family("short", "quick")
+        if last_family is not None and now_ms - int(last_family) < self.policy.reprice_cooldown_minutes * 60_000:
+            return {"blocking": False, "state": "COOLDOWN", "canceled": [], "submitted": []}
+        candidates = []
+        for offer in active_offers.values():
+            pool = offer.get("pool") or pool_for_period(offer["period"])
+            display = str(offer.get("display_type") or offer.get("offer_type") or "LIMIT").upper()
+            age = now_ms - int(offer.get("mts_created") or now_ms)
+            amount = D(offer["amount"])
+            if (
+                offer.get("managed")
+                and pool == "short"
+                and display == "LIMIT"
+                and int(offer["offer_id"]) not in self._pending_cancel_requested
+                and not (self.store.reprice_chain_for_offer(int(offer["offer_id"])) or {}).get("pending_action")
+                and age >= self.policy.minimum_offer_minutes * 60_000
+                and amount + wallet >= USD_ORDER_CHUNK
+            ):
+                candidates.append(offer)
+        if not candidates:
+            return {"blocking": False, "state": "NO_CANDIDATE", "canceled": [], "submitted": []}
+        candidate = min(
+            candidates,
+            key=lambda offer: (
+                D(offer["amount"]),
+                int(offer["period"]) == int(winner),
+                int(offer.get("mts_created") or now_ms),
+            ),
+        )
+        offer_id = int(candidate["offer_id"])
+        self.store.begin_consolidation(offer_id, wallet, candidate["amount"], winner, strategy_version, now_ms)
+        result = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
+        if result.outcome == WriteOutcome.UNKNOWN:
+            self.store.update_consolidation("AMBIGUOUS", result.error, now_ms)
+            self.store.record_ownership_event(
+                "CANCEL_UNKNOWN", offer_id=offer_id, details={"reason": "dust_consolidation", "error": result.error}
+            )
+            self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}")
+            return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
+        if result.outcome == WriteOutcome.DEFINITE_REJECT:
+            self.store.clear_consolidation(now_ms)
+            return {"blocking": False, "state": "REJECTED", "canceled": [], "submitted": []}
+        self.store.record_reprice(
+            offer_id,
+            "dust_consolidation",
+            candidate.get("rate_real") or candidate["rate"],
+            None,
+            created_at_ms=now_ms,
+            strategy_version=strategy_version,
+            display_type=candidate.get("display_type"),
+        )
+        self.store.record_ownership_event(
+            "CANCEL_CONFIRMED",
+            offer_id=offer_id,
+            details={"reason": "dust_consolidation", "wallet": format(wallet, "f")},
+        )
+        self.store.update_consolidation("CANCELLING", now_ms=now_ms)
+        self._pending_cancel_requested.add(offer_id)
+        return {"blocking": True, "state": "CANCELLING", "canceled": [offer_id], "submitted": []}
 
     def _pending_adjustments(self, snapshot, account, pending_policy, pending_result, now_ms):
         """Return hard incompatibilities that must disappear before activation.
@@ -1579,29 +1843,39 @@ class LendingRuntimeV3:
                 signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
                 self._persist_period_selection(signals, version, now)
                 result = self._build_plan(account, self.policy, signals, version)
-                hard_adjustments = self._pending_adjustments(snapshot, account, self.policy, result, now)
-                canceled = self._cancel_hard_adjustments(
-                    hard_adjustments,
-                    now,
-                    "active_policy",
-                    strategy_version=version,
-                    plan_hash=result.get("plan_hash"),
-                )
-                if not hard_adjustments:
-                    canceled = self._cancel_ratio_rebalance(result, now, version)
-                    result["rebalance_cancellations"] = canceled
-                    result["rebalanceCancellations"] = canceled
-                    if not canceled:
-                        canceled = self._cancel_reprice_candidates(
-                            {"market": signals}, result, now, strategy_version=version
-                        )
-                if not canceled and self.store.runtime()["mode"] == "LIVE":
+                canceled = self._cancel_external_takeovers(now, version, result.get("plan_hash"))
+                dust = {"blocking": False, "canceled": [], "submitted": [], "state": "IDLE"}
+                hard_adjustments = []
+                if not canceled:
+                    dust = self._dust_consolidation(account, signals, now, version)
+                    canceled = dust.get("canceled", [])
+                    result["dustConsolidation"] = dust
+                if not canceled and not dust.get("blocking"):
+                    hard_adjustments = self._pending_adjustments(snapshot, account, self.policy, result, now)
+                    canceled = self._cancel_hard_adjustments(
+                        hard_adjustments,
+                        now,
+                        "active_policy",
+                        strategy_version=version,
+                        plan_hash=result.get("plan_hash"),
+                    )
+                    if not hard_adjustments:
+                        canceled = self._cancel_ratio_rebalance(result, now, version)
+                        result["rebalance_cancellations"] = canceled
+                        result["rebalanceCancellations"] = canceled
+                        if not canceled:
+                            canceled = self._cancel_reprice_candidates(
+                                {"market": signals}, result, now, strategy_version=version
+                            )
+                if not canceled and not dust.get("blocking") and self.store.runtime()["mode"] == "LIVE":
                     # Requested hard cancellations remain blocking until a fresh
                     # authoritative account snapshot confirms the offers vanished.
                     if hard_adjustments:
                         result["submitted"] = []
                     else:
                         result["submitted"] = self._submit_plan(result, account["wallet"], version)
+                elif dust.get("blocking"):
+                    result["submitted"] = dust.get("submitted", [])
                 else:
                     result["submitted"] = []
             result["canceledForReprice"] = canceled

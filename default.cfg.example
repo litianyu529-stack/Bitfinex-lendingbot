@@ -48,7 +48,7 @@ enable_frr_delta_fixed = true
 enable_frr_delta_variable = true
 variable_max_share = 10
 enable_hidden = false
-adopt_external_offers = false
+adopt_external_offers = true
 hidden_max_share =
 
 minimum_offer_minutes = 10

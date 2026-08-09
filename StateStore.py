@@ -71,11 +71,7 @@ def base_slice_key(slice_key):
 
 def slice_pool_layer(slice_key):
     parts = base_slice_key(slice_key).split(":")
-    if (
-        len(parts) >= 4
-        and parts[-3] in {"short", "medium", "long"}
-        and parts[-2] in {"quick", "balanced", "high"}
-    ):
+    if len(parts) >= 4 and parts[-3] in {"short", "medium", "long"} and parts[-2] in {"quick", "balanced", "high"}:
         return parts[-3], parts[-2]
     return None, None
 
@@ -103,7 +99,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 10:
+        if version >= 11:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -466,6 +462,38 @@ class LendingStateStore:
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (strategy_version, pool)
             )""",
+            """CREATE TABLE IF NOT EXISTS demand_confirmation_state (
+                strategy_version TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                signal_key TEXT NOT NULL,
+                consecutive_cycles INTEGER NOT NULL DEFAULT 0,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                last_cycle INTEGER,
+                last_share TEXT,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (strategy_version, scope, signal_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS consolidation_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                state TEXT NOT NULL DEFAULT 'IDLE',
+                offer_id INTEGER,
+                captured_wallet TEXT,
+                captured_offer_amount TEXT,
+                target_period INTEGER,
+                strategy_version TEXT,
+                started_at_ms INTEGER,
+                updated_at_ms INTEGER NOT NULL,
+                last_error TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS external_takeover_state (
+                offer_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                snapshot_digest TEXT,
+                first_seen_ms INTEGER NOT NULL,
+                confirmed_at_ms INTEGER,
+                updated_at_ms INTEGER NOT NULL,
+                last_error TEXT
+            )""",
         ]
         connection = self._connect()
         try:
@@ -483,14 +511,20 @@ class LendingStateStore:
             self._migrate_v8_recovery_columns(connection)
             self._migrate_v9_period_selection_columns(connection)
             self._migrate_v10_recovery_state(connection)
+            self._migrate_v11_allocation_state(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '10')
-                   ON CONFLICT(key) DO UPDATE SET value='10'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '11')
+                   ON CONFLICT(key) DO UPDATE SET value='11'"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
                     currency, status, updated_at_ms
                 ) VALUES('USD', 'PENDING', ?)""",
+                (self._now_ms(),),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO consolidation_state(singleton, state, updated_at_ms)
+                   VALUES(1, 'IDLE', ?)""",
                 (self._now_ms(),),
             )
             connection.execute(
@@ -507,17 +541,13 @@ class LendingStateStore:
 
     @staticmethod
     def _migrate_v9_period_selection_columns(connection):
-        existing = {
-            row["name"] for row in connection.execute("PRAGMA table_info(period_selection_state)")
-        }
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(period_selection_state)")}
         for name, definition in {
             "challenger_period": "INTEGER",
             "challenger_since_ms": "INTEGER",
         }.items():
             if name not in existing:
-                connection.execute(
-                    f"ALTER TABLE period_selection_state ADD COLUMN {name} {definition}"
-                )
+                connection.execute(f"ALTER TABLE period_selection_state ADD COLUMN {name} {definition}")
 
     @staticmethod
     def _migrate_v10_recovery_state(connection):
@@ -699,6 +729,17 @@ class LendingStateStore:
             )
         return now
 
+    @staticmethod
+    def _migrate_v11_allocation_state(connection):
+        # Tables are created in the normal initialization list. Keeping an
+        # explicit migration hook documents the durable Schema 11 boundary.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS demand_confirmation_updated_idx ON demand_confirmation_state(updated_at_ms)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS external_takeover_state_idx ON external_takeover_state(state, updated_at_ms)"
+        )
+
     def begin_recovery(
         self,
         category,
@@ -787,9 +828,7 @@ class LendingStateStore:
             ).fetchone()[0]
             if count >= int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS) and not unresolved:
                 target = row["target_mode"] if row["target_mode"] in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
-                current_mode = connection.execute(
-                    "SELECT mode FROM runtime_state WHERE singleton=1"
-                ).fetchone()[0]
+                current_mode = connection.execute("SELECT mode FROM runtime_state WHERE singleton=1").fetchone()[0]
                 connection.execute(
                     """UPDATE runtime_state SET mode=?, previous_mode=NULL, safe_reason=NULL,
                        safe_manual=0, consistent_syncs=0, last_consistent_sync_ms=NULL,
@@ -811,14 +850,10 @@ class LendingStateStore:
 
     def consume_resume_barrier(self):
         with self.transaction(immediate=True) as connection:
-            row = connection.execute(
-                "SELECT resume_pending_cycle FROM recovery_state WHERE singleton=1"
-            ).fetchone()
+            row = connection.execute("SELECT resume_pending_cycle FROM recovery_state WHERE singleton=1").fetchone()
             pending = bool(row[0])
             if pending:
-                connection.execute(
-                    "UPDATE recovery_state SET resume_pending_cycle=0 WHERE singleton=1"
-                )
+                connection.execute("UPDATE recovery_state SET resume_pending_cycle=0 WHERE singleton=1")
         return pending
 
     def clear_recovery(self):
@@ -1260,9 +1295,7 @@ class LendingStateStore:
             ).fetchone()
             active = None if previous is None else previous["selected_period"]
             selected_since = (
-                now
-                if previous is None or previous["selected_since_ms"] is None
-                else int(previous["selected_since_ms"])
+                now if previous is None or previous["selected_since_ms"] is None else int(previous["selected_since_ms"])
             )
             challenger = None
             challenger_since = None
@@ -1277,8 +1310,7 @@ class LendingStateStore:
                 old_score = score_by_period.get(int(active))
                 new_score = score_by_period.get(period)
                 qualifies = new_score is not None and (
-                    old_score is None
-                    or (new_score > old_score and new_score >= old_score * (D("1") + D(advantage)))
+                    old_score is None or (new_score > old_score and new_score >= old_score * (D("1") + D(advantage)))
                 )
                 if qualifies:
                     previous_challenger = previous["challenger_period"]
@@ -1329,6 +1361,179 @@ class LendingStateStore:
             "promoted": promoted,
             "updatedAtMs": now,
         }
+
+    def observe_demand_confirmation(
+        self,
+        strategy_version,
+        scope,
+        signal_key,
+        share,
+        below_threshold,
+        now_ms=None,
+        required_cycles=2,
+    ):
+        """Confirm a low-demand signal only across distinct five-minute buckets."""
+
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        cycle = now // 300_000
+        with self.transaction(immediate=True) as connection:
+            previous = connection.execute(
+                """SELECT * FROM demand_confirmation_state
+                   WHERE strategy_version=? AND scope=? AND signal_key=?""",
+                (str(strategy_version), str(scope), str(signal_key)),
+            ).fetchone()
+            count = 0 if previous is None else int(previous["consecutive_cycles"] or 0)
+            last_cycle = None if previous is None else previous["last_cycle"]
+            if below_threshold is None or not bool(below_threshold):
+                count = 0
+            elif last_cycle != cycle:
+                count = count + 1 if last_cycle == cycle - 1 else 1
+            confirmed = bool(count >= int(required_cycles))
+            connection.execute(
+                """INSERT INTO demand_confirmation_state(
+                       strategy_version, scope, signal_key, consecutive_cycles,
+                       confirmed, last_cycle, last_share, updated_at_ms
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(strategy_version, scope, signal_key) DO UPDATE SET
+                       consecutive_cycles=excluded.consecutive_cycles,
+                       confirmed=excluded.confirmed,
+                       last_cycle=excluded.last_cycle,
+                       last_share=excluded.last_share,
+                       updated_at_ms=excluded.updated_at_ms""",
+                (
+                    str(strategy_version),
+                    str(scope),
+                    str(signal_key),
+                    count,
+                    int(confirmed),
+                    cycle,
+                    None if share is None else _decimal_text(share),
+                    now,
+                ),
+            )
+        return {"cycles": count, "confirmed": confirmed, "cycle": cycle}
+
+    def consolidation_status(self):
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT * FROM consolidation_state WHERE singleton=1").fetchone()
+        return {} if row is None else dict(row)
+
+    def begin_consolidation(self, offer_id, wallet, offer_amount, target_period, strategy_version, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            current = connection.execute("SELECT * FROM consolidation_state WHERE singleton=1").fetchone()
+            if current is not None and current["state"] != "IDLE":
+                return dict(current)
+            connection.execute(
+                """INSERT INTO consolidation_state(
+                       singleton, state, offer_id, captured_wallet, captured_offer_amount,
+                       target_period, strategy_version, started_at_ms, updated_at_ms, last_error
+                   ) VALUES(1, 'PLANNED', ?, ?, ?, ?, ?, ?, ?, NULL)
+                   ON CONFLICT(singleton) DO UPDATE SET
+                       state='PLANNED', offer_id=excluded.offer_id,
+                       captured_wallet=excluded.captured_wallet,
+                       captured_offer_amount=excluded.captured_offer_amount,
+                       target_period=excluded.target_period,
+                       strategy_version=excluded.strategy_version,
+                       started_at_ms=excluded.started_at_ms,
+                       updated_at_ms=excluded.updated_at_ms, last_error=NULL""",
+                (
+                    int(offer_id),
+                    _decimal_text(wallet),
+                    _decimal_text(offer_amount),
+                    int(target_period),
+                    str(strategy_version),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM consolidation_state WHERE singleton=1").fetchone()
+        return dict(row)
+
+    def update_consolidation(self, state, error=None, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE consolidation_state SET state=?, last_error=?, updated_at_ms=? WHERE singleton=1",
+                (str(state), error, now),
+            )
+            row = connection.execute("SELECT * FROM consolidation_state WHERE singleton=1").fetchone()
+        return dict(row)
+
+    def clear_consolidation(self, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE consolidation_state SET state='IDLE', offer_id=NULL,
+                   captured_wallet=NULL, captured_offer_amount=NULL, target_period=NULL,
+                   strategy_version=NULL, started_at_ms=NULL, updated_at_ms=?, last_error=NULL
+                   WHERE singleton=1""",
+                (now,),
+            )
+
+    @staticmethod
+    def _takeover_digest(offer):
+        payload = {
+            key: offer.get(key)
+            for key in ("id", "amount", "amount_original", "rate", "rate_real", "period", "offer_type", "flags")
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    def observe_external_takeover(self, offer, now_ms=None, minimum_gap_ms=30_000):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        offer_id = int(offer.get("id") or offer.get("offer_id"))
+        digest = self._takeover_digest(offer)
+        with self.transaction(immediate=True) as connection:
+            previous = connection.execute(
+                "SELECT * FROM external_takeover_state WHERE offer_id=?", (offer_id,)
+            ).fetchone()
+            first_seen = now
+            state = "OBSERVED"
+            if previous is not None and previous["snapshot_digest"] == digest:
+                first_seen = int(previous["first_seen_ms"])
+                state = previous["state"]
+                if state == "OBSERVED" and now - first_seen >= int(minimum_gap_ms):
+                    state = "CONFIRMED"
+            connection.execute(
+                """INSERT INTO external_takeover_state(
+                       offer_id, state, snapshot_digest, first_seen_ms, confirmed_at_ms,
+                       updated_at_ms, last_error
+                   ) VALUES(?, ?, ?, ?, ?, ?, NULL)
+                   ON CONFLICT(offer_id) DO UPDATE SET
+                       state=excluded.state, snapshot_digest=excluded.snapshot_digest,
+                       first_seen_ms=excluded.first_seen_ms,
+                       confirmed_at_ms=excluded.confirmed_at_ms,
+                       updated_at_ms=excluded.updated_at_ms, last_error=NULL""",
+                (offer_id, state, digest, first_seen, now if state == "CONFIRMED" else None, now),
+            )
+            row = connection.execute("SELECT * FROM external_takeover_state WHERE offer_id=?", (offer_id,)).fetchone()
+        return dict(row)
+
+    def update_external_takeover(self, offer_id, state, error=None, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE external_takeover_state SET state=?, last_error=?, updated_at_ms=?
+                   WHERE offer_id=?""",
+                (str(state), error, now, int(offer_id)),
+            )
+
+    def reset_unconfirmed_external_takeovers(self):
+        """Discard snapshot confirmations after a non-authoritative account read."""
+
+        with self.transaction(immediate=True) as connection:
+            connection.execute("DELETE FROM external_takeover_state WHERE state IN ('OBSERVED', 'CONFIRMED')")
+
+    def external_takeovers(self, states=None):
+        query = "SELECT * FROM external_takeover_state"
+        params = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            query += f" WHERE state IN ({placeholders})"
+            params.extend(sorted(states))
+        query += " ORDER BY offer_id"
+        with self.read_connection() as connection:
+            return [dict(row) for row in connection.execute(query, params).fetchall()]
 
     def period_activity(self, since_ms, currency="USD"):
         """Return recent robot submissions and managed fills grouped by term."""
@@ -1705,8 +1910,7 @@ class LendingStateStore:
                 remaining
                 and confirm_absent
                 and all(
-                    candidate_counts.get(int(item["id"]), 0) == 0
-                    and str(item["offer_type"]).upper() == "LIMIT"
+                    candidate_counts.get(int(item["id"]), 0) == 0 and str(item["offer_type"]).upper() == "LIMIT"
                     for item in remaining
                 )
             ):
@@ -2295,6 +2499,17 @@ class LendingStateStore:
                     """INSERT INTO ownership_events(offer_id, credit_id, event_type, details_json, created_at_ms)
                        VALUES(?, NULL, 'ADOPT_EXTERNAL', ?, ?)""",
                     (raw_id, json.dumps({"strategyVersion": str(strategy_version)}, sort_keys=True), now),
+                )
+                connection.execute(
+                    """INSERT INTO external_takeover_state(
+                           offer_id, state, snapshot_digest, first_seen_ms,
+                           confirmed_at_ms, updated_at_ms, last_error
+                       ) VALUES(?, 'ADOPTED', ?, ?, ?, ?, NULL)
+                       ON CONFLICT(offer_id) DO UPDATE SET
+                           state='ADOPTED', snapshot_digest=excluded.snapshot_digest,
+                           confirmed_at_ms=excluded.confirmed_at_ms,
+                           updated_at_ms=excluded.updated_at_ms, last_error=NULL""",
+                    (raw_id, self._takeover_digest(normalized[raw_id]), now, now, now),
                 )
                 adopted.append(raw_id)
         return adopted

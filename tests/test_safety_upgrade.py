@@ -163,12 +163,12 @@ def test_manual_safe_resolution_returns_only_to_paused():
     assert mode_after_ambiguous_resolution(0, "LIVE", False) == "LIVE"
 
 
-def test_schema_v10_is_explicit(tmp_path):
+def test_schema_v11_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "10"
+    assert version == "11"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
@@ -192,7 +192,7 @@ def test_schema_v10_is_explicit(tmp_path):
     assert store.recovery_status()["requiredSnapshots"] == 2
 
 
-def test_schema_v10_migrates_offer_history_without_losing_rows(tmp_path):
+def test_schema_v11_migrates_offer_history_without_losing_rows(tmp_path):
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -220,7 +220,7 @@ def test_schema_v10_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "10"
+    assert version == "11"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 

@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.2 / V3.2
+# Bitfinex-lendingbot 0.3.3 / V3.3
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -22,17 +22,19 @@
 
 - 仅支持 `USD`，期限限定为 Bitfinex Funding 的 2–120 天。
 - API 必须允许 wallets 读取、funding 读取/写入；withdraw 与 ui_withdraw 写权限必须关闭。
-- 机器人默认只撤改 SQLite 中能够证明归属的挂单。开启“接管外部挂单”后，只有 LIVE 预检逐笔列出并人工确认的 USD 挂单会转为托管；运行中新出现的外部单仍不会自动接管。
+- 机器人只撤改 SQLite 中能够证明归属的挂单。V3.3 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
 - 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；超过 `max(150 USD, 2%)` 容差时分阶段再平衡。
 - 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
 - 网络、市场数据和普通运行故障在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。只有出现多个可能匹配时才保持人工 SAFE。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
-- SQLite 使用显式 Schema 10。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
+- SQLite 使用显式 Schema 11。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
 
 V3.2 的无人值守恢复边界、退避、双快照确认和 Worker 心跳守护见 [V3.2 自动自愈说明](docs/v3.2-unattended-recovery.md)。
+
+V3.3 的全市场需求分配、150 USD 低需求池保留、小额余额合并复投与外部挂单接管见 [V3.3 策略说明](docs/v3.3-demand-allocation.md)。
 
 ## 快速开始
 
@@ -104,7 +106,7 @@ python -m pip install -r requirements-dev.txt
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.2`
+- 应用/User-Agent：`0.3.3`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`
