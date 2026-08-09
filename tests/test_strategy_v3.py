@@ -17,7 +17,7 @@ from RuntimeV3 import (
     build_active_credit_dashboard,
     parse_ledger_rows_v3,
 )
-from StateStore import InsufficientReservedBalance, LendingStateStore, StateStoreError
+from StateStore import InsufficientReservedBalance, LendingStateStore
 from StrategyV3 import (
     StrategyPolicyV3,
     _candidate_types,
@@ -1954,19 +1954,17 @@ def test_new_strategy_chain_recovers_latest_predecessor_for_existing_offer(tmp_p
     assert D(inherited["market_anchor_rate"]) == D("0.0004")
 
 
-def test_ambiguous_resolution_requires_operator_and_returns_paused():
+def test_ambiguous_resolution_continues_read_only_recovery_and_returns_paused():
     with tempfile.TemporaryDirectory() as directory:
         store = LendingStateStore(f"{directory}/state.sqlite3")
         store.set_mode("LIVE", "test")
         _, intent = store.reserve_intent(intent_order(), D("1000"))
         store.mark_submitting(intent["id"])
         store.mark_ambiguous(intent["id"], "timeout")
-        assert store.runtime()["mode"] == "PAUSED" and store.runtime()["safe_manual"] == 1
+        assert store.runtime()["mode"] == "PAUSED" and store.runtime()["safe_manual"] == 0
         store.enter_protected_pause("MARKET_DATA_STALE")
-        assert store.runtime()["safe_manual"] == 1
-        assert store.runtime()["safe_reason"].startswith("AMBIGUOUS_SUBMIT")
-        with pytest.raises(StateStoreError):
-            store.set_mode("PAUSED", "bypass")
+        assert store.runtime()["safe_manual"] == 0
+        assert store.recovery_status()["targetMode"] == "LIVE"
         result = store.resolve_ambiguous_intent(intent["id"], close=True)
         assert result["intent"]["state"] == "CLOSED"
         assert result["runtime"]["mode"] == "PAUSED"

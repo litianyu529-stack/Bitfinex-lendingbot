@@ -159,12 +159,12 @@ def test_manual_protected_pause_resolution_remains_paused():
     assert can_clear_ambiguous_pause(0, "LIVE", False) is False
 
 
-def test_schema_v12_is_explicit(tmp_path):
+def test_schema_v13_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "12"
+    assert version == "13"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
@@ -186,7 +186,7 @@ def test_schema_v12_is_explicit(tmp_path):
     assert store.recovery_status()["requiredSnapshots"] == 2
 
 
-def test_schema_v12_folds_legacy_safe_runtime_into_protected_paused(tmp_path):
+def test_schema_v13_folds_legacy_safe_runtime_into_auto_recovery_paused(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = LendingStateStore(path)
     with store.transaction(immediate=True) as connection:
@@ -202,22 +202,17 @@ def test_schema_v12_folds_legacy_safe_runtime_into_protected_paused(tmp_path):
     assert runtime["mode"] == "PAUSED"
     assert runtime["previous_mode"] == "LIVE"
     assert runtime["safe_reason"] == "AMBIGUOUS_SUBMIT:7"
-    assert runtime["safe_manual"] == 1
+    assert runtime["safe_manual"] == 0
     assert list((tmp_path / "backups").glob("schema-v11-*.sqlite3"))
 
 
-def test_safe_is_no_longer_a_runtime_mode_and_manual_guard_cannot_be_cleared(tmp_path):
+def test_safe_is_no_longer_a_runtime_mode(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with pytest.raises(StateStoreError):
         store.set_mode("SAFE", "legacy")
-    store.enter_protected_pause("AMBIGUOUS_SUBMIT:7", manual=True)
-    with pytest.raises(StateStoreError):
-        store.set_mode("LIVE", "bypass")
-    with pytest.raises(StateStoreError):
-        store.set_mode("PAUSED", "bypass")
 
 
-def test_schema_v12_migrates_offer_history_without_losing_rows(tmp_path):
+def test_schema_v13_migrates_offer_history_without_losing_rows(tmp_path):
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -245,7 +240,7 @@ def test_schema_v12_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "12"
+    assert version == "13"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 
@@ -291,7 +286,7 @@ def test_restart_closes_only_never_sent_intent(tmp_path):
     assert (recovered["state"], recovered["resolution"]) == ("CLOSED", "PROCESS_RESTART_BEFORE_SEND")
 
 
-def test_restart_after_send_enters_manual_protected_pause(tmp_path):
+def test_restart_after_send_enters_auto_recovery_protected_pause(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     _, intent = store.reserve_intent(order(), D("500"))
     store.mark_submitting(intent["id"])
@@ -299,7 +294,7 @@ def test_restart_after_send_enters_manual_protected_pause(tmp_path):
     assert result["ambiguousAfterSend"] == 1
     assert store.intent(intent["id"])["state"] == "AMBIGUOUS"
     assert store.runtime()["mode"] == "PAUSED"
-    assert store.runtime()["safe_manual"] == 1
+    assert store.runtime()["safe_manual"] == 0
 
 
 class SubmitClient:
@@ -531,7 +526,7 @@ def test_submit_plan_persists_sixty_attempt_rolling_limit_and_resumes(tmp_path):
 def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.set_mode("LIVE", "test")
-    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001", manual=True)
+    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001")
 
     store.observe_ambiguous_cancel({9001}, now_ms=1_000_000)
     store.observe_ambiguous_cancel({9001}, now_ms=1_020_000)
@@ -551,7 +546,7 @@ def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path)
 def test_ambiguous_cancel_absent_automatically_resumes_live(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.set_mode("LIVE", "test")
-    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001", manual=True)
+    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001")
 
     store.observe_ambiguous_cancel(set(), now_ms=1_000_000)
     store.observe_ambiguous_cancel(set(), now_ms=1_030_000)

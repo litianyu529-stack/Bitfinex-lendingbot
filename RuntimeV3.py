@@ -312,7 +312,7 @@ class LendingRuntimeV3:
             return
         recovery = self.store.recover_incomplete_writes()
         if recovery["ambiguousAfterSend"]:
-            self._log(f"检测到 {recovery['ambiguousAfterSend']} 个进程中断时未确认的写入；已进入人工 PAUSED。")
+            self._log(f"检测到 {recovery['ambiguousAfterSend']} 个进程中断时未确认的写入；已进入自动对账 PAUSED。")
         if self.store.strategy("ACTIVE") is None:
             self.store.save_strategy(json_decimal(self.policy.__dict__), status="ACTIVE")
         else:
@@ -1359,7 +1359,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": reason, "error": write.error},
                 )
-                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
                 self._log(write.error)
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:
@@ -1431,7 +1431,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": "ratio_rebalance", "error": write.error},
                 )
-                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
                 self._log(f"撤销 Offer {offer_id} 结果未知，将自动对账后重试：{write.error}")
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:
@@ -1709,7 +1709,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": f"{reason_prefix}:{reason}", "error": write.error},
                 )
-                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
                 self._log(f"撤销 Offer {offer_id} 结果未知，将自动对账后重试：{write.error}")
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:

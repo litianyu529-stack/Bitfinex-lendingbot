@@ -95,7 +95,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 12:
+        if version >= 13:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -509,9 +509,10 @@ class LendingStateStore:
             self._migrate_v10_recovery_state(connection)
             self._migrate_v11_allocation_state(connection)
             self._migrate_v12_single_paused_mode(connection)
+            self._migrate_v13_unattended_recovery(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '12')
-                   ON CONFLICT(key) DO UPDATE SET value='12'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '13')
+                   ON CONFLICT(key) DO UPDATE SET value='13'"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
@@ -578,6 +579,19 @@ class LendingStateStore:
         connection.execute("UPDATE runtime_state SET previous_mode='PAUSED' WHERE previous_mode='SAFE'")
         connection.execute("UPDATE recovery_state SET origin_mode='PAUSED' WHERE origin_mode='SAFE'")
         connection.execute("UPDATE recovery_state SET target_mode='PAUSED' WHERE target_mode='SAFE'")
+
+    @staticmethod
+    def _migrate_v13_unattended_recovery(connection):
+        # Only an explicit Dashboard pause stops recovery. Older versions used
+        # these flags for non-manual failures; release them into the read-only
+        # recovery loop without allowing any speculative write.
+        connection.execute("UPDATE runtime_state SET safe_manual=0")
+        connection.execute(
+            """UPDATE recovery_state
+               SET manual_required=0,
+                   next_probe_at_ms=COALESCE(next_probe_at_ms, started_at_ms)
+               WHERE active=1"""
+        )
 
     @staticmethod
     def _migrate_v3_audit_columns(connection):
@@ -1704,7 +1718,7 @@ class LendingStateStore:
             write_phase="UNKNOWN",
             resolution="MANUAL_REQUIRED",
         )
-        self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{intent_id}", manual=True)
+        self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{intent_id}")
         return self.intent(intent_id)
 
     def recover_incomplete_writes(self):
@@ -1741,15 +1755,15 @@ class LendingStateStore:
                     ),
                 )
         for row in submitting:
-            self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{row['id']}", manual=True)
+            self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{row['id']}")
         return {"closedBeforeSend": planned, "ambiguousAfterSend": len(submitting)}
 
     def resolve_ambiguous_intent(self, intent_id, exchange_offer_id=None, close=False):
         """Resolve an uncertain write only after an operator has reconciled it.
 
         Binding requires a concrete exchange id.  Closing means the operator has
-        confirmed that no offer exists. A protected manual pause stays PAUSED so
-        that resuming LIVE still requires the normal preflight confirmation.
+        confirmed that no offer exists. The protected pause remains read-only
+        until the normal two-snapshot recovery barrier completes.
         """
         now = self._now_ms()
         with self.transaction(immediate=True) as connection:
@@ -1971,11 +1985,7 @@ class LendingStateStore:
                 )
             if not remaining and (resolved or closed_absent):
                 runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
-                if (
-                    runtime["mode"] == "PAUSED"
-                    and runtime["safe_manual"]
-                    and str(runtime["safe_reason"] or "").startswith("AMBIGUOUS_SUBMIT:")
-                ):
+                if runtime["mode"] == "PAUSED" and str(runtime["safe_reason"] or "").startswith("AMBIGUOUS_SUBMIT:"):
                     self._resume_protected_pause(
                         connection,
                         runtime,

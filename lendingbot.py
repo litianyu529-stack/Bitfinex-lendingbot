@@ -972,11 +972,11 @@ def reconcile_orphaned_live_runtime(config_path, context=None):
     external = external_live_process(config_path, context)
     if external and external.get("buildMismatch"):
         if external.get("stateError"):
-            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
+            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED")
             return store.runtime()
         identity_error = _live_process_identity_error(external)
         if identity_error:
-            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
+            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED")
             return store.runtime()
         stop_controlled_bot(config_path, reason="worker_build_mismatch", context=context)
         store.set_mode("PAUSED", "worker_build_mismatch_stopped")
@@ -1698,13 +1698,22 @@ def worker_supervisor_loop(config_path, status_path, context):
                 store.begin_recovery(
                     "SUPERVISOR_AUTHORIZATION_INVALID",
                     "Dashboard session, build, configuration, or strategy changed",
-                    origin_mode=recovery.get("originMode") or "PAUSED",
-                    target_mode="PAUSED",
-                    manual_required=True,
+                    origin_mode=recovery.get("originMode") or "LIVE",
+                    target_mode=recovery.get("targetMode") or "LIVE",
                 )
-                state.auto_restart_authorization = None
-                state.stop_reason = "watchdog_authorization_invalid"
-                continue
+                # The same Dashboard session can safely refresh its own
+                # authorization after a build/configuration change. A fresh
+                # preflight below still proves account, credentials and plan
+                # before any worker restart.
+                active = store.strategy("ACTIVE") or {}
+                authorization = {
+                    "session": state.supervisor_session,
+                    "configDigest": config_sha256(config_path),
+                    "buildId": worker_build_id(),
+                    "strategyVersion": active.get("version_id"),
+                    "authorizedAt": context.now(),
+                }
+                state.auto_restart_authorization = authorization
             preflight = create_controlled_bot_preflight(config_path, context=context)
             if not preflight.get("canStart") or not preflight.get("preflightId"):
                 store.record_recovery_failure("watchdog preflight did not pass", "WATCHDOG_PREFLIGHT", now_ms)
@@ -1721,18 +1730,7 @@ def worker_supervisor_loop(config_path, status_path, context):
             try:
                 store, _ = v3_store_for_config(config_path)
                 decision = classify_runtime_error(exc)
-                if decision.retryable:
-                    store.record_recovery_failure(str(exc), decision.category)
-                else:
-                    recovery = store.recovery_status()
-                    store.begin_recovery(
-                        decision.category,
-                        str(exc),
-                        origin_mode=recovery.get("originMode") or "PAUSED",
-                        target_mode="PAUSED",
-                        manual_required=True,
-                    )
-                    state.auto_restart_authorization = None
+                store.record_recovery_failure(str(exc), decision.category)
             except Exception:
                 state.auto_restart_authorization = None
 
@@ -1864,9 +1862,7 @@ def publish_safe_status(log, store, exc):
     decision = classify_runtime_error(exc)
     reason = f"{decision.category}:{type(exc).__name__}"
     current = store.runtime()
-    if current.get("safe_manual"):
-        runtime = current
-    elif decision.retryable:
+    if decision.retryable:
         recovery = store.recovery_status()
         origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
         if current["mode"] != "PAUSED":
@@ -1881,18 +1877,9 @@ def publish_safe_status(log, store, exc):
             manual_required=False,
         )
         store.record_recovery_failure(str(exc), decision.category)
-    else:
-        # Account reconciliation can prove that balances are consistent, but it
-        # cannot prove that an unknown programming error has disappeared. Keep
-        # the worker read-only until an operator restarts it after investigation.
+    else:  # Defensive fallback if a future classifier adds a non-retryable type.
         runtime = store.set_mode("PAUSED", reason)
-        store.begin_recovery(
-            decision.category,
-            str(exc),
-            origin_mode=current["mode"],
-            target_mode="PAUSED",
-            manual_required=True,
-        )
+        store.begin_recovery(decision.category, str(exc), origin_mode=current["mode"], target_mode=current["mode"])
     log.updateMetaValue("schemaVersion", STATUS_SCHEMA_VERSION)
     log.updateMetaValue("operationMode", runtime["mode"])
     log.updateMetaValue("runtime", runtime)

@@ -30,16 +30,12 @@ def recovery_delay_seconds(attempts: int) -> int:
 
 
 def classify_runtime_error(exc: BaseException) -> RecoveryDecision:
-    """Classify only errors that are safe to retry without a trading write."""
+    """Classify failures for read-only recovery; no error resumes trading directly."""
 
     if isinstance(exc, BitfinexAmbiguousWriteError):
-        return RecoveryDecision("AMBIGUOUS_WRITE", False, True)
+        return RecoveryDecision("AMBIGUOUS_WRITE", True)
     if isinstance(exc, BitfinexApiError):
-        return RecoveryDecision(
-            getattr(exc, "category", "BITFINEX_API"),
-            bool(getattr(exc, "retryable", False)),
-            bool(getattr(exc, "manual_required", False)),
-        )
+        return RecoveryDecision(getattr(exc, "category", "BITFINEX_API"), True)
     if isinstance(
         exc,
         (
@@ -56,10 +52,10 @@ def classify_runtime_error(exc: BaseException) -> RecoveryDecision:
         text = str(exc).lower()
         if "locked" in text or "busy" in text:
             return RecoveryDecision("DATABASE_BUSY", True)
-        return RecoveryDecision("DATABASE_ERROR", False, True)
+        return RecoveryDecision("DATABASE_ERROR", True)
     if isinstance(exc, (TypeError, AssertionError, ValueError)):
-        return RecoveryDecision("PROGRAM_ERROR", False, True)
-    return RecoveryDecision("UNEXPECTED_RUNTIME_ERROR", False, True)
+        return RecoveryDecision("PROGRAM_ERROR", True)
+    return RecoveryDecision("UNEXPECTED_RUNTIME_ERROR", True)
 
 
 def recovery_category_for_reason(reason: str) -> str | None:
@@ -72,4 +68,6 @@ def recovery_category_for_reason(reason: str) -> str | None:
         return "AMBIGUOUS_WRITE"
     if value.startswith("AMBIGUOUS_SUBMIT:") or value.startswith("AMBIGUOUS_CANCEL:"):
         return "AMBIGUOUS_WRITE"
+    if value == "WORKER_BUILD_MISMATCH_UNVERIFIED":
+        return "WORKER_BUILD"
     return None

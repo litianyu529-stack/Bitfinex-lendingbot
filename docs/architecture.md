@@ -35,4 +35,4 @@ flowchart LR
 
 订单写入从 `PLANNED → SUBMITTING → CONFIRMED/CLOSED/AMBIGUOUS`。`write_phase` 记录是否可能已经发往交易所，`resolution` 记录恢复结论，`strategy_variant` 记录基线或候选归属。只有确认绑定 `exchange_offer_id` 的订单才成为机器人托管订单。
 
-运行模式为 `PAUSED / LIVE / REPLAY / APPLYING`。所有停止写入的情况统一显示为 `PAUSED`。普通故障在两次完整 REST 同步后恢复；不确定撤单通过重复 Offers 快照对账；不确定提交通过请求时间附近的 Offers、Funding Trades 和历史 Offers 对账。唯一匹配或稳定确认不存在时恢复此前模式，只有多重候选才要求人工处理。保护原因和是否需要人工处理仍单独持久化，不会因为合并状态而放宽写入条件。
+运行模式为 `PAUSED / LIVE / REPLAY / APPLYING`。所有停止写入的情况统一显示为 `PAUSED`。除人工暂停外，所有故障均按退避执行只读恢复；不确定撤单通过重复 Offers 快照对账；不确定提交通过请求时间附近的 Offers、Funding Trades 和历史 Offers 对账。唯一匹配或稳定确认不存在时恢复此前模式；多重候选持续自动对账，但在证据唯一前保持只读。保护原因仍单独持久化，不会因为合并状态而放宽写入条件。
