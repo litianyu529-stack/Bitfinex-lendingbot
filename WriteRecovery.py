@@ -26,7 +26,5 @@ def unique_unbound_candidate(candidate_ids, already_bound=()):
     return candidates.pop() if len(candidates) == 1 else None
 
 
-def mode_after_ambiguous_resolution(unresolved_count, runtime_mode, safe_manual):
-    if int(unresolved_count) == 0 and str(runtime_mode).upper() == "SAFE" and bool(safe_manual):
-        return "PAUSED"
-    return str(runtime_mode).upper()
+def can_clear_ambiguous_pause(unresolved_count, runtime_mode, protected_manual):
+    return int(unresolved_count) == 0 and str(runtime_mode).upper() == "PAUSED" and bool(protected_manual)

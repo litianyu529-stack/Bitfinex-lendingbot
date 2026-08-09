@@ -864,7 +864,7 @@ def read_status_payload(status_path):
             payload = json.load(file)
     except (OSError, ValueError):
         payload = None
-    valid_modes = {"live", "LIVE", "PAUSED", "REPLAY", "SAFE", "APPLYING"}
+    valid_modes = {"live", "LIVE", "PAUSED", "REPLAY", "APPLYING"}
     if (
         not isinstance(payload, dict)
         or payload.get("schemaVersion") != STATUS_SCHEMA_VERSION
@@ -915,7 +915,7 @@ def dashboard_status_payload(status_path, config_path, context=None):
             empty["log"] = list(payload.get("log") or [])
             empty["runtime"] = runtime
             empty["recovery"] = recovery
-            empty["operationMode"] = "PAUSED" if runtime["mode"] != "SAFE" else "SAFE"
+            empty["operationMode"] = "PAUSED"
             empty["last_status"] = f"机器人进程已停止（{stop_reason_message(stop_reason)}）；账户与挂单快照当前不可用。"
             empty["lastStopReason"] = stop_reason
             empty["snapshotAvailable"] = False
@@ -932,9 +932,11 @@ def dashboard_status_payload(status_path, config_path, context=None):
             and account.get("total") is not None
         )
         if runtime["mode"] == "PAUSED":
-            payload["last_status"] = "策略已暂停；实盘进程仍在运行。"
-        elif runtime["mode"] == "SAFE":
-            payload["last_status"] = f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}"
+            payload["last_status"] = (
+                f"PAUSED：{runtime.get('safe_reason')}"
+                if runtime.get("safe_reason")
+                else "策略已暂停；实盘进程仍在运行。"
+            )
         payload.update(stats_v3_payload(store))
     except Exception as exc:
         unavailable = empty_status_payload()
@@ -970,11 +972,11 @@ def reconcile_orphaned_live_runtime(config_path, context=None):
     external = external_live_process(config_path, context)
     if external and external.get("buildMismatch"):
         if external.get("stateError"):
-            store.enter_safe("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
+            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
             return store.runtime()
         identity_error = _live_process_identity_error(external)
         if identity_error:
-            store.enter_safe("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
+            store.enter_protected_pause("WORKER_BUILD_MISMATCH_UNVERIFIED", manual=True)
             return store.runtime()
         stop_controlled_bot(config_path, reason="worker_build_mismatch", context=context)
         store.set_mode("PAUSED", "worker_build_mismatch_stopped")
@@ -1534,6 +1536,11 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None, p
             # restarts retain that episode so the two-snapshot write barrier
             # still applies.
             store.clear_recovery()
+            runtime = store.runtime()
+            if runtime.get("safe_manual"):
+                raise ConfigError("存在需要人工确认的未决写入，不能启动实盘")
+            if runtime.get("safe_reason"):
+                store.set_mode("PAUSED", "manual_start_reset")
         os.makedirs(os.path.dirname(status_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(context.process_log_path) or ".", exist_ok=True)
 
@@ -1665,7 +1672,7 @@ def worker_supervisor_loop(config_path, status_path, context):
                 target = recovery.get("targetMode") or runtime.get("previous_mode") or runtime["mode"]
                 if target not in {"LIVE", "PAUSED", "REPLAY"}:
                     target = "LIVE"
-                if runtime["mode"] != "SAFE":
+                if runtime["mode"] != "PAUSED":
                     store.set_mode("PAUSED", "AUTO_RECOVERY:WORKER_HEARTBEAT_TIMEOUT")
                 store.begin_recovery(
                     "WORKER_HEARTBEAT_TIMEOUT",
@@ -1857,12 +1864,12 @@ def publish_safe_status(log, store, exc):
     decision = classify_runtime_error(exc)
     reason = f"{decision.category}:{type(exc).__name__}"
     current = store.runtime()
-    if current["mode"] == "SAFE" and current.get("safe_manual"):
+    if current.get("safe_manual"):
         runtime = current
     elif decision.retryable:
         recovery = store.recovery_status()
         origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
-        if current["mode"] != "SAFE":
+        if current["mode"] != "PAUSED":
             runtime = store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
         else:
             runtime = current
@@ -2066,10 +2073,10 @@ def main(argv=None):
     client = Bitfinex(settings.api_key, settings.api_secret)
     state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
     _, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
-    # Preserve a durable SAFE across process restarts so bootstrap can reconcile
+    # Preserve a durable protected PAUSED across process restarts so bootstrap can reconcile
     # the uncertain exchange write from authoritative account data. Normal
     # PAUSED starts still transition directly to LIVE after the confirmed preflight.
-    if state_store_v3.runtime()["mode"] != "SAFE":
+    if not state_store_v3.runtime().get("safe_reason"):
         state_store_v3.set_mode("LIVE", "live_preflight_confirmed")
     runtime_v3 = LendingRuntimeV3(
         client,
@@ -2141,7 +2148,7 @@ def main(argv=None):
         pass
     finally:
         runtime_v3.shutdown()
-        if state_store_v3.runtime()["mode"] != "SAFE":
+        if not state_store_v3.runtime().get("safe_reason"):
             state_store_v3.set_mode("PAUSED", "live_process_stopped")
         if settings.web_server:
             stop_web_server(log, context)

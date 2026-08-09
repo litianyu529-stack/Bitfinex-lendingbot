@@ -35,11 +35,7 @@ from StrategyV3 import (
     policy_v3_to_json,
     replay_strategy_v3,
 )
-from WriteRecovery import (
-    mode_after_ambiguous_resolution,
-    restart_transition,
-    unique_unbound_candidate,
-)
+from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
 from bitfinex import Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError
 
 
@@ -157,18 +153,18 @@ def test_unique_candidate_requires_exactly_one_unbound_id():
     assert unique_unbound_candidate({1, 2}, set()) is None
 
 
-def test_manual_safe_resolution_returns_only_to_paused():
-    assert mode_after_ambiguous_resolution(0, "SAFE", True) == "PAUSED"
-    assert mode_after_ambiguous_resolution(1, "SAFE", True) == "SAFE"
-    assert mode_after_ambiguous_resolution(0, "LIVE", False) == "LIVE"
+def test_manual_protected_pause_resolution_remains_paused():
+    assert can_clear_ambiguous_pause(0, "PAUSED", True) is True
+    assert can_clear_ambiguous_pause(1, "PAUSED", True) is False
+    assert can_clear_ambiguous_pause(0, "LIVE", False) is False
 
 
-def test_schema_v11_is_explicit(tmp_path):
+def test_schema_v12_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "11"
+    assert version == "12"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
@@ -180,9 +176,7 @@ def test_schema_v11_is_explicit(tmp_path):
         ).fetchone()
         reprice_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_events)")}
         reprice_chain_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
-        offer_history_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(offer_history)")
-        }
+        offer_history_columns = {row["name"] for row in connection.execute("PRAGMA table_info(offer_history)")}
     assert "attribution_state" in credit_columns
     assert ownership_table is not None
     assert reprice_chain_table is not None
@@ -192,7 +186,38 @@ def test_schema_v11_is_explicit(tmp_path):
     assert store.recovery_status()["requiredSnapshots"] == 2
 
 
-def test_schema_v11_migrates_offer_history_without_losing_rows(tmp_path):
+def test_schema_v12_folds_legacy_safe_runtime_into_protected_paused(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    store = LendingStateStore(path)
+    with store.transaction(immediate=True) as connection:
+        connection.execute("UPDATE schema_meta SET value='11' WHERE key='schema_version'")
+        connection.execute(
+            """UPDATE runtime_state SET mode='SAFE', previous_mode='LIVE',
+               safe_reason='AMBIGUOUS_SUBMIT:7', safe_manual=1 WHERE singleton=1"""
+        )
+
+    migrated = LendingStateStore(path)
+
+    runtime = migrated.runtime()
+    assert runtime["mode"] == "PAUSED"
+    assert runtime["previous_mode"] == "LIVE"
+    assert runtime["safe_reason"] == "AMBIGUOUS_SUBMIT:7"
+    assert runtime["safe_manual"] == 1
+    assert list((tmp_path / "backups").glob("schema-v11-*.sqlite3"))
+
+
+def test_safe_is_no_longer_a_runtime_mode_and_manual_guard_cannot_be_cleared(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    with pytest.raises(StateStoreError):
+        store.set_mode("SAFE", "legacy")
+    store.enter_protected_pause("AMBIGUOUS_SUBMIT:7", manual=True)
+    with pytest.raises(StateStoreError):
+        store.set_mode("LIVE", "bypass")
+    with pytest.raises(StateStoreError):
+        store.set_mode("PAUSED", "bypass")
+
+
+def test_schema_v12_migrates_offer_history_without_losing_rows(tmp_path):
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -220,7 +245,7 @@ def test_schema_v11_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "11"
+    assert version == "12"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 
@@ -266,14 +291,14 @@ def test_restart_closes_only_never_sent_intent(tmp_path):
     assert (recovered["state"], recovered["resolution"]) == ("CLOSED", "PROCESS_RESTART_BEFORE_SEND")
 
 
-def test_restart_after_send_enters_manual_safe(tmp_path):
+def test_restart_after_send_enters_manual_protected_pause(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     _, intent = store.reserve_intent(order(), D("500"))
     store.mark_submitting(intent["id"])
     result = store.recover_incomplete_writes()
     assert result["ambiguousAfterSend"] == 1
     assert store.intent(intent["id"])["state"] == "AMBIGUOUS"
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     assert store.runtime()["safe_manual"] == 1
 
 
@@ -307,11 +332,11 @@ def submit_once(tmp_path, write_result):
     return store, client, result
 
 
-def test_unknown_submit_is_not_retried_and_enters_safe(tmp_path):
+def test_unknown_submit_is_not_retried_and_enters_protected_pause(tmp_path):
     store, client, submitted = submit_once(tmp_path, WriteResult(WriteOutcome.UNKNOWN, error="timeout"))
     assert client.calls == 1
     assert submitted == []
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     assert store.intents()[0]["state"] == "AMBIGUOUS"
 
 
@@ -361,7 +386,7 @@ def test_unique_authoritative_offer_requires_two_clean_snapshots_then_pauses(tmp
     store.reconcile_offers([matching_offer(9001)])
     resolved = store.reconcile_ambiguous_candidates()
     assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     base = store.recovery_status()["lastProbeAt"]
     store.record_consistent_sync(base + 30_000)
     store.record_consistent_sync(base + 60_000)
@@ -386,7 +411,7 @@ def test_multiple_authoritative_matches_stay_manual_safe(tmp_path):
     store.reconcile_offers([matching_offer(9001), matching_offer(9002)])
     assert store.reconcile_ambiguous_candidates() == []
     assert store.intent(intent["id"])["state"] == "AMBIGUOUS"
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
 
 
 def test_unique_ambiguous_submit_match_automatically_resumes_live(tmp_path):
@@ -400,7 +425,7 @@ def test_unique_ambiguous_submit_match_automatically_resumes_live(tmp_path):
     resolved = store.reconcile_ambiguous_candidates(now_ms=1_000_000)
 
     assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.record_consistent_sync(1_030_000)
     store.record_consistent_sync(1_060_000)
     assert store.runtime()["mode"] == "LIVE"
@@ -417,10 +442,10 @@ def test_ambiguous_submit_absence_requires_two_authoritative_history_snapshots(t
 
     store.reconcile_ambiguous_candidates(confirm_absent=False, now_ms=1_000_000)
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=1_030_000)
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=1_060_000)
 
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.record_consistent_sync(1_090_000)
     store.record_consistent_sync(1_120_000)
     assert store.runtime()["mode"] == "LIVE"
@@ -506,14 +531,14 @@ def test_submit_plan_persists_sixty_attempt_rolling_limit_and_resumes(tmp_path):
 def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.set_mode("LIVE", "test")
-    store.enter_safe("AMBIGUOUS_CANCEL:9001", manual=True)
+    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001", manual=True)
 
     store.observe_ambiguous_cancel({9001}, now_ms=1_000_000)
     store.observe_ambiguous_cancel({9001}, now_ms=1_020_000)
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.observe_ambiguous_cancel({9001}, now_ms=1_030_000)
 
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.record_consistent_sync(1_060_000)
     store.record_consistent_sync(1_090_000)
     assert store.runtime()["mode"] == "LIVE"
@@ -526,12 +551,12 @@ def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path)
 def test_ambiguous_cancel_absent_automatically_resumes_live(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.set_mode("LIVE", "test")
-    store.enter_safe("AMBIGUOUS_CANCEL:9001", manual=True)
+    store.enter_protected_pause("AMBIGUOUS_CANCEL:9001", manual=True)
 
     store.observe_ambiguous_cancel(set(), now_ms=1_000_000)
     store.observe_ambiguous_cancel(set(), now_ms=1_030_000)
 
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     store.record_consistent_sync(1_060_000)
     store.record_consistent_sync(1_090_000)
     assert store.runtime()["mode"] == "LIVE"
@@ -672,7 +697,7 @@ def test_empty_authoritative_histories_automatically_resume_live(tmp_path):
 
     assert runtime.sync_ambiguous_write_history([intent], request_ms + 60_000) is True
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 60_000)
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     assert runtime.sync_ambiguous_write_history([intent], request_ms + 90_000) is True
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 90_000)
 
@@ -882,9 +907,7 @@ def test_live_market_context_requests_latest_trades_before_applying_limit():
             return []
 
     client = LatestClient()
-    _book, trades, _stats, _signals, warnings = lendingbot.load_v3_market_context(
-        client, policy(), now
-    )
+    _book, trades, _stats, _signals, warnings = lendingbot.load_v3_market_context(client, policy(), now)
     assert warnings == []
     assert client.trade_kwargs["sort"] == -1
     assert [row["id"] for row in trades] == ["1", "2"]

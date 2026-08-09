@@ -76,7 +76,7 @@ def test_failed_probe_resets_consecutive_snapshot_count(tmp_path):
     assert store.runtime()["mode"] == "LIVE"
 
 
-def test_secondary_market_stale_safe_keeps_original_live_recovery_target(tmp_path):
+def test_secondary_market_stale_pause_keeps_original_live_recovery_target(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: 1000)
     store.set_mode("LIVE", "test")
     store.set_mode("PAUSED", "AUTO_RECOVERY:NETWORK_TRANSPORT")
@@ -89,11 +89,11 @@ def test_secondary_market_stale_safe_keeps_original_live_recovery_target(tmp_pat
     )
 
     # This is the exact production sequence: the failed REST probe leaves the
-    # cached market stale, which enters SAFE while runtime mode is already PAUSED.
-    store.enter_safe("MARKET_DATA_STALE")
+    # cached market stale, which adds a protected pause while runtime is PAUSED.
+    store.enter_protected_pause("MARKET_DATA_STALE")
 
     recovery = store.recovery_status()
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     assert recovery["originMode"] == "LIVE"
     assert recovery["targetMode"] == "LIVE"
     store.record_consistent_sync(1_030_000)
@@ -126,7 +126,7 @@ def test_manual_dashboard_pause_clears_auto_recovery(tmp_path):
     assert not store.recovery_status()["active"]
 
 
-def test_schema_11_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_path):
+def test_schema_12_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = LendingStateStore(path)
     store.set_mode("PAUSED", "dashboard_stop")
@@ -134,7 +134,7 @@ def test_schema_11_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         recovery_rows = connection.execute("SELECT COUNT(*) FROM recovery_state").fetchone()[0]
-    assert (version, integrity, recovery_rows) == ("11", "ok", 1)
+    assert (version, integrity, recovery_rows) == ("12", "ok", 1)
 
 
 class OneSupervisorIteration:

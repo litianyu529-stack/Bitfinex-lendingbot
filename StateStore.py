@@ -7,11 +7,7 @@ import time
 from contextlib import contextmanager
 from decimal import Decimal
 
-from WriteRecovery import (
-    mode_after_ambiguous_resolution,
-    restart_transition,
-    unique_unbound_candidate,
-)
+from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
 from Recovery import (
     RECOVERY_MINIMUM_GAP_MS,
     RECOVERY_REQUIRED_SNAPSHOTS,
@@ -21,9 +17,9 @@ from Recovery import (
 
 
 D = Decimal
-RUNTIME_MODES = {"PAUSED", "LIVE", "REPLAY", "SAFE", "APPLYING"}
+RUNTIME_MODES = {"PAUSED", "LIVE", "REPLAY", "APPLYING"}
 OPEN_INTENT_STATES = {"PLANNED", "SUBMITTING", "AMBIGUOUS"}
-AUTO_RECOVERABLE_SAFE_REASONS = {
+AUTO_RECOVERABLE_PAUSE_REASONS = {
     "MARKET_DATA_STALE",
     "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN",
     "ACCOUNT_RECONCILIATION_MISMATCH",
@@ -99,7 +95,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 11:
+        if version >= 12:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -512,9 +508,10 @@ class LendingStateStore:
             self._migrate_v9_period_selection_columns(connection)
             self._migrate_v10_recovery_state(connection)
             self._migrate_v11_allocation_state(connection)
+            self._migrate_v12_single_paused_mode(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '11')
-                   ON CONFLICT(key) DO UPDATE SET value='11'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '12')
+                   ON CONFLICT(key) DO UPDATE SET value='12'"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
@@ -571,6 +568,16 @@ class LendingStateStore:
                 resume_pending_cycle INTEGER NOT NULL DEFAULT 0
             )"""
         )
+
+    @staticmethod
+    def _migrate_v12_single_paused_mode(connection):
+        # SAFE is folded into PAUSED.  The durable reason/manual flag still
+        # carries the safety lock, so migration changes presentation without
+        # weakening write protection.
+        connection.execute("UPDATE runtime_state SET mode='PAUSED' WHERE mode='SAFE'")
+        connection.execute("UPDATE runtime_state SET previous_mode='PAUSED' WHERE previous_mode='SAFE'")
+        connection.execute("UPDATE recovery_state SET origin_mode='PAUSED' WHERE origin_mode='SAFE'")
+        connection.execute("UPDATE recovery_state SET target_mode='PAUSED' WHERE target_mode='SAFE'")
 
     @staticmethod
     def _migrate_v3_audit_columns(connection):
@@ -894,17 +901,17 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             current = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             from_mode = current["mode"]
-            if from_mode == "SAFE" and current["safe_manual"] and mode != "SAFE":
-                raise StateStoreError("manual SAFE must be resolved through the ambiguous intent workflow")
+            if current["safe_manual"]:
+                raise StateStoreError("protected PAUSED must be resolved through the ambiguous intent workflow")
             if from_mode == "LIVE" and mode == "REPLAY":
                 raise StateStoreError("LIVE must transition to PAUSED before REPLAY")
-            previous = from_mode if mode == "SAFE" else current["previous_mode"]
+            previous = current["previous_mode"]
             connection.execute(
                 """UPDATE runtime_state
                    SET mode = ?, previous_mode = ?, safe_reason = ?, safe_manual = 0,
                        consistent_syncs = 0, last_consistent_sync_ms = NULL, updated_at_ms = ?
                    WHERE singleton = 1""",
-                (mode, previous, reason if mode == "SAFE" else None, now),
+                (mode, previous, None, now),
             )
             connection.execute(
                 "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, ?, ?, ?)",
@@ -924,23 +931,23 @@ class LendingStateStore:
                 )
         return self.runtime()
 
-    def enter_safe(self, reason, manual=False):
+    def enter_protected_pause(self, reason, manual=False):
         now = self._now_ms()
         with self.transaction(immediate=True) as connection:
             current = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
-            previous = current["previous_mode"] if current["mode"] == "SAFE" else current["mode"]
-            sticky_manual = bool(manual or (current["mode"] == "SAFE" and current["safe_manual"]))
+            previous = current["previous_mode"] if current["safe_reason"] else current["mode"]
+            sticky_manual = bool(manual or current["safe_manual"])
             safe_reason = current["safe_reason"] if sticky_manual and current["safe_manual"] else str(reason)
             connection.execute(
                 """UPDATE runtime_state
-                   SET mode = 'SAFE', previous_mode = ?, safe_reason = ?, safe_manual = ?,
+                   SET mode = 'PAUSED', previous_mode = ?, safe_reason = ?, safe_manual = ?,
                        consistent_syncs = 0, last_consistent_sync_ms = NULL, updated_at_ms = ?
                    WHERE singleton = 1""",
                 (previous, safe_reason, int(sticky_manual), now),
             )
-            if current["mode"] != "SAFE":
+            if not current["safe_reason"]:
                 connection.execute(
-                    "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, 'SAFE', ?, ?)",
+                    "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, 'PAUSED', ?, ?)",
                     (current["mode"], str(reason), now),
                 )
         category = recovery_category_for_reason(reason)
@@ -964,9 +971,9 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             if (
-                row["mode"] != "SAFE"
+                row["mode"] != "PAUSED"
                 or row["safe_manual"]
-                or str(row["safe_reason"] or "") not in AUTO_RECOVERABLE_SAFE_REASONS
+                or str(row["safe_reason"] or "") not in AUTO_RECOVERABLE_PAUSE_REASONS
             ):
                 return dict(row)
             previous_sync = row["last_consistent_sync_ms"]
@@ -988,7 +995,7 @@ class LendingStateStore:
                 )
                 connection.execute(
                     "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) "
-                    "VALUES('SAFE', ?, 'reconciled', ?)",
+                    "VALUES('PAUSED', ?, 'reconciled', ?)",
                     (target, now),
                 )
         return self.runtime()
@@ -998,10 +1005,10 @@ class LendingStateStore:
         return row["previous_mode"] if row["previous_mode"] in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
 
     @staticmethod
-    def _resume_safe(connection, row, now, reason):
+    def _resume_protected_pause(connection, row, now, reason):
         target = LendingStateStore._safe_resume_target(row)
         connection.execute(
-            """UPDATE runtime_state SET mode = 'SAFE', previous_mode = ?, safe_reason = ?,
+            """UPDATE runtime_state SET mode = 'PAUSED', previous_mode = ?, safe_reason = ?,
                safe_manual = 0, consistent_syncs = 0, last_consistent_sync_ms = NULL,
                updated_at_ms = ? WHERE singleton = 1""",
             (target, "POST_AMBIGUOUS_RECONCILIATION", now),
@@ -1016,10 +1023,10 @@ class LendingStateStore:
         )
         connection.execute(
             """INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms)
-               VALUES('SAFE', 'SAFE', ?, ?)""",
+               VALUES('PAUSED', 'PAUSED', ?, ?)""",
             (f"{reason}; awaiting clean snapshots", now),
         )
-        return "SAFE"
+        return "PAUSED"
 
     def observe_ambiguous_cancel(self, active_offer_ids, now_ms=None):
         """Resolve an uncertain cancel from repeated authoritative Offers snapshots.
@@ -1034,7 +1041,7 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             reason = str(row["safe_reason"] or "")
-            if row["mode"] != "SAFE" or not reason.startswith("AMBIGUOUS_CANCEL:"):
+            if row["mode"] != "PAUSED" or not reason.startswith("AMBIGUOUS_CANCEL:"):
                 return dict(row)
             try:
                 offer_id = int(reason.split(":", 1)[1])
@@ -1066,7 +1073,7 @@ class LendingStateStore:
                         now,
                     ),
                 )
-                self._resume_safe(connection, row, now, "ambiguous cancel reconciled")
+                self._resume_protected_pause(connection, row, now, "ambiguous cancel reconciled")
         return self.runtime()
 
     def save_strategy(self, policy_payload, status="PENDING"):
@@ -1697,7 +1704,7 @@ class LendingStateStore:
             write_phase="UNKNOWN",
             resolution="MANUAL_REQUIRED",
         )
-        self.enter_safe(f"AMBIGUOUS_SUBMIT:{intent_id}", manual=True)
+        self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{intent_id}", manual=True)
         return self.intent(intent_id)
 
     def recover_incomplete_writes(self):
@@ -1734,14 +1741,14 @@ class LendingStateStore:
                     ),
                 )
         for row in submitting:
-            self.enter_safe(f"AMBIGUOUS_SUBMIT:{row['id']}", manual=True)
+            self.enter_protected_pause(f"AMBIGUOUS_SUBMIT:{row['id']}", manual=True)
         return {"closedBeforeSend": planned, "ambiguousAfterSend": len(submitting)}
 
     def resolve_ambiguous_intent(self, intent_id, exchange_offer_id=None, close=False):
         """Resolve an uncertain write only after an operator has reconciled it.
 
         Binding requires a concrete exchange id.  Closing means the operator has
-        confirmed that no offer exists.  A manual SAFE always returns to PAUSED so
+        confirmed that no offer exists. A protected manual pause stays PAUSED so
         that resuming LIVE still requires the normal preflight confirmation.
         """
         now = self._now_ms()
@@ -1775,7 +1782,7 @@ class LendingStateStore:
                 "SELECT COUNT(*) AS count FROM order_intents WHERE state='AMBIGUOUS'"
             ).fetchone()["count"]
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
-            if mode_after_ambiguous_resolution(unresolved, runtime["mode"], runtime["safe_manual"]) == "PAUSED":
+            if can_clear_ambiguous_pause(unresolved, runtime["mode"], runtime["safe_manual"]):
                 connection.execute(
                     """UPDATE runtime_state SET mode='PAUSED', previous_mode=NULL,
                        safe_reason=NULL, safe_manual=0, consistent_syncs=0,
@@ -1784,7 +1791,7 @@ class LendingStateStore:
                 )
                 connection.execute(
                     """INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms)
-                       VALUES('SAFE', 'PAUSED', 'ambiguous intent resolved', ?)""",
+                       VALUES('PAUSED', 'PAUSED', 'ambiguous intent resolved', ?)""",
                     (now,),
                 )
         return {"intent": self.intent(intent_id), "runtime": self.runtime()}
@@ -1823,7 +1830,7 @@ class LendingStateStore:
         A unique offer/trade is bound immediately. Absence is accepted only when
         the caller confirms that both the active Offers and Funding Trades reads
         were authoritative, twice at least 30 seconds apart. Multiple candidates
-        remain SAFE for operator review because choosing one would be guesswork.
+        remain in protected PAUSED for operator review because choosing one would be guesswork.
         """
         resolved = []
         closed_absent = []
@@ -1965,11 +1972,11 @@ class LendingStateStore:
             if not remaining and (resolved or closed_absent):
                 runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
                 if (
-                    runtime["mode"] == "SAFE"
+                    runtime["mode"] == "PAUSED"
                     and runtime["safe_manual"]
                     and str(runtime["safe_reason"] or "").startswith("AMBIGUOUS_SUBMIT:")
                 ):
-                    self._resume_safe(
+                    self._resume_protected_pause(
                         connection,
                         runtime,
                         now,

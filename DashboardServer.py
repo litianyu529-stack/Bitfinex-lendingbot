@@ -272,7 +272,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                 result = app.stop_controlled(self.config_path, context=self.app_context)
                 store, _ = app.store_for_config(self.config_path)
                 runtime = store.runtime()
-                if runtime["mode"] != "SAFE":
+                if not runtime.get("safe_manual"):
                     runtime = store.set_mode("PAUSED", "dashboard_stop")
                 self._send_json({"ok": True, "bot": result, "runtime": runtime})
                 return
@@ -301,4 +301,4 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                 "LIVE_PREFLIGHT_REQUIRED",
                 400,
             )
-        raise ApiRequestError("仅允许切换到 PAUSED、REPLAY；SAFE 由安全状态机管理", "INVALID_MODE", 400)
+        raise ApiRequestError("仅允许切换到 PAUSED、REPLAY", "INVALID_MODE", 400)

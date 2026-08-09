@@ -1961,8 +1961,8 @@ def test_ambiguous_resolution_requires_operator_and_returns_paused():
         _, intent = store.reserve_intent(intent_order(), D("1000"))
         store.mark_submitting(intent["id"])
         store.mark_ambiguous(intent["id"], "timeout")
-        assert store.runtime()["mode"] == "SAFE" and store.runtime()["safe_manual"] == 1
-        store.enter_safe("MARKET_DATA_STALE")
+        assert store.runtime()["mode"] == "PAUSED" and store.runtime()["safe_manual"] == 1
+        store.enter_protected_pause("MARKET_DATA_STALE")
         assert store.runtime()["safe_manual"] == 1
         assert store.runtime()["safe_reason"].startswith("AMBIGUOUS_SUBMIT")
         with pytest.raises(StateStoreError):
@@ -1976,22 +1976,22 @@ def test_safe_recovers_only_after_two_consistent_samples_thirty_seconds_apart():
     with tempfile.TemporaryDirectory() as directory:
         store = LendingStateStore(f"{directory}/state.sqlite3")
         store.set_mode("LIVE", "test")
-        store.enter_safe("MARKET_DATA_STALE")
+        store.enter_protected_pause("MARKET_DATA_STALE")
         store.record_consistent_sync(1_000_000)
         store.record_consistent_sync(1_020_000)
-        assert store.runtime()["mode"] == "SAFE"
+        assert store.runtime()["mode"] == "PAUSED"
         store.record_consistent_sync(1_030_000)
         assert store.runtime()["mode"] == "LIVE"
 
 
-def test_unknown_runtime_safe_reason_never_auto_resumes_live():
+def test_unknown_runtime_pause_reason_never_auto_resumes_live():
     with tempfile.TemporaryDirectory() as directory:
         store = LendingStateStore(f"{directory}/state.sqlite3")
         store.set_mode("LIVE", "test")
-        store.enter_safe("UNEXPECTED_RUNTIME_ERROR:TypeError")
+        store.enter_protected_pause("UNEXPECTED_RUNTIME_ERROR:TypeError")
         store.record_consistent_sync(1_000_000)
         store.record_consistent_sync(1_030_000)
-        assert store.runtime()["mode"] == "SAFE"
+        assert store.runtime()["mode"] == "PAUSED"
 
 
 def test_websocket_snapshot_increment_and_five_minute_safe_boundary():
@@ -2321,7 +2321,7 @@ def test_live_cycle_enters_safe_when_account_cannot_be_reconciled(available, saf
         status = runtime.cycle(now)
 
         assert client.writes == 0
-        assert status["operationMode"] == "SAFE"
+        assert status["operationMode"] == "PAUSED"
         assert status["runtime"]["safe_reason"] == safe_reason
         assert status["account"]["walletAvailableKnown"] is (available is not None)
 
@@ -2648,7 +2648,7 @@ def test_dust_unknown_cancel_enters_safe_without_replacement(tmp_path):
         "v3.3",
     )
     assert result["state"] == "AMBIGUOUS"
-    assert store.runtime()["mode"] == "SAFE"
+    assert store.runtime()["mode"] == "PAUSED"
     assert store.consolidation_status()["state"] == "AMBIGUOUS"
     assert store.intents(states={"PLANNED", "SUBMITTING", "AMBIGUOUS"}) == []
 

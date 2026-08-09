@@ -622,15 +622,15 @@ function renderStatus() {
         ? "状态已过期，请检查实盘进程或网络。"
         : (recovery.active
             ? `${recovery.manualRequired ? "需要人工处理" : "自动修复中"}：${recovery.reason || safeReason || "正在重新读取权威数据"}${recoveryDetail}`
-            : (mode === "SAFE"
-            ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}`
-            : (status.last_status || "实盘状态已同步。")));
+            : (safeReason
+                ? `PAUSED：${safeReason}`
+                : (status.last_status || "实盘状态已同步。")));
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
     badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.3 · ${mode}`);
-    badge.classList.toggle("invalid", !valid || stale || mode === "SAFE" || recovery.active);
+    badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active);
     $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.3 · 已过期" : `V3.3 · ${mode}`);
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
@@ -682,7 +682,7 @@ function renderControl() {
     $("controlTitle").textContent = running
         ? (recovery.active
             ? (recovery.manualRequired ? "等待人工处理" : "自动修复中")
-            : (mode === "SAFE" ? "SAFE 安全暂停" : (stale ? "进程运行 · 状态过期" : "运行中")))
+            : (mode === "PAUSED" ? "PAUSED" : (stale ? "进程运行 · 状态过期" : "运行中")))
         : "已停止";
     $("controlDetail").textContent = running
         ? (recovery.active

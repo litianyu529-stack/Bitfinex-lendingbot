@@ -312,7 +312,7 @@ class LendingRuntimeV3:
             return
         recovery = self.store.recover_incomplete_writes()
         if recovery["ambiguousAfterSend"]:
-            self._log(f"检测到 {recovery['ambiguousAfterSend']} 个进程中断时未确认的写入；已进入人工 SAFE。")
+            self._log(f"检测到 {recovery['ambiguousAfterSend']} 个进程中断时未确认的写入；已进入人工 PAUSED。")
         if self.store.strategy("ACTIVE") is None:
             self.store.save_strategy(json_decimal(self.policy.__dict__), status="ACTIVE")
         else:
@@ -461,7 +461,7 @@ class LendingRuntimeV3:
                 elif result.outcome == WriteOutcome.UNKNOWN:
                     # A complete wallet snapshot makes retrying this sweep
                     # idempotent: an already-transferred source balance is zero.
-                    self.store.enter_safe("AMBIGUOUS_WALLET_TRANSFER")
+                    self.store.enter_protected_pause("AMBIGUOUS_WALLET_TRANSFER")
                     raise BitfinexAmbiguousWriteError(result.error)
                 else:
                     self._log(f"USD 自动转入被明确拒绝：{result.error}")
@@ -606,9 +606,9 @@ class LendingRuntimeV3:
         snapshot = self.hub.snapshot(now)
         account = self._account(snapshot)
         current = self.store.runtime()
-        if current["mode"] == "SAFE" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
+        if current["mode"] == "PAUSED" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
             resolved_runtime = self.store.observe_ambiguous_cancel(active_offer_ids, now)
-            if resolved_runtime["mode"] != "SAFE":
+            if not resolved_runtime.get("safe_reason"):
                 consolidation = self.store.consolidation_status()
                 if consolidation.get("state") == "AMBIGUOUS" and consolidation.get("offer_id") is not None:
                     if int(consolidation["offer_id"]) in active_offer_ids:
@@ -641,7 +641,7 @@ class LendingRuntimeV3:
                 if not account["walletAvailableKnown"]
                 else "ACCOUNT_RECONCILIATION_MISMATCH"
             )
-            self.store.enter_safe(reason)
+            self.store.enter_protected_pause(reason)
         return snapshot
 
     def sync_ambiguous_write_history(self, intents, now_ms=None):
@@ -670,7 +670,7 @@ class LendingRuntimeV3:
                 )
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
-                self._log(f"未知挂单 Funding Trades 对账失败，将保持 SAFE 并重试：{exc}")
+                self._log(f"未知挂单 Funding Trades 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
                 self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
                 if len(funding_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
@@ -688,7 +688,7 @@ class LendingRuntimeV3:
                 )
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
-                self._log(f"未知挂单 Funding Offers 对账失败，将保持 SAFE 并重试：{exc}")
+                self._log(f"未知挂单 Funding Offers 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
                 self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
                 if len(offer_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
@@ -1127,8 +1127,8 @@ class LendingRuntimeV3:
                     self.log.updateMetaValue(key, value)
             self.log.updateMetaValue("openOffers", status["openOffers"])
             self.log.updateMetaValue("credits", status["credits"])
-            if runtime["mode"] == "SAFE":
-                self.log.refreshStatus(f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}")
+            if runtime["mode"] == "PAUSED" and runtime.get("safe_reason"):
+                self.log.refreshStatus(f"PAUSED：{runtime.get('safe_reason') or '策略已暂停'}")
             else:
                 self.log.refreshStatus(f"V3.3 {runtime['mode']} 状态已同步。")
         return status
@@ -1359,7 +1359,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": reason, "error": write.error},
                 )
-                self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
                 self._log(write.error)
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:
@@ -1431,7 +1431,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": "ratio_rebalance", "error": write.error},
                 )
-                self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
                 self._log(f"撤销 Offer {offer_id} 结果未知，将自动对账后重试：{write.error}")
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:
@@ -1478,7 +1478,7 @@ class LendingRuntimeV3:
                 self.store.record_ownership_event(
                     "CANCEL_UNKNOWN", offer_id=offer_id, details={"reason": "external_takeover", "error": result.error}
                 )
-                self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}")
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
                 break
             if result.outcome == WriteOutcome.DEFINITE_REJECT:
                 self.store.update_external_takeover(offer_id, "ERROR", result.error, now_ms)
@@ -1621,7 +1621,7 @@ class LendingRuntimeV3:
             self.store.record_ownership_event(
                 "CANCEL_UNKNOWN", offer_id=offer_id, details={"reason": "dust_consolidation", "error": result.error}
             )
-            self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}")
+            self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
             return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
         if result.outcome == WriteOutcome.DEFINITE_REJECT:
             self.store.clear_consolidation(now_ms)
@@ -1709,7 +1709,7 @@ class LendingRuntimeV3:
                     offer_id=offer_id,
                     details={"reason": f"{reason_prefix}:{reason}", "error": write.error},
                 )
-                self.store.enter_safe(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
+                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}", manual=True)
                 self._log(f"撤销 Offer {offer_id} 结果未知，将自动对账后重试：{write.error}")
                 break
             if write.outcome == WriteOutcome.DEFINITE_REJECT:
@@ -1800,7 +1800,7 @@ class LendingRuntimeV3:
                 runtime = self.store.runtime()
                 recovery = self.store.recovery_status()
                 origin = recovery.get("targetMode") or runtime["mode"]
-                if runtime["mode"] not in {"PAUSED", "SAFE"}:
+                if runtime["mode"] != "PAUSED":
                     self.store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
                 self.store.begin_recovery(
                     decision.category,
@@ -1814,7 +1814,7 @@ class LendingRuntimeV3:
         else:
             snapshot = self.hub.snapshot(now)
         if snapshot["safeRequired"]:
-            self.store.enter_safe("MARKET_DATA_STALE")
+            self.store.enter_protected_pause("MARKET_DATA_STALE")
         account = self._account(snapshot)
         runtime = self.store.runtime()
         if runtime["mode"] == "LIVE" and account["reconciliationStatus"] != "MATCHED":
@@ -1823,7 +1823,7 @@ class LendingRuntimeV3:
                 if not account["walletAvailableKnown"]
                 else "ACCOUNT_RECONCILIATION_MISMATCH"
             )
-            self.store.enter_safe(reason)
+            self.store.enter_protected_pause(reason)
         signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
         self.store.record_market_bars(signals.get("windows"), now)
         self._record_variable_floor_violations(now)

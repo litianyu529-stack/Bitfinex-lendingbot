@@ -440,8 +440,8 @@
         const dust = status?.strategyV3?.dustConsolidation || {};
         const takeoverRows = status?.strategyV3?.externalTakeover?.offers || [];
         const activeTakeovers = takeoverRows.filter((row) => !["CLOSED", "ERROR"].includes(row.state));
-        if (runtime.mode === "SAFE" && runtime.safe_reason) {
-            byId("v3FormMessage").textContent = `SAFE：${runtime.safe_reason}`;
+        if (runtime.mode === "PAUSED" && runtime.safe_reason) {
+            byId("v3FormMessage").textContent = `PAUSED：${runtime.safe_reason}`;
         } else if (dust.state && dust.state !== "IDLE") {
             const labels = {
                 PLANNED: "小额余额等待合并",
