@@ -1524,6 +1524,13 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             connection.execute("DELETE FROM external_takeover_state WHERE state IN ('OBSERVED', 'CONFIRMED')")
 
+    def discard_unconfirmed_external_takeover(self, offer_id):
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                "DELETE FROM external_takeover_state WHERE offer_id=? AND state IN ('OBSERVED', 'CONFIRMED')",
+                (int(offer_id),),
+            )
+
     def external_takeovers(self, states=None):
         query = "SELECT * FROM external_takeover_state"
         params = []

@@ -2692,3 +2692,26 @@ def test_external_takeover_requires_two_matching_snapshots_and_cancels_exact_id(
     assert runtime._cancel_external_takeovers(now + 60_000, "v3.3") == [5074345865]
     assert client.canceled == [5074345865]
     assert store.external_takeovers()[0]["state"] == "CANCELLING"
+
+
+def test_robot_offer_is_removed_from_unconfirmed_external_takeover_candidates(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 7501,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0003"),
+        "rate_real": D("0.0003"),
+        "period": 30,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "pool": "medium",
+        "mts_created": now,
+    }
+    assert store.observe_external_takeover(offer, now)["state"] == "OBSERVED"
+    store.discard_unconfirmed_external_takeover(offer["id"])
+    assert store.external_takeovers() == []

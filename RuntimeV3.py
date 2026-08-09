@@ -507,6 +507,20 @@ class LendingRuntimeV3:
             except (BitfinexApiError, AttributeError) as exc:
                 self._log(f"成交归属即时同步失败，将保持待归属并安全重试：{exc}")
         self.store.reconcile_offers(offers, now)
+        # A confirmed submit can first appear at the exchange one REST cycle
+        # after its intent was written. Refresh ownership from the durable
+        # intent binding before external-offer observation so a robot order is
+        # never briefly classified as a takeover candidate.
+        stored_offer_map = {int(row["offer_id"]): row for row in self.store.offers(active_only=True)}
+        for offer in offers:
+            stored = stored_offer_map.get(int(offer["id"]))
+            if stored is not None:
+                offer["managed"] = bool(stored["managed"])
+                offer["pool"] = stored.get("pool") or offer.get("pool")
+                offer["layer"] = stored.get("layer") or offer.get("layer")
+                offer["display_type"] = stored.get("display_type") or offer.get("display_type")
+                if offer["managed"]:
+                    self.store.discard_unconfirmed_external_takeover(offer["id"])
         takeover_snapshot_safe = (
             authoritative_account["walletAvailableKnown"] and authoritative_account["reconciliationStatus"] == "MATCHED"
         )
