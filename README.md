@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.1 / V3.1
+# Bitfinex-lendingbot 0.3.2 / V3.2
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -28,9 +28,11 @@
 - 网络、市场数据和普通运行故障在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。只有出现多个可能匹配时才保持人工 SAFE。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
-- SQLite 使用显式 schema v5。升级前在线备份，迁移在事务中完成。
+- SQLite 使用显式 Schema 10。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
+
+V3.2 的无人值守恢复边界、退避、双快照确认和 Worker 心跳守护见 [V3.2 自动自愈说明](docs/v3.2-unattended-recovery.md)。
 
 ## 快速开始
 
@@ -102,7 +104,7 @@ python -m pip install -r requirements-dev.txt
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.1`
+- 应用/User-Agent：`0.3.2`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`

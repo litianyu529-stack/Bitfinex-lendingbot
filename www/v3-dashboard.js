@@ -166,7 +166,7 @@
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
-        fixedSafety.textContent = "V3.1 固定安全规则：最低订单 150 USD · 单池最多高于基础比例 10 个百分点 · 第一期限最多占池 70% · 每 60 秒最多提交 60 单。";
+        fixedSafety.textContent = "V3.2 固定安全规则：最低订单 150 USD · 单池最多高于基础比例 10 个百分点 · 第一期限最多占池 70% · 每 60 秒最多提交 60 单 · 系统故障自动只读修复。";
         form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");

@@ -28,6 +28,7 @@ from RuntimeV3 import (
     parse_wallet_rows_v3,
 )
 from MarketDataStream import BitfinexMarketDataHub, websocket_dependency_available
+from Recovery import WORKER_HEARTBEAT_TIMEOUT_MS, classify_runtime_error
 from StrategyV3 import (
     USD_ORDER_CHUNK,
     build_market_signals_v3,
@@ -116,6 +117,7 @@ WORKER_BUILD_FILES = (
     "StrategyV3.py",
     "StrategyResearch.py",
     "WriteRecovery.py",
+    "Recovery.py",
 )
 DASHBOARD_ASSET_FILES = (
     os.path.join("www", "lendingbot.html"),
@@ -836,6 +838,21 @@ def empty_status_payload():
         "credits": active_credit_dashboard["credits"],
         "activeCreditSummary": active_credit_dashboard["summary"],
         "strategyDecision": {},
+        "recovery": {
+            "active": False,
+            "category": None,
+            "reason": None,
+            "originMode": None,
+            "targetMode": None,
+            "attempts": 0,
+            "successfulSnapshots": 0,
+            "requiredSnapshots": 2,
+            "lastProbeAt": None,
+            "nextProbeAt": None,
+            "lastError": None,
+            "heartbeatAt": None,
+            "manualRequired": False,
+        },
         "legacyIgnored": False,
     }
 
@@ -887,6 +904,7 @@ def dashboard_status_payload(status_path, config_path, context=None):
     try:
         store, _ = v3_store_for_config(config_path)
         runtime = store.runtime()
+        recovery = store.recovery_status()
         process = controlled_bot_status(config_path, context)
         if not process["running"]:
             mode_event = store.latest_mode_event()
@@ -897,6 +915,7 @@ def dashboard_status_payload(status_path, config_path, context=None):
             empty = empty_status_payload()
             empty["log"] = list(payload.get("log") or [])
             empty["runtime"] = runtime
+            empty["recovery"] = recovery
             empty["operationMode"] = "PAUSED" if runtime["mode"] != "SAFE" else "SAFE"
             empty["last_status"] = (
                 f"机器人进程已停止（{stop_reason_message(stop_reason)}）；"
@@ -907,9 +926,15 @@ def dashboard_status_payload(status_path, config_path, context=None):
             empty["process"] = process
             return empty
         payload["runtime"] = runtime
+        payload["recovery"] = recovery
         payload["process"] = process
         payload["operationMode"] = runtime["mode"]
-        payload["snapshotAvailable"] = True
+        account = payload.get("account")
+        payload["snapshotAvailable"] = bool(
+            isinstance(account, dict)
+            and account.get("walletAvailableKnown") is True
+            and account.get("total") is not None
+        )
         if runtime["mode"] == "PAUSED":
             payload["last_status"] = "策略已暂停；实盘进程仍在运行。"
         elif runtime["mode"] == "SAFE":
@@ -1105,6 +1130,7 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
                 (internal_running and internal_worker_build and internal_worker_build != current_worker_build)
                 or (external and external.get("buildMismatch"))
             ),
+            "watchdogAuthorized": bool(state.auto_restart_authorization),
             **({"stateError": external["stateError"]} if external and external.get("stateError") else {}),
         }
 
@@ -1546,14 +1572,30 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None):
             raise
         state.started_at = timestamp()
         state.stop_reason = None
+        store, _ = v3_store_for_config(config_path)
+        active = store.strategy("ACTIVE") or {}
+        state.auto_restart_authorization = {
+            "session": state.supervisor_session,
+            "configDigest": config_sha256(config_path),
+            "buildId": worker_build_id(),
+            "strategyVersion": active.get("version_id"),
+            "authorizedAt": context.now(),
+        }
         return controlled_bot_status(config_path, context)
 
 
-def stop_controlled_bot(config_path=DEFAULT_CONFIG, reason="stopped_by_dashboard", context=None):
+def stop_controlled_bot(
+    config_path=DEFAULT_CONFIG,
+    reason="stopped_by_dashboard",
+    context=None,
+    preserve_authorization=False,
+):
     context = process_context(config_path, context)
     state = context.process_state
     with state.lock:
         state.preflight = None
+        if not preserve_authorization:
+            state.auto_restart_authorization = None
         process = state.process
         internal_running = process is not None and process.poll() is None
         external = None if internal_running else external_live_process(config_path, context)
@@ -1584,6 +1626,98 @@ def stop_controlled_bot(config_path=DEFAULT_CONFIG, reason="stopped_by_dashboard
         cleanup_controlled_bot_handle(context)
         state.stop_reason = reason
         return controlled_bot_status(config_path, context)
+
+
+def _watchdog_authorization_valid(config_path, context, authorization):
+    if not authorization or authorization.get("session") != context.process_state.supervisor_session:
+        return False
+    if authorization.get("configDigest") != config_sha256(config_path):
+        return False
+    if authorization.get("buildId") != worker_build_id():
+        return False
+    store, _ = v3_store_for_config(config_path)
+    active = store.strategy("ACTIVE") or {}
+    return authorization.get("strategyVersion") == active.get("version_id")
+
+
+def worker_supervisor_loop(config_path, status_path, context):
+    state = context.process_state
+    while not state.supervisor_stop.wait(5):
+        authorization = state.auto_restart_authorization
+        if not authorization:
+            continue
+        try:
+            store, _ = v3_store_for_config(config_path)
+            recovery = store.recovery_status()
+            status = controlled_bot_status(config_path, context)
+            now_ms = int(context.now() * 1000)
+            if status["running"]:
+                heartbeat = recovery.get("heartbeatAt")
+                authorized_ms = int(float(authorization.get("authorizedAt") or context.now()) * 1000)
+                baseline = int(heartbeat or authorized_ms)
+                if now_ms - baseline < WORKER_HEARTBEAT_TIMEOUT_MS:
+                    continue
+                runtime = store.runtime()
+                target = recovery.get("targetMode") or runtime.get("previous_mode") or runtime["mode"]
+                if target not in {"LIVE", "PAUSED", "REPLAY"}:
+                    target = "LIVE"
+                if runtime["mode"] != "SAFE":
+                    store.set_mode("PAUSED", "AUTO_RECOVERY:WORKER_HEARTBEAT_TIMEOUT")
+                store.begin_recovery(
+                    "WORKER_HEARTBEAT_TIMEOUT",
+                    "Worker heartbeat has not advanced for five minutes",
+                    origin_mode=target,
+                    target_mode=target,
+                )
+                stop_controlled_bot(
+                    config_path,
+                    reason="watchdog_heartbeat_timeout",
+                    context=context,
+                    preserve_authorization=True,
+                )
+                continue
+            if not recovery["active"] or recovery["manualRequired"]:
+                state.auto_restart_authorization = None
+                if not recovery["manualRequired"]:
+                    state.stop_reason = state.stop_reason or "unexpected_worker_exit"
+                continue
+            if recovery.get("nextProbeAt") and now_ms < int(recovery["nextProbeAt"]):
+                continue
+            if not _watchdog_authorization_valid(config_path, context, authorization):
+                store.begin_recovery(
+                    "SUPERVISOR_AUTHORIZATION_INVALID",
+                    "Dashboard session, build, configuration, or strategy changed",
+                    origin_mode=recovery.get("originMode") or "PAUSED",
+                    target_mode="PAUSED",
+                    manual_required=True,
+                )
+                state.auto_restart_authorization = None
+                state.stop_reason = "watchdog_authorization_invalid"
+                continue
+            preflight = create_controlled_bot_preflight(config_path, context=context)
+            if not preflight.get("canStart") or not preflight.get("preflightId"):
+                store.record_recovery_failure("watchdog preflight did not pass", "WATCHDOG_PREFLIGHT", now_ms)
+                continue
+            start_controlled_bot(config_path, status_path, preflight["preflightId"], context=context)
+            state.stop_reason = None
+        except Exception as exc:
+            try:
+                store, _ = v3_store_for_config(config_path)
+                decision = classify_runtime_error(exc)
+                if decision.retryable:
+                    store.record_recovery_failure(str(exc), decision.category)
+                else:
+                    recovery = store.recovery_status()
+                    store.begin_recovery(
+                        decision.category,
+                        str(exc),
+                        origin_mode=recovery.get("originMode") or "PAUSED",
+                        target_mode="PAUSED",
+                        manual_required=True,
+                    )
+                    state.auto_restart_authorization = None
+            except Exception:
+                state.auto_restart_authorization = None
 
 
 def load_dashboard_static_snapshot(directory, build_id, csrf_token=""):
@@ -1642,6 +1776,16 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
     port = 8000
     host = "127.0.0.1"
     directory = os.path.join(os.getcwd(), "www")
+    state.supervisor_session = secrets.token_urlsafe(24)
+    state.auto_restart_authorization = None
+    state.supervisor_stop.clear()
+    state.supervisor_thread = threading.Thread(
+        target=worker_supervisor_loop,
+        args=(config_path, status_path, context),
+        daemon=True,
+        name="v3-worker-supervisor",
+    )
+    state.supervisor_thread.start()
     handler = make_dashboard_handler(directory, config_path, status_path, context=context)
     try:
         if state.market_hub is None and websocket_dependency_available():
@@ -1665,10 +1809,19 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
             server.server_close()
             if state.dashboard_server is server:
                 state.dashboard_server = None
+            state.supervisor_stop.set()
+            if state.supervisor_thread is not None:
+                state.supervisor_thread.join(timeout=5)
+                state.supervisor_thread = None
     except Exception as exc:
         log.log(f"网页控制台启动失败：{exc}")
         if raise_errors:
             raise
+    finally:
+        state.supervisor_stop.set()
+        if state.supervisor_thread is not None and state.supervisor_thread is not threading.current_thread():
+            state.supervisor_thread.join(timeout=5)
+            state.supervisor_thread = None
 
 
 def stop_web_server(log, context=None):
@@ -1691,18 +1844,42 @@ def stop_web_server(log, context=None):
 
 
 def publish_safe_status(log, store, exc):
-    reason = f"UNEXPECTED_RUNTIME_ERROR:{type(exc).__name__}"
+    decision = classify_runtime_error(exc)
+    reason = f"{decision.category}:{type(exc).__name__}"
     current = store.runtime()
     if current["mode"] == "SAFE" and current.get("safe_manual"):
         runtime = current
+    elif decision.retryable:
+        recovery = store.recovery_status()
+        origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
+        if current["mode"] != "SAFE":
+            runtime = store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
+        else:
+            runtime = current
+        store.begin_recovery(
+            decision.category,
+            str(exc),
+            origin_mode=origin,
+            target_mode=origin,
+            manual_required=False,
+        )
+        store.record_recovery_failure(str(exc), decision.category)
     else:
         # Account reconciliation can prove that balances are consistent, but it
         # cannot prove that an unknown programming error has disappeared. Keep
         # the worker read-only until an operator restarts it after investigation.
         runtime = store.set_mode("PAUSED", reason)
+        store.begin_recovery(
+            decision.category,
+            str(exc),
+            origin_mode=current["mode"],
+            target_mode="PAUSED",
+            manual_required=True,
+        )
     log.updateMetaValue("schemaVersion", STATUS_SCHEMA_VERSION)
     log.updateMetaValue("operationMode", runtime["mode"])
     log.updateMetaValue("runtime", runtime)
+    log.updateMetaValue("recovery", store.recovery_status())
     log.refreshStatus(f"{runtime['mode']}：{type(exc).__name__}：{exc}")
     log.persistStatus()
     return runtime
@@ -1903,21 +2080,52 @@ def main(argv=None):
         thread.start()
 
     sleep_time = settings.sleep_active
+    deferred_recovery_error = None
     try:
         while True:
+            if deferred_recovery_error is not None:
+                try:
+                    publish_safe_status(log, state_store_v3, deferred_recovery_error)
+                except Exception as persist_exc:
+                    if not classify_runtime_error(persist_exc).retryable:
+                        return 1
+                    time.sleep(30)
+                    continue
+                deferred_recovery_error = None
+                # Persisting recovery is a read-only cycle. Strategy writes are
+                # deferred until a later normal cycle.
+                time.sleep(30)
+                continue
             try:
                 runtime_v3.cycle()
-                sleep_time = settings.sleep_active
+                sleep_time = 30 if state_store_v3.recovery_status()["active"] else settings.sleep_active
                 if settings.once:
                     break
                 time.sleep(sleep_time)
             except Exception as exc:
                 log.log("错误：" + str(exc))
-                publish_safe_status(log, state_store_v3, exc)
+                decision = classify_runtime_error(exc)
+                try:
+                    publish_safe_status(log, state_store_v3, exc)
+                except Exception as persist_exc:
+                    if decision.retryable and classify_runtime_error(persist_exc).retryable:
+                        deferred_recovery_error = exc
+                    else:
+                        return 1
                 print(timestamp())
                 print(traceback.format_exc())
                 if settings.once:
                     return 1
+                if deferred_recovery_error is None:
+                    try:
+                        if state_store_v3.recovery_status()["manualRequired"]:
+                            return 1
+                    except Exception as status_exc:
+                        if decision.retryable and classify_runtime_error(status_exc).retryable:
+                            deferred_recovery_error = exc
+                        else:
+                            return 1
+                sleep_time = 30
                 time.sleep(sleep_time)
     except KeyboardInterrupt:
         pass

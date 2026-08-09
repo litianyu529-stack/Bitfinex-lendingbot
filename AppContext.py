@@ -14,6 +14,10 @@ class ProcessState:
     preflight: dict | None = None
     dashboard_server: Any = None
     market_hub: Any = None
+    supervisor_session: str | None = None
+    auto_restart_authorization: dict | None = None
+    supervisor_thread: Any = None
+    supervisor_stop: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 

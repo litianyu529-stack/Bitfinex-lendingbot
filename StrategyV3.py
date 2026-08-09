@@ -284,7 +284,7 @@ def validate_policy_v3(policy, require_live_floors=False):
     if policy.max_lend_percent < 0 or policy.max_lend_percent > 100:
         raise ValueError("max_lend_percent must be 0-100")
     if policy.max_pool_shift != POOL_SHIFT_CAP_PERCENTAGE_POINTS:
-        raise ValueError("V3.1 fixes max_pool_shift at 10 percentage points")
+        raise ValueError("V3.2 fixes max_pool_shift at 10 percentage points")
     for pool, (minimum, maximum) in TERM_PERIOD_RANGES.items():
         periods = tuple(getattr(policy, f"{pool}_periods"))
         if (

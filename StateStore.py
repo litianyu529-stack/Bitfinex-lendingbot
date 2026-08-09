@@ -12,6 +12,12 @@ from WriteRecovery import (
     restart_transition,
     unique_unbound_candidate,
 )
+from Recovery import (
+    RECOVERY_MINIMUM_GAP_MS,
+    RECOVERY_REQUIRED_SNAPSHOTS,
+    recovery_category_for_reason,
+    recovery_delay_seconds,
+)
 
 
 D = Decimal
@@ -97,7 +103,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 9:
+        if version >= 10:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -159,6 +165,24 @@ class LendingStateStore:
                 consistent_syncs INTEGER NOT NULL DEFAULT 0,
                 last_consistent_sync_ms INTEGER,
                 updated_at_ms INTEGER NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS recovery_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                active INTEGER NOT NULL DEFAULT 0,
+                category TEXT,
+                reason TEXT,
+                origin_mode TEXT,
+                target_mode TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                successful_snapshots INTEGER NOT NULL DEFAULT 0,
+                required_snapshots INTEGER NOT NULL DEFAULT 2,
+                started_at_ms INTEGER,
+                last_probe_at_ms INTEGER,
+                next_probe_at_ms INTEGER,
+                last_error TEXT,
+                heartbeat_at_ms INTEGER,
+                manual_required INTEGER NOT NULL DEFAULT 0,
+                resume_pending_cycle INTEGER NOT NULL DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS mode_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -458,15 +482,21 @@ class LendingStateStore:
             self._migrate_v7_reprice_chain_columns(connection)
             self._migrate_v8_recovery_columns(connection)
             self._migrate_v9_period_selection_columns(connection)
+            self._migrate_v10_recovery_state(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '9')
-                   ON CONFLICT(key) DO UPDATE SET value='9'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '10')
+                   ON CONFLICT(key) DO UPDATE SET value='10'"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
                     currency, status, updated_at_ms
                 ) VALUES('USD', 'PENDING', ?)""",
                 (self._now_ms(),),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO recovery_state(
+                       singleton, active, required_snapshots, manual_required, resume_pending_cycle
+                   ) VALUES(1, 0, 2, 0, 0)"""
             )
             connection.execute(
                 """INSERT OR IGNORE INTO runtime_state(
@@ -488,6 +518,29 @@ class LendingStateStore:
                 connection.execute(
                     f"ALTER TABLE period_selection_state ADD COLUMN {name} {definition}"
                 )
+
+    @staticmethod
+    def _migrate_v10_recovery_state(connection):
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS recovery_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                active INTEGER NOT NULL DEFAULT 0,
+                category TEXT,
+                reason TEXT,
+                origin_mode TEXT,
+                target_mode TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                successful_snapshots INTEGER NOT NULL DEFAULT 0,
+                required_snapshots INTEGER NOT NULL DEFAULT 2,
+                started_at_ms INTEGER,
+                last_probe_at_ms INTEGER,
+                next_probe_at_ms INTEGER,
+                last_error TEXT,
+                heartbeat_at_ms INTEGER,
+                manual_required INTEGER NOT NULL DEFAULT 0,
+                resume_pending_cycle INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
 
     @staticmethod
     def _migrate_v3_audit_columns(connection):
@@ -612,6 +665,172 @@ class LendingStateStore:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
         return dict(row)
 
+    @staticmethod
+    def _recovery_payload(row):
+        value = dict(row)
+        return {
+            "active": bool(value.get("active")),
+            "category": value.get("category"),
+            "reason": value.get("reason"),
+            "originMode": value.get("origin_mode"),
+            "targetMode": value.get("target_mode"),
+            "attempts": int(value.get("attempts") or 0),
+            "successfulSnapshots": int(value.get("successful_snapshots") or 0),
+            "requiredSnapshots": int(value.get("required_snapshots") or RECOVERY_REQUIRED_SNAPSHOTS),
+            "startedAt": value.get("started_at_ms"),
+            "lastProbeAt": value.get("last_probe_at_ms"),
+            "nextProbeAt": value.get("next_probe_at_ms"),
+            "lastError": value.get("last_error"),
+            "heartbeatAt": value.get("heartbeat_at_ms"),
+            "manualRequired": bool(value.get("manual_required")),
+        }
+
+    def recovery_status(self):
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+        return self._recovery_payload(row)
+
+    def touch_heartbeat(self, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                "UPDATE recovery_state SET heartbeat_at_ms=? WHERE singleton=1",
+                (now,),
+            )
+        return now
+
+    def begin_recovery(
+        self,
+        category,
+        reason,
+        *,
+        origin_mode=None,
+        target_mode=None,
+        manual_required=False,
+        now_ms=None,
+    ):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
+            current = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            origin = str(origin_mode or runtime["previous_mode"] or runtime["mode"] or "PAUSED").upper()
+            target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
+            if target not in {"LIVE", "PAUSED", "REPLAY"}:
+                target = "PAUSED"
+            started = current["started_at_ms"] if current["active"] else now
+            attempts = int(current["attempts"] or 0) if current["active"] else 0
+            connection.execute(
+                """UPDATE recovery_state SET active=1, category=?, reason=?, origin_mode=?,
+                   target_mode=?, attempts=?, successful_snapshots=0, required_snapshots=?,
+                   started_at_ms=?, last_probe_at_ms=?, next_probe_at_ms=?, last_error=?,
+                   manual_required=?, resume_pending_cycle=0 WHERE singleton=1""",
+                (
+                    str(category),
+                    str(reason),
+                    origin,
+                    target,
+                    attempts,
+                    RECOVERY_REQUIRED_SNAPSHOTS,
+                    started,
+                    None,
+                    None if manual_required else now + recovery_delay_seconds(attempts) * 1000,
+                    str(reason),
+                    int(bool(manual_required)),
+                ),
+            )
+        return self.recovery_status()
+
+    def record_recovery_failure(self, error_text, category=None, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if not row["active"] or row["manual_required"]:
+                return self._recovery_payload(row)
+            attempts = int(row["attempts"] or 0) + 1
+            delay = recovery_delay_seconds(attempts - 1)
+            connection.execute(
+                """UPDATE recovery_state SET category=COALESCE(?, category), attempts=?,
+                   successful_snapshots=0, last_probe_at_ms=?, next_probe_at_ms=?,
+                   last_error=? WHERE singleton=1""",
+                (category, attempts, now, now + delay * 1000, str(error_text)),
+            )
+        return self.recovery_status()
+
+    def recovery_probe_due(self, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+        return bool(
+            row["active"]
+            and not row["manual_required"]
+            and (row["next_probe_at_ms"] is None or now >= int(row["next_probe_at_ms"]))
+        )
+
+    def record_recovery_snapshot(self, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        resumed = False
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if not row["active"] or row["manual_required"]:
+                return {"resumed": False, "recovery": self._recovery_payload(row)}
+            last = row["last_probe_at_ms"]
+            count = int(row["successful_snapshots"] or 0)
+            if last is None or now - int(last) >= RECOVERY_MINIMUM_GAP_MS:
+                count += 1
+                connection.execute(
+                    """UPDATE recovery_state SET successful_snapshots=?, last_probe_at_ms=?,
+                       next_probe_at_ms=?, last_error=NULL WHERE singleton=1""",
+                    (count, now, now + RECOVERY_MINIMUM_GAP_MS),
+                )
+            unresolved = connection.execute(
+                "SELECT COUNT(*) FROM order_intents WHERE state IN ('PLANNED','SUBMITTING','AMBIGUOUS')"
+            ).fetchone()[0]
+            if count >= int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS) and not unresolved:
+                target = row["target_mode"] if row["target_mode"] in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
+                current_mode = connection.execute(
+                    "SELECT mode FROM runtime_state WHERE singleton=1"
+                ).fetchone()[0]
+                connection.execute(
+                    """UPDATE runtime_state SET mode=?, previous_mode=NULL, safe_reason=NULL,
+                       safe_manual=0, consistent_syncs=0, last_consistent_sync_ms=NULL,
+                       updated_at_ms=? WHERE singleton=1""",
+                    (target, now),
+                )
+                connection.execute(
+                    "INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms) VALUES(?,?,?,?)",
+                    (current_mode, target, "automatic recovery confirmed", now),
+                )
+                connection.execute(
+                    """UPDATE recovery_state SET active=0, successful_snapshots=0,
+                       next_probe_at_ms=NULL, manual_required=0, resume_pending_cycle=1,
+                       last_error=NULL WHERE singleton=1"""
+                )
+                resumed = True
+            final = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+        return {"resumed": resumed, "recovery": self._recovery_payload(final)}
+
+    def consume_resume_barrier(self):
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT resume_pending_cycle FROM recovery_state WHERE singleton=1"
+            ).fetchone()
+            pending = bool(row[0])
+            if pending:
+                connection.execute(
+                    "UPDATE recovery_state SET resume_pending_cycle=0 WHERE singleton=1"
+                )
+        return pending
+
+    def clear_recovery(self):
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE recovery_state SET active=0, category=NULL, reason=NULL,
+                   origin_mode=NULL, target_mode=NULL, attempts=0, successful_snapshots=0,
+                   started_at_ms=NULL, last_probe_at_ms=NULL, next_probe_at_ms=NULL,
+                   last_error=NULL, manual_required=0, resume_pending_cycle=0 WHERE singleton=1"""
+            )
+        return self.recovery_status()
+
     def latest_mode_event(self):
         with self.read_connection() as connection:
             row = connection.execute(
@@ -643,6 +862,18 @@ class LendingStateStore:
                 "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, ?, ?, ?)",
                 (from_mode, mode, reason, now),
             )
+            if str(reason) in {
+                "dashboard_stop",
+                "dashboard_pause",
+                "worker_build_mismatch_stopped",
+                "dashboard_started_without_live_process",
+            }:
+                connection.execute(
+                    """UPDATE recovery_state SET active=0, category=NULL, reason=NULL,
+                       origin_mode=NULL, target_mode=NULL, attempts=0, successful_snapshots=0,
+                       started_at_ms=NULL, last_probe_at_ms=NULL, next_probe_at_ms=NULL,
+                       last_error=NULL, manual_required=0, resume_pending_cycle=0 WHERE singleton=1"""
+                )
         return self.runtime()
 
     def enter_safe(self, reason, manual=False):
@@ -664,10 +895,24 @@ class LendingStateStore:
                     "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, 'SAFE', ?, ?)",
                     (current["mode"], str(reason), now),
                 )
+        category = recovery_category_for_reason(reason)
+        if category is not None:
+            self.begin_recovery(
+                category,
+                reason,
+                origin_mode=previous,
+                target_mode=previous,
+                manual_required=manual,
+                now_ms=now,
+            )
         return self.runtime()
 
     def record_consistent_sync(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
+        recovery = self.recovery_status()
+        if recovery["active"]:
+            result = self.record_recovery_snapshot(now)
+            return self.runtime() if result["resumed"] else self.runtime()
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             if (
@@ -708,17 +953,25 @@ class LendingStateStore:
     def _resume_safe(connection, row, now, reason):
         target = LendingStateStore._safe_resume_target(row)
         connection.execute(
-            """UPDATE runtime_state SET mode = ?, previous_mode = NULL, safe_reason = NULL,
+            """UPDATE runtime_state SET mode = 'SAFE', previous_mode = ?, safe_reason = ?,
                safe_manual = 0, consistent_syncs = 0, last_consistent_sync_ms = NULL,
                updated_at_ms = ? WHERE singleton = 1""",
-            (target, now),
+            (target, "POST_AMBIGUOUS_RECONCILIATION", now),
+        )
+        connection.execute(
+            """UPDATE recovery_state SET active=1, category='AMBIGUOUS_WRITE', reason=?,
+               origin_mode=?, target_mode=?, attempts=0, successful_snapshots=0,
+               required_snapshots=2, started_at_ms=?, last_probe_at_ms=?,
+               next_probe_at_ms=?, last_error=NULL, manual_required=0,
+               resume_pending_cycle=0 WHERE singleton=1""",
+            (str(reason), target, target, now, now, now + RECOVERY_MINIMUM_GAP_MS),
         )
         connection.execute(
             """INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms)
-               VALUES('SAFE', ?, ?, ?)""",
-            (target, str(reason), now),
+               VALUES('SAFE', 'SAFE', ?, ?)""",
+            (f"{reason}; awaiting clean snapshots", now),
         )
-        return target
+        return "SAFE"
 
     def observe_ambiguous_cancel(self, active_offer_ids, now_ms=None):
         """Resolve an uncertain cancel from repeated authoritative Offers snapshots.

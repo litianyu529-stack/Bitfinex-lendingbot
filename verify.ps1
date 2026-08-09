@@ -14,14 +14,18 @@ python -m pytest -q `
     --cov=StateStore `
     --cov=StrategyV3 `
     --cov=WriteRecovery `
+    --cov=Recovery `
     --cov-branch `
     --cov-report=term-missing `
     --cov-fail-under=75
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# V3.1 pure strategy core includes branch data from the run above and must stay
+# V3.2 pure strategy core includes branch data from the run above and must stay
 # above the release threshold independently of the integration-heavy runtime.
 python -m coverage report --include=StrategyV3.py --fail-under=90
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+python -m coverage report --include=Recovery.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 node --check www/lendingbot.js

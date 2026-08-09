@@ -163,12 +163,12 @@ def test_manual_safe_resolution_returns_only_to_paused():
     assert mode_after_ambiguous_resolution(0, "LIVE", False) == "LIVE"
 
 
-def test_schema_v9_is_explicit(tmp_path):
+def test_schema_v10_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "9"
+    assert version == "10"
     assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
@@ -189,9 +189,10 @@ def test_schema_v9_is_explicit(tmp_path):
     assert "amount_original" in offer_history_columns
     assert {"chain_key", "stage", "benchmark_rate", "floor_rate"} <= reprice_columns
     assert "market_anchor_rate" in reprice_chain_columns
+    assert store.recovery_status()["requiredSnapshots"] == 2
 
 
-def test_schema_v9_migrates_offer_history_without_losing_rows(tmp_path):
+def test_schema_v10_migrates_offer_history_without_losing_rows(tmp_path):
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -219,7 +220,7 @@ def test_schema_v9_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "9"
+    assert version == "10"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 
@@ -355,11 +356,15 @@ def ambiguous_store(tmp_path):
     return store, intent
 
 
-def test_unique_authoritative_offer_reconciles_to_paused(tmp_path):
+def test_unique_authoritative_offer_requires_two_clean_snapshots_then_pauses(tmp_path):
     store, intent = ambiguous_store(tmp_path)
     store.reconcile_offers([matching_offer(9001)])
     resolved = store.reconcile_ambiguous_candidates()
     assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
+    assert store.runtime()["mode"] == "SAFE"
+    base = store.recovery_status()["lastProbeAt"]
+    store.record_consistent_sync(base + 30_000)
+    store.record_consistent_sync(base + 60_000)
     assert store.runtime()["mode"] == "PAUSED"
     assert store.offers(active_only=True)[0]["managed"] == 1
 
@@ -395,6 +400,9 @@ def test_unique_ambiguous_submit_match_automatically_resumes_live(tmp_path):
     resolved = store.reconcile_ambiguous_candidates(now_ms=1_000_000)
 
     assert resolved == [{"intentId": intent["id"], "offerId": 9001}]
+    assert store.runtime()["mode"] == "SAFE"
+    store.record_consistent_sync(1_030_000)
+    store.record_consistent_sync(1_060_000)
     assert store.runtime()["mode"] == "LIVE"
     assert store.intent(intent["id"])["resolution"] == "AUTO_UNIQUE_MATCH"
 
@@ -412,6 +420,9 @@ def test_ambiguous_submit_absence_requires_two_authoritative_history_snapshots(t
     assert store.runtime()["mode"] == "SAFE"
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=1_060_000)
 
+    assert store.runtime()["mode"] == "SAFE"
+    store.record_consistent_sync(1_090_000)
+    store.record_consistent_sync(1_120_000)
     assert store.runtime()["mode"] == "LIVE"
     assert store.intent(intent["id"])["state"] == "CLOSED"
     assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
@@ -444,6 +455,8 @@ def test_unrelated_same_period_history_does_not_block_absence_recovery(tmp_path)
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 60_000)
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 90_000)
 
+    store.record_consistent_sync(request_ms + 120_000)
+    store.record_consistent_sync(request_ms + 150_000)
     assert store.runtime()["mode"] == "LIVE"
     assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
 
@@ -500,6 +513,9 @@ def test_ambiguous_cancel_present_automatically_resumes_live_for_retry(tmp_path)
     assert store.runtime()["mode"] == "SAFE"
     store.observe_ambiguous_cancel({9001}, now_ms=1_030_000)
 
+    assert store.runtime()["mode"] == "SAFE"
+    store.record_consistent_sync(1_060_000)
+    store.record_consistent_sync(1_090_000)
     assert store.runtime()["mode"] == "LIVE"
     with store.read_connection() as connection:
         event = connection.execute("SELECT * FROM ownership_events ORDER BY id DESC LIMIT 1").fetchone()
@@ -515,6 +531,9 @@ def test_ambiguous_cancel_absent_automatically_resumes_live(tmp_path):
     store.observe_ambiguous_cancel(set(), now_ms=1_000_000)
     store.observe_ambiguous_cancel(set(), now_ms=1_030_000)
 
+    assert store.runtime()["mode"] == "SAFE"
+    store.record_consistent_sync(1_060_000)
+    store.record_consistent_sync(1_090_000)
     assert store.runtime()["mode"] == "LIVE"
     with store.read_connection() as connection:
         event_type = connection.execute("SELECT event_type FROM ownership_events ORDER BY id DESC LIMIT 1").fetchone()[
@@ -657,6 +676,8 @@ def test_empty_authoritative_histories_automatically_resume_live(tmp_path):
     assert runtime.sync_ambiguous_write_history([intent], request_ms + 90_000) is True
     store.reconcile_ambiguous_candidates(confirm_absent=True, now_ms=request_ms + 90_000)
 
+    store.record_consistent_sync(request_ms + 120_000)
+    store.record_consistent_sync(request_ms + 150_000)
     assert store.runtime()["mode"] == "LIVE"
     assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
 

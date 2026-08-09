@@ -11,21 +11,47 @@ from urllib import error, parse, request
 from DomainTypes import WriteOutcome, WriteResult
 
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 
 
 class BitfinexApiError(Exception):
-    pass
+    def __init__(
+        self,
+        message,
+        *,
+        retryable=False,
+        category="BITFINEX_API",
+        status_code=None,
+        manual_required=False,
+    ):
+        super().__init__(str(message))
+        self.retryable = bool(retryable)
+        self.category = str(category)
+        self.status_code = status_code
+        self.manual_required = bool(manual_required)
 
 
 class BitfinexAmbiguousWriteError(BitfinexApiError):
     """The request may have reached Bitfinex but no authoritative result was received."""
 
-    pass
+    def __init__(self, message):
+        super().__init__(message, category="AMBIGUOUS_WRITE", manual_required=True)
+
+
+class BitfinexTransientError(BitfinexApiError):
+    def __init__(self, message, *, category="NETWORK_TRANSPORT", status_code=None):
+        super().__init__(message, retryable=True, category=category, status_code=status_code)
 
 
 FUNDING_OFFER_TYPES = {"LIMIT", "FRR", "FRRDELTAFIX", "FRRDELTAVAR"}
 HIDDEN_OFFER_FLAG = 64
+
+
+def _write_rejection_category(message):
+    value = str(message).lower()
+    if "balance" in value and any(token in value for token in ("not enough", "insufficient", "available")):
+        return "BALANCE_DRIFT"
+    return "WRITE_REJECTED"
 
 
 class Bitfinex:
@@ -100,7 +126,19 @@ class Bitfinex:
                 content = json.loads(raw)
             except ValueError:
                 content = raw
-            raise BitfinexApiError(f"HTTP {exc.code} {exc.reason}: {content}") from exc
+            message = f"HTTP {exc.code} {exc.reason}: {content}"
+            retryable = exc.code in {408, 425, 429} or 500 <= exc.code <= 599
+            if ambiguous_on_failure and retryable:
+                raise BitfinexAmbiguousWriteError(message) from exc
+            if retryable:
+                raise BitfinexTransientError(message, category="BITFINEX_HTTP_TRANSIENT", status_code=exc.code) from exc
+            category = "AUTH_PERMISSION" if exc.code in {401, 403} else "BITFINEX_HTTP"
+            raise BitfinexApiError(
+                message,
+                category=category,
+                status_code=exc.code,
+                manual_required=exc.code in {401, 403},
+            ) from exc
         except (
             error.URLError,
             TimeoutError,
@@ -113,7 +151,7 @@ class Bitfinex:
         ) as exc:
             if ambiguous_on_failure:
                 raise BitfinexAmbiguousWriteError("Bitfinex write result is unknown after a transport failure") from exc
-            raise BitfinexApiError(str(exc)) from exc
+            raise BitfinexTransientError(str(exc)) from exc
 
         try:
             payload = json.loads(raw)
@@ -122,7 +160,9 @@ class Bitfinex:
                 raise BitfinexAmbiguousWriteError(
                     "Bitfinex write result is unknown because the response was not valid JSON"
                 ) from exc
-            raise BitfinexApiError(f"Invalid JSON response: {raw[:200]}") from exc
+            raise BitfinexTransientError(
+                f"Invalid JSON response: {raw[:200]}", category="INVALID_READ_RESPONSE"
+            ) from exc
         if isinstance(payload, list) and payload and payload[0] == "error":
             raise BitfinexApiError(str(payload))
         return payload
@@ -151,16 +191,23 @@ class Bitfinex:
         status = str(response[6] or "").upper()
         if status != "SUCCESS":
             message = response[7] or response
-            raise BitfinexApiError(f"Bitfinex write failed ({status or 'UNKNOWN'}): {message}")
+            rendered = f"Bitfinex write failed ({status or 'UNKNOWN'}): {message}"
+            category = _write_rejection_category(rendered)
+            raise BitfinexApiError(rendered, category=category, retryable=category == "BALANCE_DRIFT")
         return response
 
     def _auth_write_result(self, path, payload=None):
         try:
             return WriteResult(WriteOutcome.CONFIRMED, response=self._auth_write(path, payload))
         except BitfinexAmbiguousWriteError as exc:
-            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc), category=exc.category)
         except BitfinexApiError as exc:
-            return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
+            return WriteResult(
+                WriteOutcome.DEFINITE_REJECT,
+                error=str(exc),
+                category=exc.category,
+                retryable=exc.retryable,
+            )
 
     def _public_get(self, path, query=None):
         url = f"{self.PUBLIC_BASE_URL}/{path}"

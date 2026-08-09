@@ -15,6 +15,8 @@ class WriteResult:
     outcome: WriteOutcome
     response: Any = None
     error: str = ""
+    category: str = ""
+    retryable: bool = False
 
 
 @dataclass(frozen=True)

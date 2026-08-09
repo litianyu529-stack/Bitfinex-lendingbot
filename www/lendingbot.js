@@ -556,7 +556,9 @@ function renderStatus() {
     const valid = status.schemaVersion === 3 && !status.legacyIgnored && Boolean(status.last_update);
     const stale = valid && statusIsStale(status);
     const mode = statusMode(status);
-    const account = valid ? status.account || {} : {};
+    const snapshotAvailable = status.snapshotAvailable !== false;
+    const accountValid = valid && snapshotAvailable;
+    const account = accountValid ? status.account || {} : {};
     const total = safeNumber(account.total);
     const lent = safeNumber(account.credits);
     const offers = safeNumber(account.offers);
@@ -566,14 +568,14 @@ function renderStatus() {
     const incomeSync = valid ? status.incomeHistorySync || {} : {};
     const currency = status.strategyV3?.currency || status.outputCurrency?.currency || "USD";
 
-    $("totalCoins").textContent = valid ? formatAmount(total) : "--";
-    $("totalLent").textContent = valid ? formatAmount(lent) : "--";
-    $("totalOffers").textContent = valid ? formatAmount(offers) : "--";
-    $("totalAvailable").textContent = valid ? formatAmount(available) : "--";
-    $("totalCoins").title = valid
+    $("totalCoins").textContent = accountValid ? formatAmount(total) : "--";
+    $("totalLent").textContent = accountValid ? formatAmount(lent) : "--";
+    $("totalOffers").textContent = accountValid ? formatAmount(offers) : "--";
+    $("totalAvailable").textContent = accountValid ? formatAmount(available) : "--";
+    $("totalCoins").title = accountValid
         ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} USD；组成项对账 ${account.reconciliationStatus || "--"}`
         : "";
-    $("totalLent").title = valid
+    $("totalLent").title = accountValid
         ? `Funding Credits ${formatAmount(account.creditPrincipal)} USD + Funding Loans ${formatAmount(account.loanPrincipal)} USD`
         : "";
     $("earningsToday").textContent = realized.today != null
@@ -603,22 +605,33 @@ function renderStatus() {
     $("offerCount").textContent = status.snapshotAvailable === false
         ? "--"
         : `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
-    $("chartTotal").textContent = valid ? formatAmount(total) : "--";
+    $("chartTotal").textContent = accountValid ? formatAmount(total) : "--";
     const safeReason = status.runtime?.safe_reason;
-    const recoverySyncs = Math.max(0, Math.min(2, Number(status.runtime?.consistent_syncs || 0)));
-    const recoveryDetail = mode === "SAFE" ? ` · 自动对账 ${recoverySyncs}/2` : "";
+    const recovery = status.recovery || {};
+    const recoverySyncs = Math.max(0, Number(recovery.successfulSnapshots || 0));
+    const recoveryRequired = Math.max(2, Number(recovery.requiredSnapshots || 2));
+    const nextRetrySeconds = recovery.nextProbeAt
+        ? Math.max(0, Math.ceil((Number(recovery.nextProbeAt) - Date.now()) / 1000))
+        : null;
+    const recoveryDetail = recovery.active
+        ? (recovery.manualRequired
+            ? " · 需要人工处理"
+            : ` · 权威快照 ${recoverySyncs}/${recoveryRequired}${nextRetrySeconds === null ? "" : ` · ${nextRetrySeconds}秒后重试`}`)
+        : "";
     $("statusHeadline").textContent = stale
         ? "状态已过期，请检查实盘进程或网络。"
-        : (mode === "SAFE"
-            ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}${recoveryDetail}`
-            : (status.last_status || "实盘状态已同步。"));
+        : (recovery.active
+            ? `${recovery.manualRequired ? "需要人工处理" : "自动修复中"}：${recovery.reason || safeReason || "正在重新读取权威数据"}${recoveryDetail}`
+            : (mode === "SAFE"
+            ? `SAFE：${safeReason || status.last_status || "策略已安全暂停"}`
+            : (status.last_status || "实盘状态已同步。")));
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.1 · ${mode}`);
-    badge.classList.toggle("invalid", !valid || stale || mode === "SAFE");
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.1 · 已过期" : `V3.1 · ${mode}`);
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.2 · ${mode}`);
+    badge.classList.toggle("invalid", !valid || stale || mode === "SAFE" || recovery.active);
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.2 · 已过期" : `V3.2 · ${mode}`);
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
     const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
@@ -665,9 +678,16 @@ function renderControl() {
     rail.classList.toggle("running", running);
     const mode = statusMode();
     const stale = state.status?.last_update ? statusIsStale() : false;
-    $("controlTitle").textContent = running ? (mode === "SAFE" ? "SAFE 安全暂停" : (stale ? "进程运行 · 状态过期" : "运行中")) : "已停止";
+    const recovery = state.status?.recovery || {};
+    $("controlTitle").textContent = running
+        ? (recovery.active
+            ? (recovery.manualRequired ? "等待人工处理" : "自动修复中")
+            : (mode === "SAFE" ? "SAFE 安全暂停" : (stale ? "进程运行 · 状态过期" : "运行中")))
+        : "已停止";
     $("controlDetail").textContent = running
-        ? `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`
+        ? (recovery.active
+            ? `${recovery.manualRequired ? "自动写入保持关闭。" : "正在只读同步，恢复后将在下一正常周期继续放贷。"} 已尝试 ${Number(recovery.attempts || 0)} 次。`
+            : `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
         : "普通启动不会下单。启动实盘前必须完成只读安全预检。";
     $("primaryControlButton").textContent = running ? "停止机器人" : "启动实盘";
     $("credentialState").textContent = state.config?.credentialsConfigured ? "已配置" : "未配置";
@@ -805,7 +825,7 @@ function renderPreflight(data) {
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3.1 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    items.push(["实际 V3.2 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );

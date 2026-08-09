@@ -4,6 +4,7 @@ import time
 from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
 from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
+from Recovery import classify_runtime_error
 from StateStore import InsufficientReservedBalance
 from ExchangeModels import (
     extract_submitted_offer_id,
@@ -217,9 +218,14 @@ def _write_result(client, result_method, legacy_method, *args, **kwargs):
         response = getattr(client, legacy_method)(*args, **kwargs)
         return WriteResult(WriteOutcome.CONFIRMED, response=response)
     except BitfinexAmbiguousWriteError as exc:
-        return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+        return WriteResult(WriteOutcome.UNKNOWN, error=str(exc), category=exc.category)
     except BitfinexApiError as exc:
-        return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
+        return WriteResult(
+            WriteOutcome.DEFINITE_REJECT,
+            error=str(exc),
+            category=exc.category,
+            retryable=exc.retryable,
+        )
 
 
 def parse_ledger_rows_v3(rows):
@@ -562,10 +568,19 @@ class LendingRuntimeV3:
         current = self.store.runtime()
         if current["mode"] == "SAFE" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
             self.store.observe_ambiguous_cancel(active_offer_ids, now)
-        elif account["reconciliationStatus"] == "MATCHED":
+        elif account["reconciliationStatus"] == "MATCHED" and not snapshot.get("safeRequired"):
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
             self.store.record_consistent_sync(now)
+        elif self.store.recovery_status()["active"]:
+            reason = (
+                "MARKET_DATA_STALE"
+                if snapshot.get("safeRequired")
+                else "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN"
+                if not account["walletAvailableKnown"]
+                else "ACCOUNT_RECONCILIATION_MISMATCH"
+            )
+            self.store.record_recovery_failure(reason, now_ms=now)
         elif current["mode"] == "LIVE":
             reason = (
                 "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN"
@@ -982,6 +997,7 @@ class LendingRuntimeV3:
             "schemaVersion": 3,
             "operationMode": runtime["mode"],
             "runtime": runtime,
+            "recovery": self.store.recovery_status(),
             "marketData": {
                 key: value
                 for key, value in snapshot.items()
@@ -1015,7 +1031,7 @@ class LendingRuntimeV3:
             if runtime["mode"] == "SAFE":
                 self.log.refreshStatus(f"SAFE：{runtime.get('safe_reason') or '策略已安全暂停'}")
             else:
-                self.log.refreshStatus(f"V3.1 {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"V3.2 {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(self, plan_result, wallet_available, strategy_version):
@@ -1086,6 +1102,16 @@ class LendingRuntimeV3:
             else:
                 self.store.reject_intent(intent["id"], result.error)
                 self._log(f"USD v3 挂单被明确拒绝：{result.error}")
+                if result.category == "BALANCE_DRIFT":
+                    self.store.set_mode("PAUSED", "AUTO_RECOVERY:BALANCE_DRIFT")
+                    self.store.begin_recovery(
+                        "BALANCE_DRIFT",
+                        result.error,
+                        origin_mode="LIVE",
+                        target_mode="LIVE",
+                    )
+                    self.store.record_recovery_failure(result.error, "BALANCE_DRIFT", now)
+                    break
         return submitted
 
     @staticmethod
@@ -1479,12 +1505,32 @@ class LendingRuntimeV3:
 
     def cycle(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
+        self.store.touch_heartbeat(now)
         if not self._bootstrapped:
             self.bootstrap(start_websocket=True)
-        if now - self._last_rest_sync_ms >= self.policy.rest_stale_seconds * 1000:
+        recovery = self.store.recovery_status()
+        rest_due = now - self._last_rest_sync_ms >= self.policy.rest_stale_seconds * 1000
+        if recovery["active"]:
+            rest_due = self.store.recovery_probe_due(now)
+        if rest_due:
             try:
                 snapshot = self.sync_rest(now_ms=now)
             except BitfinexApiError as exc:
+                decision = classify_runtime_error(exc)
+                if not decision.retryable:
+                    raise
+                runtime = self.store.runtime()
+                recovery = self.store.recovery_status()
+                origin = recovery.get("targetMode") or runtime["mode"]
+                if runtime["mode"] not in {"PAUSED", "SAFE"}:
+                    self.store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
+                self.store.begin_recovery(
+                    decision.category,
+                    str(exc),
+                    origin_mode=origin,
+                    target_mode=origin,
+                )
+                self.store.record_recovery_failure(str(exc), decision.category, now)
                 snapshot = self.hub.snapshot(now)
                 self._log(f"v3 REST 同步失败：{exc}")
         else:
@@ -1504,7 +1550,8 @@ class LendingRuntimeV3:
         self.store.record_market_bars(signals.get("windows"), now)
         self._record_variable_floor_violations(now)
         runtime = self.store.runtime()
-        if runtime["mode"] == "LIVE":
+        resume_barrier = self.store.consume_resume_barrier()
+        if runtime["mode"] == "LIVE" and not resume_barrier:
             validate_policy_v3(self.policy, require_live_floors=True)
             pending_status = self._advance_pending_strategy(snapshot, account, signals, now)
             if pending_status and pending_status.get("pending"):
@@ -1567,10 +1614,14 @@ class LendingRuntimeV3:
             version = strategy["version_id"] if strategy else "3"
             self._persist_period_selection(signals, version, now)
             result = self._build_plan(account, self.policy, signals, version)
+            if resume_barrier:
+                result["recoveryResumeBarrier"] = True
+                result["submitted"] = []
         self.store.record_account_sample(
             account["total"], account["wallet"], account["offers"], account["credits"], self._net_interest_total(), now
         )
         status = self._strategy_status(snapshot, signals, result)
         if self.log is not None:
             self.log.persistStatus()
+        self.store.touch_heartbeat(now)
         return status
