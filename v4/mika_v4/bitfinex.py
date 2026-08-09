@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import threading
 import time
@@ -19,7 +20,18 @@ D = Decimal
 
 
 class BitfinexError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "BITFINEX_API",
+        retryable: bool = False,
+        manual_required: bool = False,
+    ):
+        super().__init__(message)
+        self.category = category
+        self.retryable = bool(retryable)
+        self.manual_required = bool(manual_required)
 
 
 class SlidingWindowLimiter:
@@ -118,12 +130,23 @@ class BitfinexClient:
         try:
             with self._opener(request, timeout=self.timeout_seconds) as response:
                 return self._decode(response)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise BitfinexError(f"public request failed: {path}: {exc}") from exc
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            json.JSONDecodeError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ) as exc:
+            raise BitfinexError(
+                f"public request failed: {path}: {exc}", category="NETWORK_TRANSPORT", retryable=True
+            ) from exc
 
     def auth(self, path: str, body: dict[str, Any] | None = None) -> Any:
         if not self.api_key or not self.api_secret:
-            raise BitfinexError("Bitfinex API credentials are not configured")
+            raise BitfinexError(
+                "Bitfinex API credentials are not configured", category="AUTH_PERMISSION", manual_required=True
+            )
         self.limiter.acquire()
         # Bitfinex nonces are scoped to an API key. Serialize nonce creation
         # through response receipt so a later request cannot overtake it.
@@ -153,9 +176,32 @@ class BitfinexClient:
                 return self._decode(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise BitfinexError(f"authenticated request rejected ({exc.code}): {detail}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise BitfinexError(f"authenticated request outcome unknown: {path}: {exc}") from exc
+            retryable = exc.code in {408, 425, 429} or 500 <= exc.code <= 599
+            if retryable:
+                category = "BITFINEX_HTTP_TRANSIENT"
+            elif exc.code in {401, 403}:
+                category = "AUTH_PERMISSION"
+            else:
+                category = "BITFINEX_HTTP"
+            raise BitfinexError(
+                f"authenticated request rejected ({exc.code}): {detail}",
+                category=category,
+                retryable=retryable,
+                manual_required=exc.code in {401, 403},
+            ) from exc
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            json.JSONDecodeError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+        ) as exc:
+            raise BitfinexError(
+                f"authenticated request outcome unknown: {path}: {exc}",
+                category="NETWORK_TRANSPORT",
+                retryable=True,
+            ) from exc
 
     def funding_book(self, symbol: str = "fUSD", length: int = 100) -> list[list[Any]]:
         result = self.public(f"book/{symbol}/P0", {"len": length})
@@ -212,17 +258,28 @@ class BitfinexClient:
             if isinstance(offer_rows, list)
             if isinstance(row, list) and len(row) > 15 and _symbol_currency(row[1]) == currency
         )
-        credits = tuple(
+        parsed_credits = tuple(
             _parse_credit(row, "credit")
             for row in credit_rows
             if isinstance(credit_rows, list)
             if isinstance(row, list) and len(row) > 12 and _symbol_currency(row[1]) == currency
         )
-        loans = tuple(
+        parsed_loans = tuple(
             _parse_credit(row, "loan")
             for row in loan_rows
             if isinstance(loan_rows, list)
             if isinstance(row, list) and len(row) > 12 and _symbol_currency(row[1]) == currency
+        )
+        # The same lender-side contract can appear in both authenticated
+        # endpoints. Keep Credits as the canonical representation and remove
+        # duplicate Loans so account conservation never double-counts capital.
+        credit_ids = {item.credit_id for item in parsed_credits}
+        credits = tuple(sorted(parsed_credits, key=lambda item: item.credit_id))
+        loans = tuple(
+            sorted(
+                (item for item in parsed_loans if item.credit_id not in credit_ids),
+                key=lambda item: item.credit_id,
+            )
         )
         return AccountSnapshot(
             as_of_ms=int(time.time() * 1000),
@@ -234,19 +291,72 @@ class BitfinexClient:
             authoritative=wallet_found and availability_known,
         )
 
+    def funding_offers_history(
+        self,
+        symbol: str = "fUSD",
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 250,
+    ) -> list[list[Any]]:
+        body: dict[str, Any] = {"limit": min(250, int(limit)), "sort": 1}
+        if start is not None:
+            body["start"] = int(start)
+        if end is not None:
+            body["end"] = int(end)
+        result = self.auth(f"v2/auth/r/funding/offers/{symbol}/hist", body)
+        return result if isinstance(result, list) else []
+
+    def funding_trades_history(
+        self,
+        symbol: str = "fUSD",
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 250,
+    ) -> list[list[Any]]:
+        body: dict[str, Any] = {"limit": min(250, int(limit)), "sort": 1}
+        if start is not None:
+            body["start"] = int(start)
+        if end is not None:
+            body["end"] = int(end)
+        result = self.auth(f"v2/auth/r/funding/trades/{symbol}/hist", body)
+        return result if isinstance(result, list) else []
+
     @staticmethod
     def _write_result(call: Callable[[], Any]) -> WriteResult:
         try:
             response = call()
         except BitfinexError as exc:
             text = str(exc)
-            outcome = WriteOutcome.UNKNOWN if "outcome unknown" in text else WriteOutcome.DEFINITE_REJECT
-            return WriteResult(outcome=outcome, error=text)
+            outcome = (
+                WriteOutcome.UNKNOWN
+                if exc.retryable or "outcome unknown" in text
+                else WriteOutcome.DEFINITE_REJECT
+            )
+            return WriteResult(
+                outcome=outcome,
+                error=text,
+                category=exc.category,
+                retryable=exc.retryable,
+            )
         if isinstance(response, list) and len(response) >= 8:
             status = str(response[6] or "").upper()
             if status == "SUCCESS":
                 return WriteResult(WriteOutcome.CONFIRMED, response=response)
-            return WriteResult(WriteOutcome.DEFINITE_REJECT, response=response, error=str(response[7]))
+            message = str(response[7])
+            lowered = message.lower()
+            balance_drift = any(
+                marker in lowered
+                for marker in ("not enough balance", "insufficient balance", "available balance")
+            )
+            return WriteResult(
+                WriteOutcome.DEFINITE_REJECT,
+                response=response,
+                error=message,
+                category="BALANCE_DRIFT" if balance_drift else "WRITE_REJECTED",
+                retryable=balance_drift,
+            )
         return WriteResult(WriteOutcome.UNKNOWN, response=response, error="unrecognized Bitfinex write response")
 
     def submit_offer(self, amount: D, rate: D, period: int, symbol: str = "fUSD") -> WriteResult:

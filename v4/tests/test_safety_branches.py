@@ -351,7 +351,9 @@ def test_bitfinex_public_auth_and_parsers() -> None:
     account = client.account_snapshot()
     assert account.offers[0].fill_fraction == D("0.5")
     assert account.credits[0].funding_state == "credit"
-    assert account.loans[0].funding_state == "loan"
+    assert not account.loans  # Duplicate lender-side rows are counted only once.
+    assert client.funding_offers_history(start=1, end=2) == []
+    assert client.funding_trades_history(start=1, end=2) == []
     assert client.submit_offer(D("150"), D("0.0003"), 2).outcome == WriteOutcome.CONFIRMED
     assert client.cancel_offer(77).outcome == WriteOutcome.CONFIRMED
     assert requests[-1].headers["Bfx-apikey"] == "key"

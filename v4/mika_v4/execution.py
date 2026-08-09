@@ -41,7 +41,6 @@ class SafeExecutor:
             offer = open_by_id[offer_id]
             self.store.update_rung_snapshot(offer_id, offer.amount, offer.status, account.as_of_ms)
         self.store.close_missing_rungs(set(open_by_id), account.as_of_ms)
-        self.store.reconcile_ambiguous(account)
 
     def reconcile(
         self,
@@ -129,12 +128,18 @@ class SafeExecutor:
                 result = self.client.cancel_offer(offer_id)
                 if result.outcome == WriteOutcome.UNKNOWN:
                     self.store.set_intent_state(fingerprint, IntentState.AMBIGUOUS, result.error)
-                    self.store.enter_safe(f"cancel outcome unknown for offer {offer_id}")
+                    self.store.enter_safe(
+                        f"cancel outcome unknown for offer {offer_id}",
+                        category="AMBIGUOUS_WRITE",
+                    )
                     return "SAFE_UNKNOWN_CANCEL"
                 if result.outcome == WriteOutcome.DEFINITE_REJECT:
                     self.store.set_intent_state(fingerprint, IntentState.REJECTED, result.error)
                     self.store.record_event("ERROR", "CANCEL_REJECTED", {"offer_id": offer_id, "error": result.error})
                     self.store.clear_pending_plan()
+                    if result.category == "BALANCE_DRIFT":
+                        self.store.enter_safe(str(result.error), category="BALANCE_DRIFT")
+                        return "RECOVERY_BALANCE_DRIFT"
                     return "CANCEL_REJECTED"
                 self.store.set_intent_state(fingerprint, IntentState.CONFIRMED)
             return "CANCELS_SUBMITTED"
@@ -176,17 +181,26 @@ class SafeExecutor:
             result = self.client.submit_offer(offer.amount, offer.rate, offer.period)
             if result.outcome == WriteOutcome.UNKNOWN:
                 self.store.set_intent_state(fingerprint, IntentState.AMBIGUOUS, result.error)
-                self.store.enter_safe(f"submit outcome unknown for {offer.key}")
+                self.store.enter_safe(
+                    f"submit outcome unknown for {offer.key}",
+                    category="AMBIGUOUS_WRITE",
+                )
                 return "SAFE_UNKNOWN_SUBMIT"
             if result.outcome == WriteOutcome.DEFINITE_REJECT:
                 self.store.set_intent_state(fingerprint, IntentState.REJECTED, result.error)
                 self.store.mark_rung_rejected(offer.key)
                 self.store.record_event("ERROR", "SUBMIT_REJECTED", {"key": offer.key, "error": result.error})
+                if result.category == "BALANCE_DRIFT":
+                    self.store.enter_safe(str(result.error), category="BALANCE_DRIFT")
+                    return "RECOVERY_BALANCE_DRIFT"
                 continue
             offer_id = submitted_offer_id(result.response)
             if offer_id is None:
                 self.store.set_intent_state(fingerprint, IntentState.AMBIGUOUS, "confirmed response had no offer id")
-                self.store.enter_safe(f"submit confirmation missing offer id for {offer.key}")
+                self.store.enter_safe(
+                    f"submit confirmation missing offer id for {offer.key}",
+                    category="AMBIGUOUS_WRITE",
+                )
                 return "SAFE_MISSING_OFFER_ID"
             self.store.update_rung_offer(offer.key, offer_id)
             self.store.set_intent_state(fingerprint, IntentState.CONFIRMED)

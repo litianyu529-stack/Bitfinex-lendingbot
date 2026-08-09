@@ -18,10 +18,11 @@ from .domain import (
     PlannerState,
     RuntimeMode,
 )
+from .recovery import MINIMUM_GAP_MS, REQUIRED_SNAPSHOTS, delay_seconds
 
 
 D = Decimal
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _encode(value: Any) -> Any:
@@ -74,7 +75,32 @@ class V4Store:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._backup_before_migration()
         self._initialize()
+
+    def _backup_before_migration(self) -> None:
+        if not self.path.exists():
+            return
+        source = sqlite3.connect(self.path)
+        try:
+            row = source.execute("SELECT version FROM schema_info LIMIT 1").fetchone()
+        except sqlite3.Error:
+            source.close()
+            return
+        version = int(row[0]) if row else 0
+        if version >= SCHEMA_VERSION:
+            source.close()
+            return
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target_path = backup_dir / f"schema-v{version}-{stamp}.sqlite3"
+        target = sqlite3.connect(target_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -95,13 +121,23 @@ class V4Store:
         with self.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info(version) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
+                INSERT INTO schema_info(version) SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_info);
                 CREATE TABLE IF NOT EXISTS runtime_state(
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), mode TEXT NOT NULL,
                     previous_mode TEXT NOT NULL, safe_reason TEXT, consistent_syncs INTEGER NOT NULL DEFAULT 0,
                     last_authoritative_ms INTEGER, updated_at_ms INTEGER NOT NULL
                 );
                 INSERT OR IGNORE INTO runtime_state VALUES(1,'SHADOW','SHADOW',NULL,0,NULL,0);
+                CREATE TABLE IF NOT EXISTS recovery_state(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1), active INTEGER NOT NULL DEFAULT 0,
+                    category TEXT, reason TEXT, origin_mode TEXT, target_mode TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0, successful_snapshots INTEGER NOT NULL DEFAULT 0,
+                    required_snapshots INTEGER NOT NULL DEFAULT 2, started_at_ms INTEGER,
+                    last_probe_at_ms INTEGER, next_probe_at_ms INTEGER, last_error TEXT,
+                    heartbeat_at_ms INTEGER, manual_required INTEGER NOT NULL DEFAULT 0,
+                    resume_pending_cycle INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO recovery_state VALUES(1,0,NULL,NULL,NULL,NULL,0,0,2,NULL,NULL,NULL,NULL,NULL,0,0);
                 CREATE TABLE IF NOT EXISTS planner_state(
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1), payload TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
                 );
@@ -172,6 +208,10 @@ class V4Store:
                     passed INTEGER NOT NULL, payload TEXT NOT NULL
                 );
             """)
+            version = int(db.execute("SELECT version FROM schema_info LIMIT 1").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(f"V4 database schema {version} is newer than supported {SCHEMA_VERSION}")
+            db.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
 
     @staticmethod
     def fingerprint(plan: AllocationPlan) -> str:
@@ -194,7 +234,7 @@ class V4Store:
         with self.connect() as db:
             return RuntimeMode(db.execute("SELECT mode FROM runtime_state WHERE singleton=1").fetchone()[0])
 
-    def set_mode(self, mode: RuntimeMode) -> None:
+    def set_mode(self, mode: RuntimeMode, *, manual: bool = True) -> None:
         if mode == RuntimeMode.SAFE:
             raise ValueError("use enter_safe")
         now = int(time.time() * 1000)
@@ -203,8 +243,21 @@ class V4Store:
                 "UPDATE runtime_state SET mode=?, previous_mode=?, safe_reason=NULL, consistent_syncs=0, updated_at_ms=? WHERE singleton=1",
                 (mode.value, mode.value, now),
             )
+            if manual:
+                db.execute(
+                    """UPDATE recovery_state SET active=0,category=NULL,reason=NULL,origin_mode=NULL,
+                       target_mode=NULL,attempts=0,successful_snapshots=0,started_at_ms=NULL,
+                       last_probe_at_ms=NULL,next_probe_at_ms=NULL,last_error=NULL,
+                       manual_required=0,resume_pending_cycle=0 WHERE singleton=1"""
+                )
 
-    def enter_safe(self, reason: str) -> None:
+    def enter_safe(
+        self,
+        reason: str,
+        *,
+        category: str = "ACCOUNT_DATA",
+        manual_required: bool = False,
+    ) -> None:
         now = int(time.time() * 1000)
         with self.connect() as db:
             row = db.execute("SELECT mode,previous_mode FROM runtime_state WHERE singleton=1").fetchone()
@@ -214,25 +267,132 @@ class V4Store:
                 (previous, reason, now),
             )
             self._event(db, "ERROR", "SAFE_ENTERED", {"reason": reason})
+        self.begin_recovery(
+            category,
+            reason,
+            origin_mode=previous,
+            target_mode=previous,
+            manual_required=manual_required,
+            now_ms=now,
+        )
 
     def safe_reason(self) -> str | None:
         with self.connect() as db:
             return db.execute("SELECT safe_reason FROM runtime_state WHERE singleton=1").fetchone()[0]
 
-    def record_consistent_snapshot(self, as_of_ms: int, minimum_gap_ms: int = 30_000) -> bool:
+    @staticmethod
+    def _recovery_payload(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        return {
+            "active": bool(value["active"]),
+            "category": value["category"],
+            "reason": value["reason"],
+            "originMode": value["origin_mode"],
+            "targetMode": value["target_mode"],
+            "attempts": int(value["attempts"] or 0),
+            "successfulSnapshots": int(value["successful_snapshots"] or 0),
+            "requiredSnapshots": int(value["required_snapshots"] or REQUIRED_SNAPSHOTS),
+            "startedAt": value["started_at_ms"],
+            "lastProbeAt": value["last_probe_at_ms"],
+            "nextProbeAt": value["next_probe_at_ms"],
+            "lastError": value["last_error"],
+            "heartbeatAt": value["heartbeat_at_ms"],
+            "manualRequired": bool(value["manual_required"]),
+        }
+
+    def recovery_status(self) -> dict[str, Any]:
         with self.connect() as db:
-            row = db.execute(
-                "SELECT mode,previous_mode,consistent_syncs,last_authoritative_ms FROM runtime_state WHERE singleton=1"
-            ).fetchone()
-            if row[0] != RuntimeMode.SAFE.value:
+            row = db.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+        return self._recovery_payload(row)
+
+    def begin_recovery(
+        self,
+        category: str,
+        reason: str,
+        *,
+        origin_mode: str | RuntimeMode | None = None,
+        target_mode: str | RuntimeMode | None = None,
+        manual_required: bool = False,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self.connect() as db:
+            runtime = db.execute("SELECT mode,previous_mode FROM runtime_state WHERE singleton=1").fetchone()
+            current = db.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            origin = str(getattr(origin_mode, "value", origin_mode) or runtime[1] or runtime[0])
+            target = str(getattr(target_mode, "value", target_mode) or origin)
+            if target not in {"LIVE", "SHADOW", "PAUSED"}:
+                target = "PAUSED"
+            attempts = int(current["attempts"] or 0) if current["active"] else 0
+            started = current["started_at_ms"] if current["active"] else now
+            db.execute(
+                """UPDATE recovery_state SET active=1,category=?,reason=?,origin_mode=?,target_mode=?,
+                   attempts=?,successful_snapshots=0,required_snapshots=?,started_at_ms=?,
+                   last_probe_at_ms=NULL,next_probe_at_ms=?,last_error=?,manual_required=?,
+                   resume_pending_cycle=0 WHERE singleton=1""",
+                (
+                    category,
+                    reason,
+                    origin,
+                    target,
+                    attempts,
+                    REQUIRED_SNAPSHOTS,
+                    started,
+                    None if manual_required else now + delay_seconds(attempts) * 1000,
+                    reason,
+                    int(manual_required),
+                ),
+            )
+        return self.recovery_status()
+
+    def recovery_probe_due(self, now_ms: int | None = None) -> bool:
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+        return bool(
+            row["active"]
+            and not row["manual_required"]
+            and (row["next_probe_at_ms"] is None or now >= int(row["next_probe_at_ms"]))
+        )
+
+    def record_recovery_failure(self, error: str, category: str | None = None, now_ms: int | None = None) -> None:
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if not row["active"] or row["manual_required"]:
+                return
+            attempts = int(row["attempts"] or 0) + 1
+            db.execute(
+                """UPDATE recovery_state SET category=COALESCE(?,category),attempts=?,
+                   successful_snapshots=0,last_probe_at_ms=?,next_probe_at_ms=?,last_error=?
+                   WHERE singleton=1""",
+                (category, attempts, now, now + delay_seconds(attempts - 1) * 1000, error),
+            )
+
+    def touch_heartbeat(self, now_ms: int | None = None) -> None:
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        with self.connect() as db:
+            db.execute("UPDATE recovery_state SET heartbeat_at_ms=? WHERE singleton=1", (now,))
+
+    def consume_resume_barrier(self) -> bool:
+        with self.connect() as db:
+            pending = bool(db.execute("SELECT resume_pending_cycle FROM recovery_state WHERE singleton=1").fetchone()[0])
+            if pending:
+                db.execute("UPDATE recovery_state SET resume_pending_cycle=0 WHERE singleton=1")
+        return pending
+
+    def record_consistent_snapshot(self, as_of_ms: int, minimum_gap_ms: int = MINIMUM_GAP_MS) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if not row["active"] or row["manual_required"]:
                 return False
-            last = row[3]
-            count = int(row[2])
+            last = row["last_probe_at_ms"]
+            count = int(row["successful_snapshots"])
             if last is None or int(as_of_ms) - int(last) >= minimum_gap_ms:
                 count += 1
                 db.execute(
-                    "UPDATE runtime_state SET consistent_syncs=?,last_authoritative_ms=?,updated_at_ms=? WHERE singleton=1",
-                    (count, int(as_of_ms), int(time.time() * 1000)),
+                    "UPDATE recovery_state SET successful_snapshots=?,last_probe_at_ms=?,next_probe_at_ms=?,last_error=NULL WHERE singleton=1",
+                    (count, int(as_of_ms), int(as_of_ms) + minimum_gap_ms),
                 )
             if count < 2:
                 return False
@@ -241,10 +401,14 @@ class V4Store:
             ).fetchone()[0]
             if unresolved:
                 return False
-            restored = row[1] if row[1] != RuntimeMode.LIVE.value else RuntimeMode.PAUSED.value
+            restored = row["target_mode"] if row["target_mode"] in {"LIVE", "SHADOW", "PAUSED"} else "PAUSED"
             db.execute(
                 "UPDATE runtime_state SET mode=?,previous_mode=?,safe_reason=NULL,consistent_syncs=0,updated_at_ms=? WHERE singleton=1",
                 (restored, restored, int(time.time() * 1000)),
+            )
+            db.execute(
+                """UPDATE recovery_state SET active=0,successful_snapshots=0,next_probe_at_ms=NULL,
+                   last_error=NULL,manual_required=0,resume_pending_cycle=1 WHERE singleton=1"""
             )
             self._event(db, "INFO", "SAFE_RECOVERED", {"mode": restored})
             return True
@@ -525,11 +689,55 @@ class V4Store:
                 ),
             )
 
-    def reconcile_ambiguous(self, snapshot: Any) -> None:
-        """Resolve unknown writes only after the same authoritative evidence is seen twice."""
+    def reconcile_ambiguous(
+        self,
+        snapshot: Any,
+        *,
+        offer_history: list[list[Any]] | None = None,
+        trade_history: list[list[Any]] | None = None,
+        history_authoritative: bool = False,
+    ) -> bool:
+        """Resolve unknown writes only from two matching authoritative observations.
+
+        Active offers and authenticated offer/trade history are considered together.
+        More than one possible submit match is deliberately unrecoverable without a
+        human, because choosing one could cause a duplicate order.
+        """
         if not snapshot.authoritative:
-            return
+            return False
         offers = {int(item.offer_id): item for item in snapshot.offers}
+        historical_offers: dict[int, dict[str, Any]] = {}
+        for item in offer_history or []:
+            if not isinstance(item, (list, tuple)) or len(item) <= 15:
+                continue
+            try:
+                historical_offers[int(item[0])] = {
+                    "offer_id": int(item[0]),
+                    "mts": int(item[2] or item[3] or 0),
+                    "amount": abs(D(str(item[5]))),
+                    "rate": D(str(item[14])),
+                    "period": int(item[15]),
+                }
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+        historical_trades: list[dict[str, Any]] = []
+        for item in trade_history or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 7:
+                continue
+            try:
+                historical_trades.append(
+                    {
+                        "offer_id": int(item[3]),
+                        "mts": int(item[2]),
+                        "amount": abs(D(str(item[4]))),
+                        "rate": D(str(item[5])),
+                        "period": int(item[6]),
+                    }
+                )
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+        manual_reason: str | None = None
+        resolved_any = False
         with self.connect() as db:
             rows = db.execute(
                 "SELECT * FROM execution_intents WHERE state IN ('SUBMITTING','AMBIGUOUS') ORDER BY id"
@@ -537,19 +745,39 @@ class V4Store:
             for row in rows:
                 candidate: str | None = None
                 if row["action"] == "CANCEL" and row["offer_id"] is not None:
-                    if int(row["offer_id"]) not in offers:
-                        candidate = "ABSENT"
+                    candidate = "PRESENT" if int(row["offer_id"]) in offers else "ABSENT"
                 elif row["action"] == "SUBMIT":
-                    matching = [
-                        item
+                    created = int(row["created_at_ms"])
+                    candidate_ids = {
+                        int(item.offer_id)
                         for item in snapshot.offers
                         if D(item.amount_original) == D(row["amount"])
                         and D(item.rate) == D(row["rate"])
                         and int(item.period) == int(row["period"])
-                        and int(item.mts_created) >= int(row["created_at_ms"]) - 5_000
-                    ]
-                    if len(matching) == 1:
-                        candidate = str(matching[0].offer_id)
+                        and created - 5_000 <= int(item.mts_created) <= created + 600_000
+                    }
+                    candidate_ids.update(
+                        item["offer_id"]
+                        for item in historical_offers.values()
+                        if item["amount"] == D(row["amount"])
+                        and item["rate"] == D(row["rate"])
+                        and item["period"] == int(row["period"])
+                        and created - 5_000 <= item["mts"] <= created + 600_000
+                    )
+                    candidate_ids.update(
+                        item["offer_id"]
+                        for item in historical_trades
+                        if item["rate"] == D(row["rate"])
+                        and item["period"] == int(row["period"])
+                        and created - 5_000 <= item["mts"] <= created + 600_000
+                    )
+                    if len(candidate_ids) > 1:
+                        manual_reason = f"multiple possible matches for {row['fingerprint']}"
+                        break
+                    if len(candidate_ids) == 1:
+                        candidate = str(next(iter(candidate_ids)))
+                    elif history_authoritative and snapshot.as_of_ms - created >= 60_000:
+                        candidate = "ABSENT"
                 kind = f"ambiguous:{row['fingerprint']}"
                 if candidate is None:
                     db.execute("DELETE FROM confirmations WHERE kind=?", (kind,))
@@ -567,16 +795,56 @@ class V4Store:
                 )
                 if count < 2:
                     continue
+                resolved_any = True
+                resolved_state = "CONFIRMED"
+                resolved_error = None
+                if candidate in {"ABSENT", "PRESENT"} and row["action"] == "SUBMIT":
+                    resolved_state = "CLOSED"
+                    resolved_error = "two authoritative observations confirm no submitted offer"
+                elif candidate == "PRESENT" and row["action"] == "CANCEL":
+                    resolved_state = "CLOSED"
+                    resolved_error = "two authoritative observations confirm cancellation did not apply"
                 db.execute(
-                    "UPDATE execution_intents SET state='CONFIRMED',error=NULL,updated_at_ms=? WHERE id=?",
-                    (snapshot.as_of_ms, row["id"]),
+                    "UPDATE execution_intents SET state=?,error=?,updated_at_ms=? WHERE id=?",
+                    (resolved_state, resolved_error, snapshot.as_of_ms, row["id"]),
                 )
-                if row["action"] == "SUBMIT" and row["offer_key"]:
+                if row["action"] == "SUBMIT" and row["offer_key"] and candidate != "ABSENT":
                     db.execute(
                         "UPDATE grid_rungs SET offer_id=?,status='OPEN',updated_at_ms=? WHERE offer_key=?",
                         (int(candidate), snapshot.as_of_ms, row["offer_key"]),
                     )
+                elif row["action"] == "SUBMIT" and row["offer_key"]:
+                    db.execute(
+                        "UPDATE grid_rungs SET status='REJECTED',updated_at_ms=? WHERE offer_key=?",
+                        (snapshot.as_of_ms, row["offer_key"]),
+                    )
                 db.execute("DELETE FROM confirmations WHERE kind=?", (kind,))
+        if manual_reason:
+            recovery = self.recovery_status()
+            self.begin_recovery(
+                "AMBIGUOUS_MULTIPLE_MATCHES",
+                manual_reason,
+                origin_mode=recovery.get("originMode"),
+                target_mode=recovery.get("targetMode"),
+                manual_required=True,
+                now_ms=snapshot.as_of_ms,
+            )
+            return False
+        if resolved_any and not self.unresolved_intents():
+            recovery = self.recovery_status()
+            self.begin_recovery(
+                "POST_AMBIGUOUS_RECONCILIATION",
+                "unknown write reconciled; confirming two new clean snapshots",
+                origin_mode=recovery.get("originMode"),
+                target_mode=recovery.get("targetMode"),
+                now_ms=snapshot.as_of_ms,
+            )
+            with self.connect() as db:
+                db.execute(
+                    "UPDATE recovery_state SET last_probe_at_ms=?,next_probe_at_ms=? WHERE singleton=1",
+                    (snapshot.as_of_ms, snapshot.as_of_ms + MINIMUM_GAP_MS),
+                )
+        return resolved_any
 
     def record_event(self, level: str, kind: str, payload: dict[str, Any]) -> None:
         with self.connect() as db:
@@ -671,6 +939,7 @@ class V4Store:
             ).fetchone()
         return {
             "runtime": state,
+            "recovery": self.recovery_status(),
             "active_rungs": active,
             "events": events,
             "pending_plan": dict(pending) if pending else None,

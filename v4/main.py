@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import threading
 from pathlib import Path
 
 from mika_v4.config import load_settings, migrate_v3_config
@@ -13,6 +12,7 @@ from mika_v4.migration import import_v3_history
 from mika_v4.history import HistoricalCollector
 from mika_v4.runtime import LendingRuntime
 from mika_v4.store import V4Store
+from mika_v4.supervisor import V4Supervisor
 from mika_v4.validation import load_real_evidence, shadow_audit, validate_90_days
 
 
@@ -23,6 +23,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Mika Lending Bot V4")
     result.add_argument("--config", default=str(ROOT / "default.cfg"))
     sub = result.add_subparsers(dest="command")
+    worker = sub.add_parser("worker", help=argparse.SUPPRESS)
+    worker.add_argument("--session", required=True)
     sub.add_parser("serve", help="启动 Worker 与 127.0.0.1:8001 Dashboard")
     sub.add_parser("once", help="执行一次账户同步与完整策略重算")
     mode = sub.add_parser("mode", help="切换 PAUSED/SHADOW/LIVE")
@@ -52,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(import_v3_history(Path(args.source), store), ensure_ascii=False, indent=2))
         return 0
     runtime = LendingRuntime(settings, store=store)
+    if args.command == "worker":
+        store.record_event("INFO", "WORKER_SESSION", {"session": args.session})
+        runtime.run()
+        return 0
     if args.command == "backfill":
         collector = HistoricalCollector(runtime.client, store)
         print(json.dumps(collector.backfill(args.days), ensure_ascii=False, indent=2))
@@ -91,18 +97,17 @@ def main(argv: list[str] | None = None) -> int:
             runtime.disable_live(requested)
         print(requested.value)
         return 0
-    server = DashboardServer(runtime)
-    worker = threading.Thread(target=runtime.run, daemon=True, name="v4-worker")
-    worker.start()
+    supervisor = V4Supervisor(settings)
+    server = DashboardServer(supervisor)
+    supervisor.start()
     print(f"Mika V4 Dashboard: http://127.0.0.1:{settings.policy.dashboard_port} ({store.mode().value})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        runtime.request_stop()
         server.close()
-        worker.join(timeout=10)
+        supervisor.close()
     return 0
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import threading
 import time
@@ -14,6 +15,7 @@ from .domain import AccountSnapshot, AllocationPlan, RuntimeMode, StrategyStatus
 from .execution import ExecutionBlocked, SafeExecutor
 from .locks import CrossVersionLiveLock, LiveLockError, ProcessLock
 from .market import MarketBuffer, PublicMarketStream, build_market_snapshot
+from .recovery import classify_error
 from .store import V4Store, _encode
 from .strategy import bottom_rung_triggered, build_plan, fast_shift_allowed, floor_stale, gross_daily_floor
 
@@ -66,12 +68,23 @@ class LendingRuntime:
         self.last_plan: AllocationPlan | None = None
         self.last_action = "STARTING"
         self._last_full_ms = 0
+        self.stop_request_file = settings.state_db.parent / "v4-worker-stop.json"
+        self._deferred_recovery_error: BaseException | None = None
 
     def _log_market(self, message: str) -> None:
         self.store.record_event("WARNING", "MARKET_STREAM", {"message": message})
 
     def request_stop(self, *_: object) -> None:
         self._stop.set()
+
+    def _external_stop_requested(self) -> bool:
+        if not self.stop_request_file.exists():
+            return False
+        try:
+            payload = json.loads(self.stop_request_file.read_text(encoding="utf-8"))
+            return int(payload.get("pid", -1)) == os.getpid()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
 
     def bootstrap_market(self) -> None:
         now = int(time.time() * 1000)
@@ -80,7 +93,7 @@ class LendingRuntime:
         self.market_buffer.replace_book(book, now)
         self.market_buffer.replace_trades(trades)
 
-    def _snapshot_market(self, refresh_rest: bool = False):
+    def _snapshot_market(self, refresh_rest: bool = False, *, strict: bool = False):
         if refresh_rest:
             try:
                 now = int(time.time() * 1000)
@@ -90,12 +103,56 @@ class LendingRuntime:
                     self.market_buffer.replace_trades(historical)
             except BitfinexError as exc:
                 self.store.record_event("WARNING", "REST_MARKET_FAILED", {"error": str(exc)})
+                if strict:
+                    raise
         book, trades, updated = self.market_buffer.snapshot()
         return build_market_snapshot(book, trades, self.policy, last_update_ms=updated)
 
     def _sync_grid(self, account: AccountSnapshot) -> None:
         self.executor.sync_account(account)
         self.store.record_account_sample(account)
+
+    @staticmethod
+    def _account_matched(account: AccountSnapshot) -> bool:
+        components = account.wallet_available
+        components += sum((offer.amount for offer in account.offers), D("0"))
+        components += sum((credit.amount for credit in account.credits), D("0"))
+        components += sum((loan.amount for loan in account.loans), D("0"))
+        return abs(account.wallet_total - components) <= D("0.02")
+
+    def _reconcile_unknown_writes(self, account: AccountSnapshot) -> None:
+        if not self.store.unresolved_intents():
+            return
+        now = account.as_of_ms
+        rows = self.store.unresolved_intents()
+        created = min((int(row["created_at_ms"]) for row in rows), default=now)
+        start = max(0, created - 60_000)
+        end = now + 60_000
+        offer_history = self.client.funding_offers_history("fUSD", start=start, end=end)
+        trade_history = self.client.funding_trades_history("fUSD", start=start, end=end)
+        self.store.reconcile_ambiguous(
+            account,
+            offer_history=offer_history,
+            trade_history=trade_history,
+            history_authoritative=True,
+        )
+
+    def _enter_recovery(self, exc: BaseException, origin_mode: RuntimeMode | None = None) -> None:
+        decision = classify_error(exc)
+        mode = origin_mode or self.store.mode()
+        self.store.enter_safe(
+            str(exc),
+            category=decision.category,
+            manual_required=decision.manual_required or not decision.retryable,
+        )
+        if mode != RuntimeMode.SAFE:
+            self.store.begin_recovery(
+                decision.category,
+                str(exc),
+                origin_mode=mode,
+                target_mode=mode,
+                manual_required=decision.manual_required or not decision.retryable,
+            )
 
     def _deployable(self, account: AccountSnapshot, target_pool: str | None = None) -> tuple[D, D, D]:
         managed_ids = self.store.managed_offer_ids()
@@ -158,27 +215,114 @@ class LendingRuntime:
 
     def cycle(self, *, force_full: bool = False) -> StrategyStatus:
         now = int(time.time() * 1000)
+        if self._deferred_recovery_error is not None:
+            pending_error = self._deferred_recovery_error
+            self._enter_recovery(pending_error)
+            self._deferred_recovery_error = None
+            self.last_action = "RECOVERY_STATE_PERSISTED"
+            self._write_status()
+            return self.status()
+        self.store.touch_heartbeat(now)
+        recovery = self.store.recovery_status()
+        if recovery["active"] and recovery["manualRequired"]:
+            self.last_action = "SAFE_MANUAL_REQUIRED"
+            self._write_status()
+            return self.status()
+        if recovery["active"] and not self.store.recovery_probe_due(now):
+            self.last_action = "RECOVERY_BACKOFF"
+            self._write_status()
+            return self.status()
         try:
             account = self.client.account_snapshot(self.policy.currency)
         except BitfinexError as exc:
-            self.store.enter_safe(f"account synchronization failed: {exc}")
-            self.last_action = "SAFE_ACCOUNT_SYNC"
+            decision = classify_error(exc)
+            existing = self.store.recovery_status()
+            if not existing["active"]:
+                self._enter_recovery(exc)
+            elif decision.retryable and not decision.manual_required:
+                self.store.record_recovery_failure(str(exc), decision.category, now)
+            else:
+                self.store.begin_recovery(
+                    decision.category,
+                    str(exc),
+                    origin_mode=existing["originMode"],
+                    target_mode=existing["targetMode"],
+                    manual_required=True,
+                    now_ms=now,
+                )
+            self.last_action = "RECOVERY_ACCOUNT_SYNC"
+            self._write_status()
             return self.status()
         self.last_account = account
         account_stale = int(time.time() * 1000) - account.as_of_ms > self.policy.fast_sync_seconds * 1000
         if not account.authoritative or account_stale:
-            self.store.enter_safe("account snapshot is stale or available balance is not authoritative")
-            self.last_action = "SAFE_ACCOUNT_UNKNOWN"
+            reason = "account snapshot is stale or available balance is not authoritative"
+            existing = self.store.recovery_status()
+            if not existing["active"]:
+                self.store.enter_safe(reason, category="ACCOUNT_DATA")
+            else:
+                self.store.record_recovery_failure(reason, "ACCOUNT_DATA", now)
+            self.last_action = "RECOVERY_ACCOUNT_UNKNOWN"
+            self._write_status()
+            return self.status()
+        if not self._account_matched(account):
+            reason = "authoritative account components do not conserve wallet total"
+            existing = self.store.recovery_status()
+            if not existing["active"]:
+                self.store.enter_safe(reason, category="ACCOUNT_MISMATCH")
+            else:
+                self.store.record_recovery_failure(reason, "ACCOUNT_MISMATCH", now)
+            self.last_action = "RECOVERY_ACCOUNT_MISMATCH"
             self._write_status()
             return self.status()
         self._sync_grid(account)
         mode = self.store.mode()
         if mode != RuntimeMode.SAFE and self.store.unresolved_intents():
-            self.store.enter_safe("unfinished execution intent recovered at startup")
+            self.store.enter_safe(
+                "unfinished execution intent recovered at startup",
+                category="AMBIGUOUS_WRITE",
+            )
             mode = RuntimeMode.SAFE
         if mode == RuntimeMode.SAFE:
-            self.store.record_consistent_snapshot(account.as_of_ms)
-            self.last_action = "SAFE_RECOVERY_CHECK"
+            try:
+                self._reconcile_unknown_writes(account)
+                if self.store.recovery_status()["manualRequired"]:
+                    self.last_action = "SAFE_MANUAL_REQUIRED"
+                    self._write_status()
+                    return self.status()
+                if self.store.unresolved_intents():
+                    self.last_action = "RECOVERY_RECONCILING_WRITE"
+                    self._write_status()
+                    return self.status()
+                market = self._snapshot_market(refresh_rest=True, strict=True)
+                self.last_market = market
+                if not market.fresh or market.valid_components < 2:
+                    self.store.record_recovery_failure("market data remains stale", "MARKET_STALE", now)
+                    self.last_action = "RECOVERY_MARKET_STALE"
+                else:
+                    recovered = self.store.record_consistent_snapshot(account.as_of_ms)
+                    self.last_action = "RECOVERED_NO_WRITE" if recovered else "RECOVERY_SNAPSHOT_OK"
+            except BaseException as exc:
+                decision = classify_error(exc)
+                if decision.retryable and not decision.manual_required:
+                    self.store.record_recovery_failure(str(exc), decision.category, now)
+                    self.last_action = "RECOVERY_PROBE_FAILED"
+                else:
+                    current = self.store.recovery_status()
+                    self.store.begin_recovery(
+                        decision.category,
+                        str(exc),
+                        origin_mode=current["originMode"],
+                        target_mode=current["targetMode"],
+                        manual_required=True,
+                        now_ms=now,
+                    )
+                    self.last_action = "SAFE_MANUAL_REQUIRED"
+            self._write_status()
+            return self.status()
+
+        if self.store.consume_resume_barrier():
+            self.last_action = "RECOVERED_NO_WRITE"
             self._write_status()
             return self.status()
 
@@ -186,8 +330,11 @@ class LendingRuntime:
         market = self._snapshot_market(refresh_rest=full_due)
         self.last_market = market
         if not market.fresh or market.valid_components < 2:
-            self.store.enter_safe("market data is stale or has fewer than two valid anchor signals")
-            self.last_action = "NO_WRITE_STALE_MARKET"
+            self.store.enter_safe(
+                "market data is stale or has fewer than two valid anchor signals",
+                category="MARKET_STALE",
+            )
+            self.last_action = "RECOVERY_MARKET_STALE"
             self._write_status()
             return self.status()
 
@@ -230,6 +377,11 @@ class LendingRuntime:
         try:
             targets = {target_pool} if target_pool else {"long"} if stale_pool == "long" else None
             self.last_action = self.executor.reconcile(plan, account, reason, targets)
+            if self.last_action == "BALANCE_CHANGED_REPLAN_REQUIRED":
+                self.store.enter_safe(
+                    "available balance changed before execution",
+                    category="BALANCE_DRIFT",
+                )
         except ExecutionBlocked as exc:
             self.last_action = f"BLOCKED: {exc}"
         self._last_full_ms = now if full_due else self._last_full_ms
@@ -277,11 +429,15 @@ class LendingRuntime:
             return
         self.store.close_unsent_planned_intents()
         mode = self.store.mode()
-        if mode == RuntimeMode.LIVE:
+        recovery = self.store.recovery_status()
+        needs_live_lock = mode == RuntimeMode.LIVE or (
+            recovery["active"] and recovery["targetMode"] == RuntimeMode.LIVE.value
+        )
+        if needs_live_lock:
             try:
                 self.live_lock.acquire()
             except LiveLockError as exc:
-                self.store.enter_safe(str(exc))
+                self.store.enter_safe(str(exc), category="LIVE_LOCK", manual_required=True)
                 self.last_action = "SAFE_LIVE_LOCK"
                 self._write_status()
                 self.worker_lock.release()
@@ -297,15 +453,54 @@ class LendingRuntime:
         try:
             while not self._stop.is_set():
                 started = time.monotonic()
-                self.cycle()
-                wait = max(0.1, self.policy.fast_sync_seconds - (time.monotonic() - started))
-                self._stop.wait(wait)
+                try:
+                    self.cycle()
+                except BaseException as exc:
+                    decision = classify_error(exc)
+                    if decision.retryable and not decision.manual_required:
+                        try:
+                            current = self.store.recovery_status()
+                            if not current["active"]:
+                                self._enter_recovery(exc)
+                            else:
+                                self.store.record_recovery_failure(str(exc), decision.category)
+                            self.last_action = "RECOVERY_RUNTIME_ERROR"
+                            self._write_status()
+                        except BaseException as persist_exc:
+                            persist_decision = classify_error(persist_exc)
+                            if persist_decision.retryable:
+                                self._deferred_recovery_error = exc
+                                self.last_action = "RECOVERY_STATE_DEFERRED"
+                            else:
+                                raise
+                    else:
+                        self.store.enter_safe(
+                            str(exc),
+                            category=decision.category,
+                            manual_required=True,
+                        )
+                        self.last_action = "SAFE_MANUAL_REQUIRED"
+                        self._write_status()
+                        break
+                if self._deferred_recovery_error is not None:
+                    interval = 30
+                else:
+                    recovery = self.store.recovery_status()
+                    interval = 30 if recovery["active"] else self.policy.fast_sync_seconds
+                wait = max(0.1, interval - (time.monotonic() - started))
+                deadline = time.monotonic() + wait
+                while not self._stop.is_set() and time.monotonic() < deadline:
+                    if self._external_stop_requested():
+                        self._stop.set()
+                        break
+                    self._stop.wait(min(1.0, max(0.0, deadline - time.monotonic())))
         finally:
+            self.store.touch_heartbeat()
             self.market_stream.stop()
             self.live_lock.release()
             self.worker_lock.release()
 
-    def enable_live(self, confirmation: str) -> None:
+    def enable_live(self, confirmation: str, *, acquire_lock: bool = True) -> None:
         if confirmation != "ENABLE V4 LIVE":
             raise ValueError("LIVE confirmation must exactly equal: ENABLE V4 LIVE")
         if not self.settings.api_key or not self.settings.api_secret:
@@ -320,10 +515,11 @@ class LendingRuntime:
         validation = self.store.latest_validation()
         if not validation or not validation["passed"] or validation["evidence_end_ms"] < audit["end_ms"]:
             raise ValueError("需要覆盖当前 SHADOW 期末的已通过验证报告")
-        try:
-            self.live_lock.acquire()
-        except LiveLockError:
-            raise
+        if acquire_lock:
+            try:
+                self.live_lock.acquire()
+            except LiveLockError:
+                raise
         self.store.set_mode(RuntimeMode.LIVE)
 
     def disable_live(self, mode: RuntimeMode = RuntimeMode.SHADOW) -> None:

@@ -66,6 +66,7 @@ python main.py mode LIVE --confirm "ENABLE V4 LIVE"
 - [长期门控与 APR 换算](docs/long-gate.md)
 - [配置和历史迁移](docs/migration.md)
 - [SAFE 恢复](docs/safe-recovery.md)
+- [无人值守自动自愈](docs/unattended-recovery.md)
 - [影子运行、验证和回退](docs/shadow-and-rollback.md)
 - [第三方策略研究附录](docs/research.md)
 

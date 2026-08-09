@@ -128,7 +128,7 @@ def test_runtime_unknown_available_balance_enters_safe_before_reconciliation(tmp
     snapshot = AccountSnapshot(now, D("0"), D("1000"), authoritative=False)
     runtime = LendingRuntime(settings(tmp_path), client=RuntimeClient(snapshot, now))
     assert runtime.cycle(force_full=True).mode == RuntimeMode.SAFE
-    assert runtime.last_action == "SAFE_ACCOUNT_UNKNOWN"
+    assert runtime.last_action == "RECOVERY_ACCOUNT_UNKNOWN"
 
 
 def test_runtime_detects_small_idle_preferred_pool(tmp_path: Path) -> None:

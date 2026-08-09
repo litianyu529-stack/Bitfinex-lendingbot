@@ -214,7 +214,9 @@ def test_ambiguous_submit_needs_two_spaced_authoritative_snapshots(tmp_path: Pat
     assert not store.record_consistent_snapshot(first.as_of_ms)
     assert store.unresolved_intents()
     store.reconcile_ambiguous(second)
-    assert store.record_consistent_snapshot(second.as_of_ms)
+    assert not store.record_consistent_snapshot(second.as_of_ms)
+    assert not store.record_consistent_snapshot(second.as_of_ms + 31_000)
+    assert store.record_consistent_snapshot(second.as_of_ms + 62_000)
     assert store.mode() == RuntimeMode.SHADOW
     assert store.managed_offer_ids() == {777}
 

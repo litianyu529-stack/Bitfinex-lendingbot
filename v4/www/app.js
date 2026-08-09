@@ -18,12 +18,26 @@ function renderStatus(data) {
   const market = data.market || {};
   const account = data.account || {};
   const plan = data.plan || {};
+  const recovery = data.recovery || {};
   const mode = runtime.mode || "UNKNOWN";
   $("mode").textContent = mode;
   $("mode").className = `badge ${mode.toLowerCase()}`;
   $("action").textContent = data.last_action || "—";
-  $("safePanel").classList.toggle("hidden", mode !== "SAFE");
-  $("safeReason").textContent = runtime.safe_reason || "";
+  $("safePanel").classList.toggle("hidden", mode !== "SAFE" && !recovery.active);
+  $("safeReason").textContent = recovery.manualRequired
+    ? `需要人工处理：${recovery.reason || runtime.safe_reason || "未知故障"}`
+    : recovery.active
+      ? `自动修复中：${recovery.reason || runtime.safe_reason || "正在重新读取权威数据"}`
+      : runtime.safe_reason || "";
+  $("recoveryProgress").textContent = recovery.active && !recovery.manualRequired
+    ? `权威快照 ${recovery.successfulSnapshots || 0}/${recovery.requiredSnapshots || 2}；恢复目标 ${recovery.targetMode || "PAUSED"}`
+    : "";
+  const retrySeconds = recovery.nextProbeAt
+    ? Math.max(0, Math.ceil((Number(recovery.nextProbeAt) - Date.now()) / 1000))
+    : null;
+  $("recoveryRetry").textContent = recovery.active && !recovery.manualRequired
+    ? `第 ${recovery.attempts || 0} 次重试；${retrySeconds == null ? "等待下一次探测" : `${retrySeconds} 秒后重试`}`
+    : "";
   $("wallet").textContent = money(account.wallet_available);
   $("anchor").textContent = pct(market.robust_anchor);
   $("step").textContent = pct(market.grid_step);
