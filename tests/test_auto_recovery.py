@@ -76,6 +76,31 @@ def test_failed_probe_resets_consecutive_snapshot_count(tmp_path):
     assert store.runtime()["mode"] == "LIVE"
 
 
+def test_secondary_market_stale_safe_keeps_original_live_recovery_target(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: 1000)
+    store.set_mode("LIVE", "test")
+    store.set_mode("PAUSED", "AUTO_RECOVERY:NETWORK_TRANSPORT")
+    store.begin_recovery(
+        "NETWORK_TRANSPORT",
+        "socket timed out",
+        origin_mode="LIVE",
+        target_mode="LIVE",
+        now_ms=1_000_000,
+    )
+
+    # This is the exact production sequence: the failed REST probe leaves the
+    # cached market stale, which enters SAFE while runtime mode is already PAUSED.
+    store.enter_safe("MARKET_DATA_STALE")
+
+    recovery = store.recovery_status()
+    assert store.runtime()["mode"] == "SAFE"
+    assert recovery["originMode"] == "LIVE"
+    assert recovery["targetMode"] == "LIVE"
+    store.record_consistent_sync(1_030_000)
+    store.record_consistent_sync(1_060_000)
+    assert store.runtime()["mode"] == "LIVE"
+
+
 def test_program_error_requires_manual_restart(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.set_mode("LIVE", "test")

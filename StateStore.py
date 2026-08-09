@@ -758,8 +758,21 @@ class LendingStateStore:
             target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
             if target not in {"LIVE", "PAUSED", "REPLAY"}:
                 target = "PAUSED"
-            started = current["started_at_ms"] if current["active"] else now
-            attempts = int(current["attempts"] or 0) if current["active"] else 0
+            if current["active"]:
+                # A recovery episode owns one immutable resume destination.
+                # Secondary failures (for example stale market data after a
+                # network timeout) may update diagnostics and backoff, but must
+                # never downgrade an authorized LIVE recovery to PAUSED.
+                if current["origin_mode"] in {"LIVE", "PAUSED", "REPLAY"}:
+                    origin = current["origin_mode"]
+                if current["target_mode"] in {"LIVE", "PAUSED", "REPLAY"}:
+                    target = current["target_mode"]
+                manual_required = bool(manual_required or current["manual_required"])
+                started = current["started_at_ms"]
+                attempts = int(current["attempts"] or 0)
+            else:
+                started = now
+                attempts = 0
             connection.execute(
                 """UPDATE recovery_state SET active=1, category=?, reason=?, origin_mode=?,
                    target_mode=?, attempts=?, successful_snapshots=0, required_snapshots=?,
