@@ -1520,13 +1520,20 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
     return {"adoptedOfferIds": adopted}
 
 
-def start_controlled_bot(config_path, status_path, preflight_id, context=None):
+def start_controlled_bot(config_path, status_path, preflight_id, context=None, preserve_recovery=False):
     context = process_context(config_path, context)
     state = context.process_state
     with state.lock:
         if controlled_bot_running(config_path, context):
             raise ConfigError("机器人已在运行")
         consume_controlled_bot_preflight(config_path, preflight_id, context=context)
+        store, _ = v3_store_for_config(config_path)
+        if not preserve_recovery:
+            # A fresh, human-authorized start supersedes any non-manual
+            # recovery episode left by the previous worker.  Supervisor
+            # restarts retain that episode so the two-snapshot write barrier
+            # still applies.
+            store.clear_recovery()
         os.makedirs(os.path.dirname(status_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(context.process_log_path) or ".", exist_ok=True)
 
@@ -1566,7 +1573,6 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None):
             raise
         state.started_at = timestamp()
         state.stop_reason = None
-        store, _ = v3_store_for_config(config_path)
         active = store.strategy("ACTIVE") or {}
         state.auto_restart_authorization = {
             "session": state.supervisor_session,
@@ -1696,7 +1702,13 @@ def worker_supervisor_loop(config_path, status_path, context):
             if not preflight.get("canStart") or not preflight.get("preflightId"):
                 store.record_recovery_failure("watchdog preflight did not pass", "WATCHDOG_PREFLIGHT", now_ms)
                 continue
-            start_controlled_bot(config_path, status_path, preflight["preflightId"], context=context)
+            start_controlled_bot(
+                config_path,
+                status_path,
+                preflight["preflightId"],
+                context=context,
+                preserve_recovery=True,
+            )
             state.stop_reason = None
         except Exception as exc:
             try:

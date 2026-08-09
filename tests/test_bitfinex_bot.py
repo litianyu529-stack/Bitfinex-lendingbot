@@ -670,6 +670,13 @@ class BitfinexBotTests(unittest.TestCase):
                 client_factory=FakePreflightClient,
             )
             response = lendingbot.create_controlled_bot_preflight(config_path, context=context)
+            store, _ = lendingbot.v3_store_for_config(config_path)
+            store.begin_recovery(
+                "WORKER_HEARTBEAT_TIMEOUT",
+                "old worker",
+                origin_mode="PAUSED",
+                target_mode="PAUSED",
+            )
 
             def attempt_start(_):
                 try:
@@ -688,6 +695,7 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(len(popen_calls), 1)
             self.assertEqual(sum(result is not None for result in results), 1)
             self.assertIn("--live", popen_calls[0][0][0])
+            self.assertFalse(store.recovery_status()["active"])
             lendingbot.stop_controlled_bot(config_path, context=context)
             lendingbot.cleanup_controlled_bot_handle(context)
 

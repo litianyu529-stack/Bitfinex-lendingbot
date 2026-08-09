@@ -226,7 +226,7 @@ def test_watchdog_restarts_only_after_valid_session_preflight(tmp_path, monkeypa
     monkeypatch.setattr(
         lendingbot,
         "start_controlled_bot",
-        lambda *_args, **_kwargs: started.append(True),
+        lambda *_args, **kwargs: started.append(kwargs.get("preserve_recovery")),
     )
 
     lendingbot.worker_supervisor_loop(context.config_path, context.status_path, context)
