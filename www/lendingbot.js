@@ -660,7 +660,9 @@ function renderStatus() {
         ? formatDateTime(releaseComparison.activatedAtMs)
         : "等待首次启动";
     $("releaseBoundary").title = releaseComparison.activatedAtMs
-        ? "订单与成交统计以此时间分为 V3.5 更新前和更新后，并使用等长时间窗口进行对比。"
+        ? `${releaseComparison.boundarySource === "LIVE_SESSION_BEFORE_EXACT_TERM_EXPLORATION"
+            ? "按首笔新定价订单所在的 LIVE 会话确定"
+            : "按首次 V3.5 启动确定"}；订单与成交统计以此时间分为更新前后，并使用等长时间窗口对比。`
         : "首次使用 V3.5 状态库时自动写入，不会随重启改变。";
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;

@@ -27,7 +27,7 @@ AUTO_RECOVERABLE_PAUSE_REASONS = {
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
 EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V3"
-CURRENT_RELEASE = "0.3.5"
+CURRENT_RELEASE = "0.3.5.1"
 CURRENT_RELEASE_LABEL = "V3.5"
 
 
@@ -526,11 +526,7 @@ class LendingStateStore:
                 """INSERT INTO schema_meta(key, value) VALUES('schema_version', '16')
                    ON CONFLICT(key) DO UPDATE SET value='16'"""
             )
-            connection.execute(
-                """INSERT OR IGNORE INTO schema_meta(key, value)
-                   VALUES('release_0.3.5_activated_at_ms', ?)""",
-                (str(self._now_ms()),),
-            )
+            self._initialize_v35_release_boundary(connection, self._now_ms())
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
                     currency, status, updated_at_ms
@@ -552,6 +548,70 @@ class LendingStateStore:
                     singleton, mode, previous_mode, updated_at_ms
                 ) VALUES(1, 'PAUSED', NULL, ?)""",
                 (self._now_ms(),),
+            )
+
+    @staticmethod
+    def _initialize_v35_release_boundary(connection, now_ms):
+        """Recover the V3.5 cutover from the first exact-term pricing session.
+
+        V3.5 groups the exact-term exploration releases into one reporting
+        generation.  Existing installations can therefore recover the real
+        cutover from durable order and mode events instead of using the later
+        GitHub publication time.  Fresh installations keep their first V3.5
+        startup as the boundary.
+        """
+
+        first_curve = connection.execute(
+            """SELECT MIN(created_at_ms) AS first_ms FROM order_intents
+               WHERE pricing_curve_version IN (
+                   'EXACT_TERM_EXPLORATION_V2', 'EXACT_TERM_EXPLORATION_V3'
+               )"""
+        ).fetchone()["first_ms"]
+        source = "FIRST_V35_START"
+        evidence_at = None
+        candidate = int(now_ms)
+        if first_curve is not None:
+            evidence_at = int(first_curve)
+            live_event = connection.execute(
+                """SELECT MAX(created_at_ms) AS live_ms FROM mode_events
+                   WHERE to_mode='LIVE' AND created_at_ms<=?""",
+                (evidence_at,),
+            ).fetchone()["live_ms"]
+            if live_event is not None:
+                candidate = int(live_event)
+                source = "LIVE_SESSION_BEFORE_EXACT_TERM_EXPLORATION"
+            else:
+                candidate = evidence_at
+                source = "FIRST_EXACT_TERM_EXPLORATION_ORDER"
+
+        current = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='release_0.3.5_activated_at_ms'"
+        ).fetchone()
+        current_ms = None if current is None else int(current["value"])
+        if current_ms is None or (first_curve is not None and current_ms > candidate):
+            connection.execute(
+                """INSERT INTO schema_meta(key, value)
+                   VALUES('release_0.3.5_activated_at_ms', ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(candidate),),
+            )
+            connection.execute(
+                """INSERT INTO schema_meta(key, value)
+                   VALUES('release_0.3.5_boundary_source', ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (source,),
+            )
+        else:
+            connection.execute(
+                """INSERT OR IGNORE INTO schema_meta(key, value)
+                   VALUES('release_0.3.5_boundary_source', 'FIRST_V35_START')"""
+            )
+        if evidence_at is not None:
+            connection.execute(
+                """INSERT INTO schema_meta(key, value)
+                   VALUES('release_0.3.5_boundary_evidence_at_ms', ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(evidence_at),),
             )
 
     @staticmethod
@@ -1650,13 +1710,24 @@ class LendingStateStore:
         """Return the immutable local activation boundary for the current release."""
 
         with self.read_connection() as connection:
-            row = connection.execute(
-                "SELECT value FROM schema_meta WHERE key='release_0.3.5_activated_at_ms'"
-            ).fetchone()
+            rows = {
+                row["key"]: row["value"]
+                for row in connection.execute(
+                    """SELECT key, value FROM schema_meta WHERE key IN (
+                           'release_0.3.5_activated_at_ms',
+                           'release_0.3.5_boundary_source',
+                           'release_0.3.5_boundary_evidence_at_ms'
+                       )"""
+                ).fetchall()
+            }
+        activated = rows.get("release_0.3.5_activated_at_ms")
+        evidence = rows.get("release_0.3.5_boundary_evidence_at_ms")
         return {
             "version": CURRENT_RELEASE,
             "label": CURRENT_RELEASE_LABEL,
-            "activatedAtMs": None if row is None else int(row["value"]),
+            "activatedAtMs": None if activated is None else int(activated),
+            "boundarySource": rows.get("release_0.3.5_boundary_source"),
+            "evidenceAtMs": None if evidence is None else int(evidence),
         }
 
     def period_activity(self, since_ms, currency="USD", until_ms=None):

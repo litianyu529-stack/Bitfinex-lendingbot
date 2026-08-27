@@ -11,7 +11,7 @@ from urllib import error, parse, request
 from DomainTypes import WriteOutcome, WriteResult
 
 
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.5.1"
 
 
 class BitfinexApiError(Exception):

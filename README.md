@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.5 / V3.5
+# Bitfinex-lendingbot 0.3.5.1 / V3.5
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -38,7 +38,7 @@ V3.3 的全市场需求分配、150 USD 低需求池保留、小额余额合并�
 
 V3.5 合并了无人值守安全恢复与精确期限定价升级；固定市场落点、单向阶段调价和最终底线规则见 [V3.5 发布说明](docs/v3.5-release.md)。
 
-状态库会在首次运行 V3.5 时写入不可变的本机上线时间。状态接口以该时间为分界，提供更新前后等长窗口的挂单数、成交数、金额、加权日利率和加权等待时间，便于持续比较本次升级效果；普通重启不会重置分界。
+状态库会从首笔精确期限探索订单向前关联其所在 LIVE 会话，以该会话启动时间作为 V3.5 数据分界；没有旧数据的新安装使用首次 V3.5 启动时间。状态接口提供更新前后等长窗口的挂单数、成交数、金额、加权日利率和加权等待时间，普通重启不会重置分界。
 
 ## 快速开始
 
@@ -106,11 +106,11 @@ python -m pip install -r requirements-dev.txt
 .\verify.ps1
 ```
 
-验证包括 Ruff、Python 编译、310 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
+验证包括 Ruff、Python 编译、311 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.5`
+- 应用/User-Agent：`0.3.5.1`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`

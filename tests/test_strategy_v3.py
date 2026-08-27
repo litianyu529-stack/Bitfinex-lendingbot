@@ -3931,9 +3931,11 @@ def test_v35_release_boundary_is_immutable_and_splits_equal_windows(tmp_path):
     first = LendingStateStore(path, clock=lambda: activated / 1000)
 
     assert first.release_boundary() == {
-        "version": "0.3.5",
+        "version": "0.3.5.1",
         "label": "V3.5",
         "activatedAtMs": activated,
+        "boundarySource": "FIRST_V35_START",
+        "evidenceAtMs": None,
     }
 
     restarted = LendingStateStore(path, clock=lambda: (activated + 3_600_000) / 1000)
@@ -3944,6 +3946,42 @@ def test_v35_release_boundary_is_immutable_and_splits_equal_windows(tmp_path):
     assert comparison["before"]["toMs"] == activated
     assert comparison["after"]["fromMs"] == activated
     assert comparison["after"]["toMs"] == activated + 3_600_001
+
+
+def test_v35_release_boundary_moves_back_to_exact_term_live_session(tmp_path):
+    path = tmp_path / "historical-release-boundary.sqlite3"
+    live_at = 1_787_548_590_850
+    first_exact_order_at = 1_787_551_007_941
+    published_at = 1_787_798_000_000
+    store = LendingStateStore(path, clock=lambda: published_at / 1000)
+    with store.transaction(immediate=True) as connection:
+        connection.execute(
+            "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES('PAUSED', 'LIVE', ?, ?)",
+            ("live_preflight_confirmed", live_at),
+        )
+        connection.execute(
+            """INSERT INTO order_intents(
+                   fingerprint, currency, slice_key, pool, layer, amount,
+                   submitted_rate, effective_rate, period, offer_type, flags,
+                   strategy_version, state, pricing_curve_version,
+                   created_at_ms, updated_at_ms
+               ) VALUES(?, 'USD', ?, 'short', 'balanced', '150',
+                        '0.0002194', '0.0002194', 2, 'LIMIT', 0,
+                        'historical-v2', 'CLOSED', 'EXACT_TERM_EXPLORATION_V2', ?, ?)""",
+            ("historical-v2-fingerprint", "historical-v2-slice", first_exact_order_at, first_exact_order_at),
+        )
+
+    restarted = LendingStateStore(path, clock=lambda: (published_at + 60_000) / 1000)
+    assert restarted.release_boundary() == {
+        "version": "0.3.5.1",
+        "label": "V3.5",
+        "activatedAtMs": live_at,
+        "boundarySource": "LIVE_SESSION_BEFORE_EXACT_TERM_EXPLORATION",
+        "evidenceAtMs": first_exact_order_at,
+    }
+
+    restarted_again = LendingStateStore(path, clock=lambda: (published_at + 120_000) / 1000)
+    assert restarted_again.release_boundary()["activatedAtMs"] == live_at
 
 
 def test_external_takeover_requires_two_matching_snapshots_and_cancels_exact_id(tmp_path):
