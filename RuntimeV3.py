@@ -20,15 +20,19 @@ from ExchangeModels import (
 from StrategyV3 import (
     D,
     DUST_REINVEST_MINIMUM,
+    EXACT_TERM_EXPLORATION_CURVE,
+    EXACT_TERM_EXPLORATION_CURVES,
     POOLS,
     StrategyPolicyV3,
     USD_ORDER_CHUNK,
     build_market_signals_v3,
     build_strategy_plan_v3,
     ceil_rate_tick,
-    competitive_rate_for_layer,
+    competitive_rate_for_period,
+    evenly_distributed_amounts,
     gross_daily_floor,
     json_decimal,
+    period_pricing_context,
     pool_for_period,
     policy_v3_with_overrides,
     rate_below_floor,
@@ -36,7 +40,6 @@ from StrategyV3 import (
     validate_policy_v3,
 )
 
-REPRICE_STAGE_FRACTIONS = (D("1") / D("3"), D("2") / D("3"), D("1"))
 CREDIT_DISPLAY_GROUPS = ("short", "medium", "long")
 AUTH_FUNDING_HISTORY_LIMIT = 500
 AMBIGUOUS_HISTORY_MIN_AGE_MS = 60_000
@@ -69,15 +72,18 @@ def _active_lending_rows(credits, loans):
     return list(merged.values())
 
 
-def _reprice_stage_type(stage):
-    return "FLOOR" if int(stage) >= 4 else "MARKET"
+def _reprice_stage_type(stage, stage_count=6):
+    market_stage_count = max(1, int(stage_count) // 2)
+    return "FLOOR" if int(stage) > market_stage_count else "MARKET"
 
 
-def _age_stage_target(stage, chain, benchmark, floor_rate, fallback_anchor=None):
+def _age_stage_target(stage, chain, benchmark, floor_rate, fallback_anchor=None, stage_count=6):
     stage = int(stage)
+    stage_count = int(stage_count)
+    market_stage_count = max(1, stage_count // 2)
     floor_rate = D(floor_rate)
-    if stage <= 3:
-        fraction = REPRICE_STAGE_FRACTIONS[stage - 1]
+    if stage <= market_stage_count:
+        fraction = D(stage) / D(market_stage_count)
         origin_rate = D(chain["origin_rate"])
         gap = max(D("0"), origin_rate - D(benchmark))
         return ceil_rate_tick(max(floor_rate, origin_rate - gap * fraction))
@@ -85,8 +91,39 @@ def _age_stage_target(stage, chain, benchmark, floor_rate, fallback_anchor=None)
     if anchor_value is None:
         anchor_value = fallback_anchor
     anchor_rate = max(floor_rate, D(anchor_value if anchor_value is not None else chain["origin_rate"]))
-    fraction = REPRICE_STAGE_FRACTIONS[stage - 4]
+    floor_stage = min(market_stage_count, max(1, stage - market_stage_count))
+    fraction = D(floor_stage) / D(market_stage_count)
     return ceil_rate_tick(max(floor_rate, anchor_rate - (anchor_rate - floor_rate) * fraction))
+
+
+def _exploration_age_stage_target(
+    stage,
+    chain,
+    benchmark,
+    floor_rate,
+    landing_stage,
+    stage_count=10,
+):
+    """Walk an exact-term offer through its market landing and on to the hard floor."""
+
+    floor_rate = D(floor_rate)
+    origin_rate = max(floor_rate, D(chain["origin_rate"]))
+    landing_value = chain.get("fixed_landing_rate")
+    landing_rate = max(
+        floor_rate,
+        D(landing_value if landing_value is not None else benchmark),
+    )
+    stage_count = max(1, int(stage_count))
+    landing_stage = min(stage_count, max(1, int(landing_stage)))
+    progress_stage = min(max(0, int(stage)), stage_count)
+    if progress_stage <= landing_stage:
+        gap = max(D("0"), origin_rate - landing_rate)
+        fraction = D(progress_stage) / D(landing_stage)
+        return ceil_rate_tick(max(landing_rate, origin_rate - gap * fraction))
+    floor_stage_count = max(1, stage_count - landing_stage)
+    floor_progress = progress_stage - landing_stage
+    fraction = D(floor_progress) / D(floor_stage_count)
+    return ceil_rate_tick(max(floor_rate, landing_rate - (landing_rate - floor_rate) * fraction))
 
 
 def _credit_display_group(credit):
@@ -281,6 +318,94 @@ class LendingRuntimeV3:
     def _log(self, message):
         if self.log is not None:
             self.log.log(message)
+
+    def _reconcile_ambiguous_dust_consolidation(self, active_offer_ids, now_ms):
+        """Advance an uncertain dust-cancel after an authoritative snapshot.
+
+        A controlled restart may clear the protected PAUSED mode before this
+        reconciliation branch runs.  Do not leave that stale cancellation
+        record blocking all later LIVE submissions.  An uncertain replacement
+        submission is still protected by its AMBIGUOUS order intent, so it is
+        deliberately left untouched here.
+        """
+        consolidation = self.store.consolidation_status()
+        if consolidation.get("state") != "AMBIGUOUS" or consolidation.get("offer_id") is None:
+            return
+        dust_hash = f"dust-{consolidation.get('started_at_ms')}-{consolidation.get('offer_id')}"
+        related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
+        if any(row.get("state") == "AMBIGUOUS" for row in related):
+            return
+        if int(consolidation["offer_id"]) in active_offer_ids:
+            self.store.clear_consolidation(now_ms)
+        else:
+            self.store.update_consolidation("READY", now_ms=now_ms)
+
+    def _close_absent_external_takeover_observations(self, active_offer_ids, now_ms):
+        """Close stale two-snapshot candidates after an authoritative read."""
+
+        active_offer_ids = {int(offer_id) for offer_id in active_offer_ids}
+        for takeover in self.store.external_takeovers(states={"OBSERVED", "CONFIRMED"}):
+            offer_id = int(takeover["offer_id"])
+            if offer_id not in active_offer_ids:
+                self.store.update_external_takeover(offer_id, "CLOSED", now_ms=now_ms)
+
+    def _write_recovery_status(self):
+        """Expose every durable write blocker through one status payload.
+
+        The persistence model intentionally remains specialised (intents,
+        consolidation and external takeover), but callers must not need to
+        understand those stores to decide whether a LIVE cycle can write.
+        """
+        blockers = []
+        recovery = self.store.recovery_status()
+        if recovery.get("active"):
+            blockers.append(
+                {
+                    "kind": "RUNTIME_RECOVERY",
+                    "state": "RECOVERING",
+                    "reason": recovery.get("reason"),
+                    "nextActionAt": recovery.get("nextProbeAt"),
+                }
+            )
+        for intent in self.store.intents(states={"PLANNED", "SUBMITTING", "AMBIGUOUS"}):
+            blockers.append(
+                {
+                    "kind": "SUBMIT",
+                    "state": intent["state"],
+                    "intentId": intent["id"],
+                    "offerId": intent.get("exchange_offer_id"),
+                    "reason": intent.get("error_text"),
+                    "createdAt": intent.get("created_at_ms"),
+                }
+            )
+        consolidation = self.store.consolidation_status()
+        if consolidation.get("state") not in {None, "IDLE"}:
+            blockers.append(
+                {
+                    "kind": "DUST_CONSOLIDATION",
+                    "state": consolidation.get("state"),
+                    "offerId": consolidation.get("offer_id"),
+                    "reason": consolidation.get("last_error"),
+                    "createdAt": consolidation.get("started_at_ms"),
+                }
+            )
+        for takeover in self.store.external_takeovers(states={"OBSERVED", "CONFIRMED", "CANCELLING", "AMBIGUOUS"}):
+            blockers.append(
+                {
+                    "kind": "EXTERNAL_TAKEOVER",
+                    "state": takeover.get("state"),
+                    "offerId": takeover.get("offer_id"),
+                    "reason": takeover.get("last_error"),
+                    "createdAt": takeover.get("first_seen_ms"),
+                }
+            )
+        blocking_states = {"RECOVERING", "PLANNED", "SUBMITTING", "AMBIGUOUS", "CANCELLING", "CONFIRMED", "READY"}
+        for item in blockers:
+            item["blocking"] = item.get("state") in blocking_states
+        return {
+            "canSubmit": not any(item["blocking"] for item in blockers),
+            "blockers": blockers,
+        }
 
     @staticmethod
     def _offer_display_type(offer):
@@ -525,6 +650,7 @@ class LendingRuntimeV3:
             authoritative_account["walletAvailableKnown"] and authoritative_account["reconciliationStatus"] == "MATCHED"
         )
         if self.policy.adopt_external_offers and takeover_snapshot_safe:
+            self._close_absent_external_takeover_observations(active_offer_ids, now)
             active_strategy = self.store.strategy("ACTIVE")
             strategy_version = active_strategy["version_id"] if active_strategy else "3"
             confirmed_external = []
@@ -609,12 +735,7 @@ class LendingRuntimeV3:
         if current["mode"] == "PAUSED" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
             resolved_runtime = self.store.observe_ambiguous_cancel(active_offer_ids, now)
             if not resolved_runtime.get("safe_reason"):
-                consolidation = self.store.consolidation_status()
-                if consolidation.get("state") == "AMBIGUOUS" and consolidation.get("offer_id") is not None:
-                    if int(consolidation["offer_id"]) in active_offer_ids:
-                        self.store.clear_consolidation(now)
-                    else:
-                        self.store.update_consolidation("READY", now_ms=now)
+                self._reconcile_ambiguous_dust_consolidation(active_offer_ids, now)
                 for takeover in self.store.external_takeovers(states={"AMBIGUOUS"}):
                     offer_id = int(takeover["offer_id"])
                     self.store.update_external_takeover(
@@ -623,6 +744,7 @@ class LendingRuntimeV3:
                         now_ms=now,
                     )
         elif account["reconciliationStatus"] == "MATCHED" and not snapshot.get("safeRequired"):
+            self._reconcile_ambiguous_dust_consolidation(active_offer_ids, now)
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
             self.store.record_consistent_sync(now)
@@ -1003,6 +1125,16 @@ class LendingRuntimeV3:
                 continue
             stage = int(chain.get("current_stage") or 0)
             stages = self.policy.reprice_stages(pool)
+            curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
+            exploration_curve = curve_version in EXACT_TERM_EXPLORATION_CURVES
+            landing_stage = min(
+                len(stages),
+                int(
+                    self.policy.balanced_landing_stage
+                    if layer in {"quick", "balanced"}
+                    else self.policy.high_landing_stage
+                ),
+            ) if exploration_curve else None
             next_stage = stage + 1 if stage < len(stages) else None
             next_at = (
                 int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000 if next_stage is not None else None
@@ -1010,12 +1142,24 @@ class LendingRuntimeV3:
             hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
-            benchmark = competitive_rate_for_layer(layer, signals, floor_rate)
+            benchmark = competitive_rate_for_period(
+                layer, pool, int(offer["period"]), signals, floor_rate
+            )
+            fixed_landing = (
+                max(floor_rate, min(D(chain["origin_rate"]), D(chain["fixed_landing_rate"])))
+                if chain.get("fixed_landing_rate") is not None
+                else max(floor_rate, min(D(chain["origin_rate"]), benchmark))
+            )
+            pricing = period_pricing_context(signals, pool, int(offer["period"]), floor_rate)
             observed_rate = D(offer.get("rate_real") or offer["rate"])
             floor_gap = max(D("0"), observed_rate - floor_rate)
+            landing_gap = max(D("0"), observed_rate - fixed_landing)
             final_due_at = int(chain["started_at_ms"]) + int(stages[-1]) * 60_000
             pending_action = chain.get("pending_action")
-            if pending_action == "AGE_STAGE" and stage >= len(stages):
+            below_repost_minimum = D(offer.get("amount") or 0) < USD_ORDER_CHUNK
+            if below_repost_minimum and floor_gap >= self.policy.minimum_rate_change:
+                floor_state = "BELOW_REPOST_MINIMUM"
+            elif pending_action == "AGE_STAGE" and stage >= len(stages):
                 floor_state = "REPRICE_PENDING"
             elif floor_gap < self.policy.minimum_rate_change:
                 floor_state = "SATISFIED_WITHIN_TOLERANCE"
@@ -1028,13 +1172,33 @@ class LendingRuntimeV3:
                 market_anchor = offer.get("rate_real") or offer["rate"]
             next_target = None
             if next_stage is not None:
-                next_target = _age_stage_target(
-                    next_stage,
-                    chain,
-                    benchmark,
-                    floor_rate,
-                    fallback_anchor=D(offer.get("rate_real") or offer["rate"]),
-                )
+                if exploration_curve:
+                    next_target = _exploration_age_stage_target(
+                        next_stage, chain, benchmark, floor_rate, landing_stage, len(stages)
+                    )
+                else:
+                    next_target = _age_stage_target(
+                        next_stage,
+                        chain,
+                        benchmark,
+                        floor_rate,
+                        fallback_anchor=D(offer.get("rate_real") or offer["rate"]),
+                        stage_count=len(stages),
+                    )
+            stage_type = (
+                "FLOOR" if exploration_curve and stage > landing_stage else "MARKET"
+                if exploration_curve
+                else _reprice_stage_type(stage, len(stages))
+            )
+            next_stage_type = (
+                None
+                if next_stage is None
+                else "FLOOR"
+                if exploration_curve and next_stage > landing_stage
+                else "MARKET"
+                if exploration_curve
+                else _reprice_stage_type(next_stage, len(stages))
+            )
             rows.append(
                 {
                     "offerId": offer_id,
@@ -1045,12 +1209,35 @@ class LendingRuntimeV3:
                     "nextStageAtMs": next_at,
                     "nextTargetRate": next_target,
                     "benchmarkRate": benchmark,
+                    "currentMarketRate": benchmark,
+                    "curveVersion": curve_version,
+                    "explorationStartRate": D(chain["origin_rate"]),
+                    "landingRate": fixed_landing,
+                    "landingPolicy": "FIXED_AT_CREATION" if exploration_curve else "LEGACY_DYNAMIC",
+                    "landingStage": landing_stage,
+                    "benchmarkSource": pricing["source"],
+                    "periodBestBorrowRate": pricing["bestBorrowRate"],
+                    "periodAnchorRate": pricing["anchorRate"],
                     "floorRate": floor_rate,
                     "floorState": floor_state,
+                    "landingState": (
+                        "SATISFIED_WITHIN_TOLERANCE"
+                        if exploration_curve and landing_gap < self.policy.minimum_rate_change
+                        else "REPRICE_REQUIRED"
+                        if exploration_curve
+                        and now_ms
+                        >= int(chain["started_at_ms"]) + int(stages[landing_stage - 1]) * 60_000
+                        else "NOT_DUE"
+                        if exploration_curve
+                        else None
+                    ),
                     "marketAnchorRate": market_anchor,
-                    "stageType": _reprice_stage_type(stage),
-                    "nextStageType": None if next_stage is None else _reprice_stage_type(next_stage),
+                    "stageType": stage_type,
+                    "nextStageType": next_stage_type,
+                    "totalStages": len(stages),
+                    "marketStageCount": landing_stage if exploration_curve else len(stages) // 2,
                     "pendingAction": chain.get("pending_action"),
+                    "repriceBlockedReason": "BELOW_REPOST_MINIMUM" if below_repost_minimum else None,
                 }
             )
         return json_decimal(rows)
@@ -1093,7 +1280,7 @@ class LendingRuntimeV3:
             strategy_payload["periodActivity"] = json_decimal(self.store.period_activity(now - 86_400_000, "USD"))
         status = {
             "schemaVersion": 3,
-            "stateSchemaVersion": 11,
+            "stateSchemaVersion": 16,
             "operationMode": runtime["mode"],
             "runtime": runtime,
             "recovery": self.store.recovery_status(),
@@ -1109,6 +1296,8 @@ class LendingRuntimeV3:
             "activeCreditSummary": active_credit_dashboard["summary"],
             "realizedIncome": realized_income,
             "incomeHistorySync": income_sync,
+            "releaseComparison": json_decimal(self.store.release_comparison(now, "USD")),
+            "writeRecovery": self._write_recovery_status(),
             "strategyV3": strategy_payload,
             "activeStrategy": self.store.strategy("ACTIVE"),
             "draftStrategy": self.store.strategy("DRAFT"),
@@ -1130,7 +1319,7 @@ class LendingRuntimeV3:
             if runtime["mode"] == "PAUSED" and runtime.get("safe_reason"):
                 self.log.refreshStatus(f"PAUSED：{runtime.get('safe_reason') or '策略已暂停'}")
             else:
-                self.log.refreshStatus(f"V3.3 {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"V3.5 {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(self, plan_result, wallet_available, strategy_version):
@@ -1148,8 +1337,7 @@ class LendingRuntimeV3:
             if attempts >= attempt_budget:
                 break
             base_slice_key = f"{strategy_version}:{plan_hash}:{row['pool']}:{row['layer']}:{row['slice_index']}"
-            pending_reprice = self.store.pending_reprice_for_base(base_slice_key, strategy_version)
-            submit_row = self._apply_pending_reprice(row, pending_reprice)
+            submit_row = dict(row)
             if submit_row["amount"] > remaining:
                 break
             order = {
@@ -1157,6 +1345,7 @@ class LendingRuntimeV3:
                 "currency": "USD",
                 "slice_key": self.store.replenishment_slice_key(base_slice_key),
                 "strategy_version": strategy_version,
+                "pricing_curve_version": EXACT_TERM_EXPLORATION_CURVE,
             }
             try:
                 created, intent = self.store.reserve_intent(order, remaining)
@@ -1184,12 +1373,6 @@ class LendingRuntimeV3:
                     self.store.mark_ambiguous(intent["id"], "successful notification omitted offer id")
                     break
                 self.store.confirm_intent(intent["id"], offer_id)
-                self.store.bind_reprice_replacement(
-                    base_slice_key,
-                    strategy_version,
-                    offer_id,
-                    submit_row["effective_rate"],
-                )
                 remaining -= submit_row["amount"]
                 submitted.append({"intentId": intent["id"], "offerId": offer_id, **submit_row})
             elif result.outcome == WriteOutcome.UNKNOWN:
@@ -1210,13 +1393,127 @@ class LendingRuntimeV3:
                     break
         return submitted
 
+    def _submit_pending_reprices(self, wallet_available, strategy_version):
+        """Restore canceled offers before new wallet cash is allocated."""
+
+        submitted = []
+        remaining = D(wallet_available)
+        now = int(self.clock() * 1000)
+        recent_attempts = self.store.submission_attempt_count_since(
+            now - FUNDING_SUBMISSION_WINDOW_MS,
+            "USD",
+        )
+        attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
+        attempts = 0
+        for pending in self.store.pending_reprices(strategy_version):
+            if attempts >= attempt_budget:
+                break
+            amount = D(pending["source_amount"])
+            if amount > remaining:
+                break
+            pool = str(pending["pool"])
+            flags = int(pending.get("source_flags") or 0)
+            hidden = bool(flags & 64)
+            fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
+            floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
+            display_type = str(
+                pending.get("source_display_type") or pending.get("source_offer_type") or "LIMIT"
+            ).upper()
+            source_effective = D(pending.get("source_rate_real") or pending["source_rate"])
+            row = self._apply_pending_reprice(
+                {
+                    "amount": amount,
+                    "pool": pool,
+                    "layer": str(pending["layer"]),
+                    "period": int(pending["source_period"]),
+                    "offer_type": str(pending.get("source_offer_type") or "LIMIT"),
+                    "display_type": display_type,
+                    "flags": flags,
+                    "submitted_rate": D(pending["source_rate"]),
+                    "effective_rate": source_effective,
+                    "target_rate": source_effective,
+                    "gross_daily_floor": floor_rate,
+                    "plan_hash": f"reprice:{pending['chain_key']}",
+                },
+                pending,
+            )
+            order = {
+                **row,
+                "currency": str(pending.get("source_currency") or "USD").upper(),
+                "slice_key": self.store.replenishment_slice_key(pending["base_slice_key"]),
+                "strategy_version": strategy_version,
+                "pricing_curve_version": str(
+                    pending.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE
+                ),
+                "fixed_landing_rate": pending.get("fixed_landing_rate"),
+            }
+            try:
+                created, intent = self.store.reserve_intent(order, remaining)
+            except InsufficientReservedBalance:
+                break
+            if not created:
+                continue
+            attempts += 1
+            self.store.mark_submitting(intent["id"])
+            result = _write_result(
+                self.client,
+                "submit_funding_offer_result",
+                "submit_funding_offer",
+                f"f{order['currency']}",
+                format(row["amount"], "f"),
+                format(row["submitted_rate"], "f"),
+                row["period"],
+                row["offer_type"],
+                flags=row["flags"],
+            )
+            if result.outcome == WriteOutcome.CONFIRMED:
+                offer_id = extract_submitted_offer_id(result.response)
+                if offer_id is None:
+                    self.store.mark_ambiguous(intent["id"], "successful notification omitted offer id")
+                    break
+                self.store.confirm_intent(intent["id"], offer_id)
+                self.store.bind_reprice_replacement_chain(
+                    pending["chain_key"],
+                    offer_id,
+                    row["effective_rate"],
+                )
+                remaining -= row["amount"]
+                submitted.append({"intentId": intent["id"], "offerId": offer_id, **row})
+            elif result.outcome == WriteOutcome.UNKNOWN:
+                self.store.mark_ambiguous(intent["id"], result.error)
+                break
+            else:
+                self.store.reject_intent(intent["id"], result.error)
+                self._log(f"USD 调价重挂被明确拒绝：{result.error}")
+                if result.category == "BALANCE_DRIFT":
+                    self.store.set_mode("PAUSED", "AUTO_RECOVERY:BALANCE_DRIFT")
+                    self.store.begin_recovery(
+                        "BALANCE_DRIFT",
+                        result.error,
+                        origin_mode="LIVE",
+                        target_mode="LIVE",
+                    )
+                    self.store.record_recovery_failure(result.error, "BALANCE_DRIFT", now)
+                break
+        outstanding = sum(
+            (D(row["source_amount"]) for row in self.store.pending_reprices(strategy_version)),
+            D("0"),
+        )
+        return submitted, max(D("0"), remaining - outstanding)
+
     @staticmethod
     def _apply_pending_reprice(row, pending):
         if not pending or pending.get("pending_target_rate") is None:
             return dict(row)
         adjusted = dict(row)
         floor_rate = ceil_rate_tick(adjusted.get("gross_daily_floor") or 0)
-        desired = ceil_rate_tick(max(floor_rate, D(pending["pending_target_rate"])))
+        source_effective = D(adjusted.get("effective_rate") or adjusted.get("submitted_rate") or 0)
+        desired = ceil_rate_tick(
+            max(
+                floor_rate,
+                min(source_effective, D(pending["pending_target_rate"])),
+            )
+        )
         display_type = str(adjusted.get("display_type") or adjusted.get("offer_type") or "LIMIT").upper()
         if display_type == "LIMIT":
             adjusted["submitted_rate"] = desired
@@ -1237,11 +1534,32 @@ class LendingRuntimeV3:
         for row in plan_result["plan"]:
             target_by_key.setdefault((row["pool"], row["layer"]), row)
         canceled = []
-        for offer in self.store.offers(active_only=True):
+        offers = self.store.offers(active_only=True)
+
+        def reprice_priority(offer):
+            pool = offer.get("pool") or pool_for_period(offer.get("period") or 0)
+            chain = self.store.reprice_chain_for_offer(int(offer["offer_id"]))
+            started_at = int(
+                (chain or {}).get("started_at_ms")
+                or offer.get("mts_created")
+                or now
+            )
+            stages = self.policy.reprice_stages(pool) if pool in POOLS else (0,)
+            final_due_at = started_at + int(stages[-1]) * 60_000
+            return (
+                0 if now >= final_due_at else 1,
+                final_due_at,
+                started_at,
+                int(offer["offer_id"]),
+            )
+
+        for offer in sorted(offers, key=reprice_priority):
             if not offer["managed"] or offer["currency"] != "USD":
                 continue
             offer_id = int(offer["offer_id"])
             if offer_id in self._pending_cancel_requested:
+                continue
+            if D(offer.get("amount") or 0) < USD_ORDER_CHUNK:
                 continue
             pool = offer.get("pool") or pool_for_period(offer["period"])
             layer = offer.get("layer") or "balanced"
@@ -1256,7 +1574,21 @@ class LendingRuntimeV3:
             hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
-            benchmark = competitive_rate_for_layer(layer, signals, floor_rate)
+            benchmark = competitive_rate_for_period(
+                layer, pool, int(offer["period"]), signals, floor_rate
+            )
+            curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
+            exploration_curve = curve_version in EXACT_TERM_EXPLORATION_CURVES
+            if exploration_curve and chain.get("fixed_landing_rate") is None:
+                fixed_landing = max(
+                    floor_rate,
+                    min(D(chain["origin_rate"]), benchmark),
+                )
+                chain = self.store.set_fixed_landing_rate(
+                    chain["chain_key"],
+                    fixed_landing,
+                    now,
+                )
             if target is not None:
                 # A4 reprices the existing order in place conceptually. Ranking
                 # changes apply only to new wallet cash and must never change the
@@ -1269,7 +1601,6 @@ class LendingRuntimeV3:
                     "flags": int(offer.get("flags") or 0),
                     "effective_rate": benchmark,
                 }
-            market_threshold = max(self.policy.minimum_rate_change, D(signals.get("trend_threshold") or 0))
             age_threshold = self.policy.minimum_rate_change
             display_type = str(offer.get("display_type") or self._offer_display_type(offer)).upper()
             compatible_shape = (
@@ -1288,13 +1619,7 @@ class LendingRuntimeV3:
                     continue
                 action = "SHAPE_CHANGE"
                 reason = "shape_change_preserve_period"
-                desired_rate = ceil_rate_tick(max(floor_rate, D(target["effective_rate"])))
-            elif benchmark - old_rate >= market_threshold:
-                if offer_age < self.policy.minimum_offer_minutes * 60_000:
-                    continue
-                action = "MARKET_RISE"
-                reason = "market_rise"
-                desired_rate = benchmark
+                desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, benchmark)))
             else:
                 current_stage = int(chain.get("current_stage") or 0)
                 stages = self.policy.reprice_stages(pool)
@@ -1306,29 +1631,51 @@ class LendingRuntimeV3:
                     due_at = int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
                     if now < due_at:
                         continue
-                    if next_stage > 3 and chain.get("market_anchor_rate") is None:
+                    if not exploration_curve and next_stage > 3 and chain.get("market_anchor_rate") is None:
                         chain = self.store.set_reprice_market_anchor(chain["chain_key"], old_rate, now)
-                    desired_rate = _age_stage_target(
-                        next_stage,
-                        chain,
-                        benchmark,
-                        floor_rate,
-                        fallback_anchor=old_rate,
-                    )
+                    if exploration_curve:
+                        landing_stage = min(
+                            len(stages),
+                            int(
+                                self.policy.balanced_landing_stage
+                                if layer in {"quick", "balanced"}
+                                else self.policy.high_landing_stage
+                            ),
+                        )
+                        desired_rate = _exploration_age_stage_target(
+                            next_stage, chain, benchmark, floor_rate, landing_stage, len(stages)
+                        )
+                    else:
+                        desired_rate = _age_stage_target(
+                            next_stage,
+                            chain,
+                            benchmark,
+                            floor_rate,
+                            fallback_anchor=old_rate,
+                            stage_count=len(stages),
+                        )
                 if display_type == "FRR" or old_rate <= desired_rate or old_rate - desired_rate < age_threshold:
                     if current_stage < len(stages):
                         self.store.complete_reprice_stage(
                             chain["chain_key"],
                             next_stage,
                             now,
-                            market_anchor_rate=old_rate if next_stage == 3 else None,
+                            market_anchor_rate=(
+                                old_rate if not exploration_curve and next_stage == 3 else None
+                            ),
                         )
                         self.store.record_ownership_event(
                             "REPRICE_STAGE_SKIPPED",
                             offer_id=offer_id,
                             details={
                                 "stage": next_stage,
-                                "stageType": _reprice_stage_type(next_stage),
+                                "stageType": (
+                                    "FLOOR"
+                                    if exploration_curve and next_stage > landing_stage
+                                    else "MARKET"
+                                    if exploration_curve
+                                    else _reprice_stage_type(next_stage, len(stages))
+                                ),
                                 "benchmarkRate": format(benchmark, "f"),
                                 "targetRate": format(desired_rate, "f"),
                                 "marketAnchorRate": format(
@@ -1344,10 +1691,19 @@ class LendingRuntimeV3:
                 stage = next_stage
                 reason = f"age_stage_{stage}"
 
-            if self.store.reprice_count_since(now - 3_600_000) >= self.policy.max_reprices_per_hour:
+            desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, desired_rate)))
+            final_floor_priority = action == "AGE_STAGE" and int(stage or 0) >= len(
+                self.policy.reprice_stages(pool)
+            )
+            if (
+                not final_floor_priority
+                and self.store.reprice_count_since(now - 3_600_000) >= self.policy.max_reprices_per_hour
+            ):
                 continue
             last_family_reprice = self.store.last_reprice_for_family(pool, layer)
             if (
+                not final_floor_priority
+                and
                 last_family_reprice is not None
                 and now - int(last_family_reprice) < self.policy.reprice_cooldown_minutes * 60_000
             ):
@@ -1376,7 +1732,12 @@ class LendingRuntimeV3:
                 desired_rate,
                 stage=stage,
                 now_ms=now,
-                market_anchor_rate=desired_rate if action == "AGE_STAGE" and stage == 3 else None,
+                market_anchor_rate=(
+                    desired_rate
+                    if action == "AGE_STAGE" and stage == 3 and not exploration_curve
+                    else None
+                ),
+                source_offer_id=offer_id,
             )
             self.store.record_reprice(
                 offer_id,
@@ -1398,11 +1759,6 @@ class LendingRuntimeV3:
                 self._log(
                     f"挂单 {offer_id} 累计等待达到第 {stage} 阶段，"
                     f"利率由 {format(old_rate, 'f')} 调整为 {format(desired_rate, 'f')}。"
-                )
-            elif action == "MARKET_RISE":
-                self._log(
-                    f"挂单 {offer_id} 检测到市场利率明显上涨，"
-                    f"将由 {format(old_rate, 'f')} 追价至 {format(desired_rate, 'f')}。"
                 )
             else:
                 self._log(f"挂单 {offer_id} 的期限或类型需要按当前策略调整。")
@@ -1502,7 +1858,7 @@ class LendingRuntimeV3:
         return canceled
 
     def _dust_consolidation(self, account, signals, now_ms, strategy_version):
-        """Merge 1-149.99 USD wallet dust into the smallest safe short offer."""
+        """Merge wallet dust, preferring short, then medium, then long managed offers."""
 
         status = self.store.consolidation_status()
         state = status.get("state", "IDLE")
@@ -1512,13 +1868,42 @@ class LendingRuntimeV3:
                 self.store.update_consolidation("READY", now_ms=now_ms)
                 return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
             return {"blocking": True, "state": state, "canceled": [], "submitted": []}
-        if state == "READY":
+        if state in {"READY", "SUBMITTING", "AMBIGUOUS"}:
             wallet = D(account["wallet"])
             expected = D(status["captured_wallet"]) + D(status["captured_offer_amount"])
-            if wallet >= expected + USD_ORDER_CHUNK:
+            dust_hash = f"dust-{status.get('started_at_ms')}-{status.get('offer_id')}"
+            related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
+            ambiguous = [row for row in related if row["state"] == "AMBIGUOUS"]
+            if ambiguous:
+                self.store.update_consolidation("AMBIGUOUS", "unknown replacement submit", now_ms)
+                return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
+            if any(row["state"] in {"PLANNED", "SUBMITTING"} for row in related):
+                self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
+                return {"blocking": True, "state": "SUBMITTING", "canceled": [], "submitted": []}
+
+            active_offer_ids = set(active_offers)
+            invisible_confirmed = [
+                row
+                for row in related
+                if row["state"] == "CONFIRMED" and int(row.get("exchange_offer_id") or 0) not in active_offer_ids
+            ]
+            if invisible_confirmed:
+                self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
+                return {"blocking": True, "state": "SUBMITTING", "canceled": [], "submitted": []}
+
+            deployed = sum(
+                (D(row["amount"]) for row in related if row["state"] in {"CONFIRMED", "CLOSED"}),
+                D("0"),
+            )
+            expected_remaining = max(D("0"), expected - deployed)
+            if wallet >= expected_remaining + USD_ORDER_CHUNK:
                 self.store.clear_consolidation(now_ms)
                 return {"blocking": False, "state": "ABORTED_ACCOUNT_CHANGE", "canceled": [], "submitted": []}
             if wallet < USD_ORDER_CHUNK:
+                if deployed > 0 and expected_remaining < USD_ORDER_CHUNK:
+                    self.store.clear_consolidation(now_ms)
+                    return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
+                self.store.update_consolidation("READY", now_ms=now_ms)
                 return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
             selection = (
                 (signals.get("periodSelection") or signals.get("period_selection") or {})
@@ -1527,16 +1912,20 @@ class LendingRuntimeV3:
             )
             period = int(selection.get("selectedPeriod") or status.get("target_period") or 2)
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.short_floor_apr, self.policy.normal_fee_rate))
-            target_rate = competitive_rate_for_layer("quick", signals, floor_rate)
-            dust_hash = f"dust-{status.get('started_at_ms')}-{status.get('offer_id')}"
+            target_rate = competitive_rate_for_period(
+                "quick", "short", period, signals, floor_rate
+            )
+            slice_count = int(wallet // USD_ORDER_CHUNK)
+            amounts = evenly_distributed_amounts(wallet, slice_count)
+            slice_offset = len(related)
             dust_plan = {
                 "plan_hash": dust_hash,
                 "plan": [
                     {
-                        "slice_index": 0,
+                        "slice_index": slice_offset + index,
                         "pool": "short",
                         "layer": "quick",
-                        "amount": wallet,
+                        "amount": amount,
                         "period": period,
                         "offer_type": "LIMIT",
                         "display_type": "LIMIT",
@@ -1547,27 +1936,21 @@ class LendingRuntimeV3:
                         "gross_daily_floor": floor_rate,
                         "plan_hash": dust_hash,
                     }
+                    for index, amount in enumerate(amounts)
                 ],
             }
             self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
             submitted = self._submit_plan(dust_plan, wallet, strategy_version)
-            if submitted:
-                self.store.clear_consolidation(now_ms)
-            elif self.store.intents(states={"AMBIGUOUS"}):
+            related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
+            if any(row["state"] == "AMBIGUOUS" for row in related):
                 self.store.update_consolidation("AMBIGUOUS", "unknown replacement submit", now_ms)
+                result_state = "AMBIGUOUS"
+            elif submitted:
+                result_state = "SUBMITTING"
             else:
                 self.store.update_consolidation("READY", now_ms=now_ms)
-            return {"blocking": True, "state": "SUBMITTING", "canceled": [], "submitted": submitted}
-        if state in {"SUBMITTING", "AMBIGUOUS"}:
-            dust_hash = f"dust-{status.get('started_at_ms')}-{status.get('offer_id')}"
-            related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
-            if any(row["state"] == "CONFIRMED" for row in related):
-                self.store.clear_consolidation(now_ms)
-                return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
-            if related and all(row["state"] in {"CLOSED", "REJECTED"} for row in related):
-                self.store.update_consolidation("READY", now_ms=now_ms)
-                return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
-            return {"blocking": True, "state": state, "canceled": [], "submitted": []}
+                result_state = "READY"
+            return {"blocking": True, "state": result_state, "canceled": [], "submitted": submitted}
 
         wallet = D(account["wallet"])
         bucket = now_ms // 300_000
@@ -1589,13 +1972,11 @@ class LendingRuntimeV3:
             return {"blocking": False, "state": "COOLDOWN", "canceled": [], "submitted": []}
         candidates = []
         for offer in active_offers.values():
-            pool = offer.get("pool") or pool_for_period(offer["period"])
             display = str(offer.get("display_type") or offer.get("offer_type") or "LIMIT").upper()
             age = now_ms - int(offer.get("mts_created") or now_ms)
             amount = D(offer["amount"])
             if (
                 offer.get("managed")
-                and pool == "short"
                 and display == "LIMIT"
                 and int(offer["offer_id"]) not in self._pending_cancel_requested
                 and not (self.store.reprice_chain_for_offer(int(offer["offer_id"])) or {}).get("pending_action")
@@ -1608,6 +1989,10 @@ class LendingRuntimeV3:
         candidate = min(
             candidates,
             key=lambda offer: (
+                {"short": 0, "medium": 1, "long": 2}.get(
+                    offer.get("pool") or pool_for_period(offer["period"]),
+                    3,
+                ),
                 D(offer["amount"]),
                 int(offer["period"]) == int(winner),
                 int(offer.get("mts_created") or now_ms),
@@ -1887,7 +2272,12 @@ class LendingRuntimeV3:
                     if hard_adjustments:
                         result["submitted"] = []
                     else:
-                        result["submitted"] = self._submit_plan(result, account["wallet"], version)
+                        replacement_submitted, new_cash_available = self._submit_pending_reprices(
+                            account["wallet"], version
+                        )
+                        result["submitted"] = replacement_submitted + self._submit_plan(
+                            result, new_cash_available, version
+                        )
                 elif dust.get("blocking"):
                     result["submitted"] = dust.get("submitted", [])
                 else:

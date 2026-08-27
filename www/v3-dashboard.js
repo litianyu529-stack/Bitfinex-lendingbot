@@ -41,7 +41,7 @@
         },
         {
             title: "订单类型与费用",
-            description: "V3.3 自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
+            description: "V3.5 自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
             fields: [
                 ["enable_limit", "LIMIT", "checkbox", "", {}],
                 ["enable_frr", "FRR", "checkbox", "", {}],
@@ -59,9 +59,13 @@
             details: true,
             fields: [
                 ["minimum_offer_minutes", "最短挂单时间", "number", "分钟", { min: 1 }],
-                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "10 / 30 / 60 / 90 / 120 / 180" }],
-                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "20 / 60 / 120 / 180 / 240 / 360" }],
-                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "60 / 180 / 360 / 480 / 720 / 1440" }],
+                ["balanced_start_premium_percent", "平衡层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
+                ["high_start_premium_percent", "高收益层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
+                ["balanced_landing_stage", "平衡层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
+                ["high_landing_stage", "高收益层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
+                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "5 / 10 / 20 / 30 / 60 / 75 / 90 / 120 / 150 / 180" }],
+                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "10 / 20 / 40 / 60 / 120 / 150 / 180 / 240 / 300 / 360" }],
+                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "30 / 60 / 120 / 180 / 360 / 480 / 720 / 960 / 1200 / 1440" }],
                 ["reprice_cooldown_minutes", "重定价冷却", "number", "分钟", { min: 1 }],
                 ["max_reprices_per_hour", "每小时重定价上限", "number", "次", { min: 0, max: 90 }],
                 ["minimum_rate_change", "显著利率变化", "number", "%/日", { min: 0, step: 0.0001 }],
@@ -165,7 +169,7 @@
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
-        fixedSafety.textContent = "V3.3 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
+        fixedSafety.textContent = "V3.5 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
         form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");
@@ -256,6 +260,14 @@
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
         if (poolTotal !== 100) throw new Error(`期限资金池比例当前为 ${poolTotal}%，必须等于100%`);
         if (layerTotal !== 100) throw new Error(`成交层比例当前为 ${layerTotal}%，必须等于100%`);
+        for (const name of ["balanced_start_premium_percent", "high_start_premium_percent"]) {
+            const value = numberValue(name);
+            if (value < 0 || value > 100) throw new Error("起始溢价必须在 0–100% 之间");
+        }
+        for (const name of ["balanced_landing_stage", "high_landing_stage"]) {
+            const value = numberValue(name);
+            if (!Number.isInteger(value) || value < 1 || value > 10) throw new Error("落点阶段必须是 1–10 的整数");
+        }
         for (const [name, [minimum, maximum]] of periodFields) {
             const periods = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
             const unique = new Set(periods);
@@ -271,11 +283,11 @@
             const name = `${pool}_reprice_stages_minutes`;
             const stages = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
             if (
-                stages.length !== 6
+                stages.length !== 10
                 || stages.some((value) => !Number.isInteger(value) || value < 1 || value > 10080)
                 || stages.some((value, index) => index > 0 && stages[index - 1] >= value)
             ) {
-                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是六个递增的 1–10080 分钟整数`);
+                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是十个递增的 1–10080 分钟整数`);
             }
         }
         if (input("enable_hidden").checked && numberValue("hidden_max_share") <= 0) throw new Error("启用Hidden时必须设置最高占比");

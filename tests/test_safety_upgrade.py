@@ -36,7 +36,7 @@ from StrategyV3 import (
     replay_strategy_v3,
 )
 from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
-from bitfinex import Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError
+from bitfinex import Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError, BitfinexTransientError
 
 
 D = Decimal
@@ -99,9 +99,50 @@ class Response:
 )
 def test_write_transport_failures_are_unknown(failure):
     client = Bitfinex("key", "secret")
-    with mock.patch("urllib.request.urlopen", side_effect=failure):
+    with mock.patch("urllib.request.urlopen", side_effect=failure) as urlopen:
         with pytest.raises(BitfinexAmbiguousWriteError):
             client._request_json("https://example.invalid", method="POST", ambiguous_on_failure=True)
+    assert urlopen.call_count == 1
+
+
+def test_read_transport_failure_retries_without_entering_runtime_recovery():
+    sleeps = []
+    client = Bitfinex("key", "secret", read_retry_delays=(0.25,), retry_sleeper=sleeps.append)
+    with mock.patch(
+        "urllib.request.urlopen",
+        side_effect=[http.client.IncompleteRead(b"{"), Response(b'{"ok":true}')],
+    ) as urlopen:
+        payload = client._request_json("https://example.invalid", method="POST")
+
+    assert payload == {"ok": True}
+    assert urlopen.call_count == 2
+    assert sleeps == [0.25]
+
+
+def test_read_transport_failure_raises_after_retry_budget_is_exhausted():
+    client = Bitfinex("key", "secret", read_retry_delays=(0, 0), retry_sleeper=lambda _: None)
+    with mock.patch("urllib.request.urlopen", side_effect=http.client.IncompleteRead(b"")) as urlopen:
+        with pytest.raises(BitfinexApiError, match="IncompleteRead"):
+            client._request_json("https://example.invalid")
+
+    assert urlopen.call_count == 3
+
+
+def test_authenticated_read_retry_uses_a_fresh_nonce_and_signature():
+    sleeps = []
+    client = Bitfinex("key", "secret", read_retry_delays=(0.25,), retry_sleeper=sleeps.append)
+    with mock.patch.object(
+        client,
+        "_request_json",
+        side_effect=[BitfinexTransientError("truncated"), []],
+    ) as request_json:
+        assert client._auth_post("v2/auth/r/wallets") == []
+
+    first_headers = request_json.call_args_list[0].kwargs["headers"]
+    second_headers = request_json.call_args_list[1].kwargs["headers"]
+    assert int(second_headers["bfx-nonce"]) > int(first_headers["bfx-nonce"])
+    assert second_headers["bfx-signature"] != first_headers["bfx-signature"]
+    assert sleeps == [0.25]
 
 
 def test_invalid_json_after_write_is_unknown():
@@ -159,13 +200,44 @@ def test_manual_protected_pause_resolution_remains_paused():
     assert can_clear_ambiguous_pause(0, "LIVE", False) is False
 
 
-def test_schema_v13_is_explicit(tmp_path):
+def test_schema_v16_is_explicit(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
-    assert version == "13"
-    assert {"write_phase", "resolution", "strategy_variant", "request_started_at_ms"} <= columns
+        chain_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
+    assert version == "16"
+    assert {
+        "write_phase",
+        "resolution",
+        "strategy_variant",
+        "request_started_at_ms",
+        "pricing_curve_version",
+        "fixed_landing_rate",
+    } <= columns
+    assert {"pending_source_offer_id", "fixed_landing_rate"} <= chain_columns
+
+
+def test_schema_v16_abandons_unsafe_legacy_pending_reprices(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    store = LendingStateStore(path)
+    with store.transaction(immediate=True) as connection:
+        connection.execute(
+            """INSERT INTO reprice_chains(
+                   chain_key, strategy_version, base_slice_key, pool, layer,
+                   origin_rate, started_at_ms, current_stage, current_offer_id,
+                   pending_action, pending_target_rate, status, updated_at_ms
+               ) VALUES('old-chain', 'v3', 'old', 'short', 'high',
+                        '0.0003', 1, 3, NULL, 'AGE_STAGE', '0.00025', 'ACTIVE', 2)"""
+        )
+        connection.execute("UPDATE schema_meta SET value='14' WHERE key='schema_version'")
+
+    migrated = LendingStateStore(path)
+    chain = migrated.reprice_chain("old-chain")
+
+    assert chain["status"] == "ABANDONED_LEGACY"
+    assert chain["pending_action"] is None
+    assert chain["pending_target_rate"] is None
     with store.read_connection() as connection:
         credit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(credits)")}
         ownership_table = connection.execute(
@@ -182,11 +254,35 @@ def test_schema_v13_is_explicit(tmp_path):
     assert reprice_chain_table is not None
     assert "amount_original" in offer_history_columns
     assert {"chain_key", "stage", "benchmark_rate", "floor_rate"} <= reprice_columns
-    assert "market_anchor_rate" in reprice_chain_columns
+    assert {"market_anchor_rate", "pricing_curve_version"} <= reprice_chain_columns
     assert store.recovery_status()["requiredSnapshots"] == 2
 
 
-def test_schema_v13_folds_legacy_safe_runtime_into_auto_recovery_paused(tmp_path):
+def test_schema_v16_backs_up_v15_and_abandons_pending_upward_reprices(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    store = LendingStateStore(path)
+    with store.transaction(immediate=True) as connection:
+        connection.execute(
+            """INSERT INTO reprice_chains(
+                   chain_key, strategy_version, base_slice_key, pool, layer,
+                   origin_rate, started_at_ms, current_stage, current_offer_id,
+                   pending_action, pending_target_rate, pending_source_offer_id,
+                   pricing_curve_version, status, updated_at_ms
+               ) VALUES('upward-chain', 'v3', 'upward', 'short', 'balanced',
+                        '0.0003', 1, 2, NULL, 'MARKET_RISE', '0.0004', 901,
+                        'EXACT_TERM_EXPLORATION_V2', 'ACTIVE', 2)"""
+        )
+        connection.execute("UPDATE schema_meta SET value='15' WHERE key='schema_version'")
+
+    migrated = LendingStateStore(path)
+    chain = migrated.reprice_chain("upward-chain")
+
+    assert chain["status"] == "ABANDONED_LEGACY"
+    assert chain["pending_action"] is None
+    assert list((tmp_path / "backups").glob("schema-v15-*.sqlite3"))
+
+
+def test_schema_v14_folds_legacy_safe_runtime_into_auto_recovery_paused(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = LendingStateStore(path)
     with store.transaction(immediate=True) as connection:
@@ -212,7 +308,7 @@ def test_safe_is_no_longer_a_runtime_mode(tmp_path):
         store.set_mode("SAFE", "legacy")
 
 
-def test_schema_v13_migrates_offer_history_without_losing_rows(tmp_path):
+def test_schema_v16_migrates_offer_history_without_losing_rows(tmp_path):
     path = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -240,7 +336,7 @@ def test_schema_v13_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "13"
+    assert version == "16"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 

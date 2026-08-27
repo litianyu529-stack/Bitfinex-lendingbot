@@ -14,21 +14,27 @@ from MarketDataStream import BitfinexMarketDataHub
 from RuntimeV3 import (
     LendingRuntimeV3,
     _age_stage_target,
+    _exploration_age_stage_target,
     build_active_credit_dashboard,
     parse_ledger_rows_v3,
 )
 from StateStore import InsufficientReservedBalance, LendingStateStore
 from StrategyV3 import (
+    EXACT_TERM_EXPLORATION_CURVE,
     StrategyPolicyV3,
+    _candidate_target_rate,
     _candidate_types,
     _winner_target_shares,
     build_market_signals_v3,
     build_strategy_plan_v3,
     ceil_rate_tick,
+    competitive_rate_for_period,
     evenly_distributed_amounts,
     filter_supported_trades,
     gross_daily_floor,
+    exploration_start_rate_for_period,
     json_decimal,
+    period_pricing_context,
     pool_for_period,
     rate_below_floor,
     replay_strategy_v3,
@@ -102,6 +108,15 @@ def limit_policy(**overrides):
         enable_frr=False,
         enable_frr_delta_fixed=False,
         enable_frr_delta_variable=False,
+        **overrides,
+    )
+
+
+def legacy_six_stage_policy(**overrides):
+    return limit_policy(
+        short_reprice_stages_minutes=(10, 30, 60, 90, 120, 180),
+        medium_reprice_stages_minutes=(20, 60, 120, 180, 240, 360),
+        long_reprice_stages_minutes=(60, 180, 360, 480, 720, 1440),
         **overrides,
     )
 
@@ -536,6 +551,89 @@ def test_offer_ratio_diagnostics_include_existing_offers_and_new_balance():
     assert result["ratio_tolerance"] == D("150")
 
 
+def test_layer_allocation_uses_managed_credits_and_offers_for_isolated_repayment():
+    result = build_strategy_plan_v3(
+        D("10000"),
+        D("150"),
+        {},
+        limit_policy(
+            short_share=D("100"),
+            medium_share=D("0"),
+            long_share=D("0"),
+            quick_share=D("30"),
+            balanced_share=D("40"),
+            high_share=D("30"),
+        ),
+        signals(),
+        "cumulative-layers",
+        existing_exposure={"total": D("9850")},
+        exposure_by_layer={"quick": D("3000"), "balanced": D("4000"), "high": D("2850")},
+        offer_exposure_by_pool={"short": D("0"), "medium": D("0"), "long": D("0")},
+        offer_exposure_by_layer={"quick": D("0"), "balanced": D("0"), "high": D("0")},
+    )
+
+    assert result["layer_allocation_basis"] == "ATTRIBUTED_MANAGED_EXPOSURE_PLUS_AVAILABLE"
+    assert result["current_layer_amounts"] == {
+        "quick": D("3000"),
+        "balanced": D("4000"),
+        "high": D("2850"),
+    }
+    assert len(result["plan"]) == 1
+    assert result["plan"][0]["layer"] == "high"
+
+
+def test_unattributed_legacy_credits_do_not_inflate_every_layer_target():
+    result = build_strategy_plan_v3(
+        D("10000"),
+        D("150"),
+        {},
+        limit_policy(short_share=D("100"), medium_share=D("0"), long_share=D("0")),
+        signals(),
+        "unattributed-layers",
+        exposure_by_layer={"quick": D("100"), "balanced": D("100"), "high": D("100")},
+        offer_exposure_by_pool={"short": D("0"), "medium": D("0"), "long": D("0")},
+    )
+
+    assert sum(result["target_layer_amounts"].values(), D("0")) == D("450")
+    assert result["unattributed_layer_amount"] == D("9550")
+
+
+def test_new_balanced_offer_uses_q75_start_guard_before_age_repricing():
+    market = signals(
+        anchor_rate=D("0.0001500"),
+        windows={
+            "1h": {"median": D("0.0001580")},
+            "24h": {"q25": D("0.0001800"), "q75": D("0.0002191")},
+        },
+    )
+
+    target = _candidate_target_rate(
+        {"layer": "balanced", "slice_index": 0},
+        market,
+        D("0.0002088"),
+    )
+
+    assert target == D("0.0002191")
+
+
+def test_new_balanced_offer_q75_guard_never_weakens_floor():
+    market = signals(
+        anchor_rate=D("0.0001500"),
+        windows={
+            "1h": {"median": D("0.0001580")},
+            "24h": {"q25": D("0.0001500"), "q75": D("0.0001800")},
+        },
+    )
+
+    target = _candidate_target_rate(
+        {"layer": "balanced", "slice_index": 0},
+        market,
+        D("0.0002088"),
+    )
+
+    assert target == D("0.0002088")
+
+
 def test_ratio_overweight_converges_without_canceling_existing_offers():
     now = 2_000_000_000_000
     configured = limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10"))
@@ -750,6 +848,46 @@ def test_six_stage_targets_preserve_market_stages_then_converge_to_floor():
     ]
 
 
+def test_ten_stage_defaults_and_targets_preserve_final_horizons():
+    configured = validate_policy_v3(policy())
+    assert configured.reprice_stages("short") == (5, 10, 20, 30, 60, 75, 90, 120, 150, 180)
+    assert configured.reprice_stages("medium") == (10, 20, 40, 60, 120, 150, 180, 240, 300, 360)
+    assert configured.reprice_stages("long") == (30, 60, 120, 180, 360, 480, 720, 960, 1200, 1440)
+    assert configured.minimum_offer_minutes == 5
+    assert configured.reprice_cooldown_minutes == 5
+    assert configured.max_reprices_per_hour == 12
+    assert configured.minimum_rate_change == D("0.00001")
+
+    chain = {"origin_rate": D("0.0006"), "market_anchor_rate": D("0.00045")}
+    targets = [
+        _age_stage_target(
+            stage,
+            chain,
+            D("0.00045"),
+            D("0.0003"),
+            stage_count=10,
+        )
+        for stage in range(1, 11)
+    ]
+    assert targets == [
+        D("0.00057"),
+        D("0.00054"),
+        D("0.00051"),
+        D("0.00048"),
+        D("0.00045"),
+        D("0.00042"),
+        D("0.00039"),
+        D("0.00036"),
+        D("0.00033"),
+        D("0.00030"),
+    ]
+
+
+def test_reprice_stage_migration_maps_six_stage_progress_without_regression():
+    assert [LendingStateStore._map_reprice_stage(stage, 6, 10) for stage in range(7)] == [0, 2, 4, 5, 7, 9, 10]
+    assert LendingStateStore._map_reprice_stage(10, 10, 6) == 6
+
+
 def result_floor(pool_name):
     return {"short": D("0.05"), "medium": D("0.06"), "long": D("0.07")}[pool_name]
 
@@ -886,6 +1024,445 @@ def test_period_selection_combines_windowed_demand_and_exact_period_book_scores(
     assert rows[4]["fillScore"] == D("0.650")
     assert rows[7]["fillScore"] == D("0.370")
     assert rows[2]["totalScore"] == D("0.6570")
+
+
+def test_exact_period_pricing_isolates_book_windows_anchor_and_q75():
+    now = 1_900_000_000_000
+    bases = {2: D("0.00020"), 7: D("0.00030"), 14: D("0.00040"), 30: D("0.00050"), 120: D("0.00060")}
+    trades = [
+        {
+            "mts": now - index * 60_000,
+            "rate": base + D(index) * D("0.00001"),
+            "amount": D("1000"),
+            "period": period,
+        }
+        for period, base in bases.items()
+        for index in range(4)
+    ]
+    book = [
+        {"period": period, "rate": base - D("0.00001"), "amount": D("-1000")}
+        for period, base in bases.items()
+    ]
+    market = build_market_signals_v3(book, trades, [], limit_policy(), now)
+    floor = D("0.00018")
+
+    two_day = period_pricing_context(market, "short", 2, floor)
+    seven_day = period_pricing_context(market, "short", 7, floor)
+
+    assert two_day["source"] == "EXACT_PERIOD"
+    assert two_day["bestBorrowRate"] == D("0.00019")
+    assert two_day["q75_24h"] == D("0.00022")
+    assert seven_day["bestBorrowRate"] == D("0.00029")
+    assert seven_day["q75_24h"] == D("0.00032")
+    assert competitive_rate_for_period("quick", "short", 2, market, floor) == D("0.0001899")
+    assert competitive_rate_for_period("quick", "short", 7, market, floor) == D("0.0002899")
+    assert competitive_rate_for_period("high", "long", 120, market, floor) > D("0.00060")
+
+    market["best_bid"] = D("0.00999")
+    market["windows"]["24h"]["q75"] = D("0.00888")
+    assert competitive_rate_for_period("quick", "short", 2, market, floor) == D("0.0001899")
+    assert competitive_rate_for_period("balanced", "short", 2, market, floor) < D("0.001")
+
+
+def test_balanced_new_offer_uses_only_its_exact_period_q75_guard():
+    now = 1_900_000_000_000
+    trades = [
+        {"mts": now - index * 60_000, "rate": D("0.00022"), "amount": D("1000"), "period": 2}
+        for index in range(4)
+    ] + [
+        {"mts": now - index * 60_000, "rate": D("0.00090"), "amount": D("1000"), "period": 7}
+        for index in range(4)
+    ]
+    book = [
+        {"period": 2, "rate": D("0.00019"), "amount": D("-1000")},
+        {"period": 7, "rate": D("0.00089"), "amount": D("-1000")},
+    ]
+    market = build_market_signals_v3(book, trades, [], limit_policy(), now)
+
+    target = _candidate_target_rate(
+        {"pool": "short", "period": 2, "layer": "balanced", "slice_index": 0},
+        market,
+        D("0.00018"),
+    )
+
+    assert target == D("0.00022")
+
+
+def test_exact_period_pricing_with_no_term_data_falls_back_to_its_floor():
+    now = 1_900_000_000_000
+    configured = limit_policy(short_periods=(2, 4, 7))
+    market = build_market_signals_v3(
+        [{"period": 2, "rate": D("0.0005"), "amount": D("-1000")}],
+        [{"mts": now, "rate": D("0.0005"), "amount": D("1000"), "period": 2}],
+        [],
+        configured,
+        now,
+    )
+    floor = D("0.0002088")
+
+    context = period_pricing_context(market, "short", 4, floor)
+
+    assert context["source"] == "EXACT_PERIOD"
+    assert context["rateDataAvailable"] is False
+    assert competitive_rate_for_period("quick", "short", 4, market, floor) == floor
+    assert competitive_rate_for_period("balanced", "short", 4, market, floor) == floor
+    assert competitive_rate_for_period("high", "short", 4, market, floor) == floor
+
+
+@pytest.mark.parametrize(
+    ("pool", "period", "term_rate"),
+    [
+        ("short", 2, "0.00022"),
+        ("short", 7, "0.00027"),
+        ("medium", 14, "0.00032"),
+        ("medium", 30, "0.00037"),
+        ("long", 120, "0.00042"),
+    ],
+)
+def test_every_supported_term_uses_only_its_exact_period_landing(pool, period, term_rate):
+    now = 1_900_000_000_000
+    configured = limit_policy()
+    rates = {
+        2: D("0.00022"),
+        7: D("0.00027"),
+        14: D("0.00032"),
+        30: D("0.00037"),
+        120: D("0.00042"),
+    }
+    book = [
+        {"period": candidate, "rate": rate - D("0.00001"), "amount": D("-1000")}
+        for candidate, rate in rates.items()
+    ]
+    trades = [
+        {"mts": now, "period": candidate, "rate": rate, "amount": D("1000")}
+        for candidate, rate in rates.items()
+    ]
+    market = build_market_signals_v3(book, trades, [], configured, now)
+    floor = ceil_rate_tick(
+        gross_daily_floor(configured.floor_apr(pool), configured.normal_fee_rate)
+    )
+    context = period_pricing_context(market, pool, period, floor)
+
+    assert context["source"] == "EXACT_PERIOD"
+    assert context["period"] == period
+    assert context["anchorRate"] == D(term_rate)
+    assert competitive_rate_for_period("balanced", pool, period, market, floor) == D(term_rate)
+
+
+def test_low_same_period_market_still_starts_balanced_and_high_above_floor():
+    now = 1_900_000_000_000
+    configured = policy(short_floor_apr=D("0.065"), normal_fee_rate=D("0.147"))
+    market = build_market_signals_v3(
+        [{"period": 2, "rate": D("0.00015"), "amount": D("-1000")}],
+        [
+            {"mts": now - 10_000, "rate": D("0.00015"), "amount": D("1000"), "period": 2},
+            {"mts": now - 20_000, "rate": D("0.00019"), "amount": D("1000"), "period": 2},
+        ],
+        [],
+        configured,
+        now,
+    )
+    floor = ceil_rate_tick(gross_daily_floor(configured.short_floor_apr, configured.normal_fee_rate))
+
+    assert exploration_start_rate_for_period("quick", "short", 2, market, floor, configured) == floor
+    assert exploration_start_rate_for_period("balanced", "short", 2, market, floor, configured) == ceil_rate_tick(
+        floor * D("1.05")
+    )
+    assert exploration_start_rate_for_period("high", "short", 2, market, floor, configured) == ceil_rate_tick(
+        floor * D("1.12")
+    )
+
+
+def test_no_same_period_data_still_uses_configured_exploration_premiums():
+    now = 1_900_000_000_000
+    configured = policy(short_floor_apr=D("0.065"), normal_fee_rate=D("0.147"))
+    market = build_market_signals_v3([], [], [], configured, now)
+    floor = ceil_rate_tick(gross_daily_floor(configured.short_floor_apr, configured.normal_fee_rate))
+
+    assert exploration_start_rate_for_period("balanced", "short", 2, market, floor, configured) == ceil_rate_tick(
+        floor * D("1.05")
+    )
+    assert exploration_start_rate_for_period("high", "short", 2, market, floor, configured) == ceil_rate_tick(
+        floor * D("1.12")
+    )
+
+
+def test_exploration_curve_reaches_balanced_and_high_landings_at_selected_stages():
+    chain = {"origin_rate": "0.0002400"}
+    floor = D("0.0002000")
+    landing = D("0.0002100")
+
+    balanced = [
+        _exploration_age_stage_target(stage, chain, landing, floor, 5) for stage in range(1, 7)
+    ]
+    high = [_exploration_age_stage_target(stage, chain, landing, floor, 7) for stage in range(1, 8)]
+
+    assert balanced == [
+        D("0.0002340"),
+        D("0.0002280"),
+        D("0.0002220"),
+        D("0.0002160"),
+        landing,
+        D("0.0002080"),
+    ]
+    assert high[-1] == landing
+    assert all(left >= right for left, right in zip(high, high[1:]))
+    assert _exploration_age_stage_target(10, chain, landing, floor, 5) == floor
+    assert _exploration_age_stage_target(10, chain, landing, floor, 7) == floor
+
+
+@pytest.mark.parametrize(
+    ("landing_stage", "stage_count"),
+    [(5, 10), (7, 10)],
+)
+def test_exploration_curve_never_increases_and_finishes_at_hard_floor(landing_stage, stage_count):
+    chain = {"origin_rate": "0.0003400"}
+    values = [
+        _exploration_age_stage_target(
+            stage,
+            chain,
+            D("0.0002800"),
+            D("0.0002088"),
+            landing_stage,
+            stage_count,
+        )
+        for stage in range(1, stage_count + 1)
+    ]
+
+    assert all(left >= right for left, right in zip(values, values[1:]))
+    assert values[landing_stage - 1] == D("0.0002800")
+    assert values[-1] == D("0.0002088")
+
+
+def test_fixed_landing_rate_survives_restart_and_ignores_later_market_rise(tmp_path):
+    now = 1_900_000_000_000
+    path = tmp_path / "fixed-landing.sqlite3"
+    store = LendingStateStore(path)
+    order = {
+        **intent_order(),
+        "submitted_rate": D("0.00034"),
+        "effective_rate": D("0.00034"),
+        "fixed_landing_rate": D("0.00028"),
+        "pricing_curve_version": EXACT_TERM_EXPLORATION_CURVE,
+    }
+    _, intent = store.reserve_intent(order, D("1000"))
+    offer = {
+        "id": 7701,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.00034"),
+        "rate_real": D("0.00034"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "balanced",
+        "mts_created": now - 5 * 60_000,
+    }
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
+    assert D(chain["fixed_landing_rate"]) == D("0.00028")
+
+    restarted = LendingStateStore(path)
+    chain = restarted.reprice_chain_for_offer(offer["id"])
+    assert D(chain["fixed_landing_rate"]) == D("0.00028")
+    rising = signals(best_bid=D("0.0005"), anchor_rate=D("0.0005"))
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(offer_id)
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), restarted, hub=object())
+    status = runtime._repricing_status(rising, now)[0]
+    assert D(status["landingRate"]) == D("0.00028")
+    assert D(status["currentMarketRate"]) == D("0.0005")
+    assert status["landingPolicy"] == "FIXED_AT_CREATION"
+    assert runtime._cancel_reprice_candidates(
+        {"market": rising},
+        {"plan_hash": "fixed", "plan": []},
+        now,
+        "v3",
+    ) == [offer["id"]]
+    pending = restarted.reprice_chains(active_only=True)[0]
+    assert D(pending["pending_target_rate"]) == _exploration_age_stage_target(
+        1,
+        pending,
+        D("0.0005"),
+        ceil_rate_tick(gross_daily_floor(D("0.05"), D("0.15"))),
+        5,
+        10,
+    )
+    assert D(pending["pending_target_rate"]) < D(offer["rate"])
+
+
+def test_new_intents_create_exploration_chains_while_explicit_legacy_intents_stay_legacy(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+
+    def create_chain(offer_id, curve=None):
+        order = {
+            "currency": "USD",
+            "slice_key": f"v3:hash:short:balanced:{offer_id}",
+            "pool": "short",
+            "layer": "balanced",
+            "amount": D("150"),
+            "submitted_rate": D("0.00022"),
+            "effective_rate": D("0.00022"),
+            "period": 2,
+            "offer_type": "LIMIT",
+            "display_type": "LIMIT",
+            "flags": 0,
+            "strategy_version": "v3",
+            "plan_hash": "hash",
+        }
+        if curve is not None:
+            order["pricing_curve_version"] = curve
+        created, intent = store.reserve_intent(order, D("1000"))
+        assert created
+        store.confirm_intent(intent["id"], offer_id)
+        return store.ensure_reprice_chain(
+            {
+                "offer_id": offer_id,
+                "rate": D("0.00022"),
+                "period": 2,
+                "pool": "short",
+                "layer": "balanced",
+                "mts_created": 1_900_000_000_000,
+            },
+            "v3",
+            1_900_000_000_001,
+        )
+
+    assert create_chain(8801)["pricing_curve_version"] == EXACT_TERM_EXPLORATION_CURVE
+    assert create_chain(8802, "LEGACY")["pricing_curve_version"] == "LEGACY"
+
+
+def test_runtime_uses_new_balanced_curve_and_exposes_landing_status(tmp_path):
+    now = 1_900_000_000_000
+    configured = limit_policy(short_reprice_stages_minutes=(5, 10, 20, 30, 60, 75, 90, 120, 150, 180))
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 8810,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0002400"),
+        "rate_real": D("0.0002400"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "balanced",
+        "mts_created": now - 6 * 60_000,
+    }
+    order = {
+        **intent_order(),
+        "slice_key": "v3:hash:short:balanced:0",
+        "pool": "short",
+        "layer": "balanced",
+        "submitted_rate": offer["rate"],
+        "effective_rate": offer["rate"],
+    }
+    _, intent = store.reserve_intent(order, D("1000"))
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
+    market = build_market_signals_v3([], [], [], configured, now)
+    floor = ceil_rate_tick(gross_daily_floor(configured.short_floor_apr, configured.normal_fee_rate))
+    expected = _exploration_age_stage_target(1, chain, floor, floor, configured.balanced_landing_stage)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, configured, store, hub=object())
+    status = runtime._repricing_status(market, now)[0]
+    canceled = runtime._cancel_reprice_candidates(
+        {"market": market}, {"plan": [], "plan_hash": "exploration"}, now, "v3"
+    )
+    pending = store.reprice_chains(active_only=True)[0]
+
+    assert status["curveVersion"] == EXACT_TERM_EXPLORATION_CURVE
+    assert D(status["explorationStartRate"]) == offer["rate"]
+    assert D(status["landingRate"]) == floor
+    assert status["landingStage"] == 5
+    assert D(status["nextTargetRate"]) == expected
+    assert canceled == [offer["id"]]
+    assert D(pending["pending_target_rate"]) == expected
+
+
+def test_exploration_status_distinguishes_market_landing_from_hard_floor(tmp_path):
+    now = 1_900_000_000_000
+    configured = limit_policy()
+    store = LendingStateStore(tmp_path / "landing-status.sqlite3")
+    offer = {
+        "id": 8811,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0002805"),
+        "rate_real": D("0.0002805"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "balanced",
+        "mts_created": now - 61 * 60_000,
+    }
+    _, intent = store.reserve_intent(
+        {
+            **intent_order(),
+            "slice_key": "v3:landing:short:balanced:0",
+            "layer": "balanced",
+            "submitted_rate": offer["rate"],
+            "effective_rate": offer["rate"],
+        },
+        D("1000"),
+    )
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
+    store.complete_reprice_stage(chain["chain_key"], 5, now)
+    runtime = LendingRuntimeV3(object(), configured, store, hub=object())
+
+    status = runtime._repricing_status(
+        signals(
+            anchor_rate=D("0.0002800"),
+            windows={"1h": {"median": D("0.0002800")}, "24h": {"q25": D("0.00027"), "q75": D("0.00028")}},
+        ),
+        now,
+    )[0]
+
+    assert status["landingState"] == "SATISFIED_WITHIN_TOLERANCE"
+    assert status["floorState"] == "NOT_DUE"
+    assert status["stageType"] == "MARKET"
+    assert status["nextStageType"] == "FLOOR"
 
 
 @pytest.mark.parametrize(
@@ -1285,15 +1862,15 @@ def test_age_reprice_chain_preserves_elapsed_time_across_replacement_and_restart
     assert canceled == [701]
     chain = store.reprice_chains(active_only=True)[0]
     assert chain["current_stage"] == 1
-    assert D(chain["pending_target_rate"]) == D("0.0005")
+    assert D(chain["pending_target_rate"]) == D("0.00054")
     assert chain["started_at_ms"] == offer["mts_created"]
 
     store.reconcile_offers([], now + 1)
     replacement_order = {
         **intent_order(),
         "slice_key": "v3:short:quick:0:r1",
-        "submitted_rate": D("0.0005"),
-        "effective_rate": D("0.0005"),
+        "submitted_rate": D("0.00054"),
+        "effective_rate": D("0.00054"),
     }
     _, replacement_intent = store.reserve_intent(replacement_order, D("1000"))
     store.confirm_intent(replacement_intent["id"], 702)
@@ -1301,10 +1878,16 @@ def test_age_reprice_chain_preserves_elapsed_time_across_replacement_and_restart
         "v3:short:quick:0",
         strategy,
         702,
-        D("0.0005"),
+        D("0.00054"),
         now_ms=now + 2,
     )
-    replacement_offer = {**offer, "id": 702, "rate": D("0.0005"), "rate_real": D("0.0005"), "mts_created": now + 2}
+    replacement_offer = {
+        **offer,
+        "id": 702,
+        "rate": D("0.00054"),
+        "rate_real": D("0.00054"),
+        "mts_created": now + 2,
+    }
     store.reconcile_offers([replacement_offer], now + 2)
 
     restarted_store = LendingStateStore(state_path)
@@ -1320,7 +1903,77 @@ def test_age_reprice_chain_preserves_elapsed_time_across_replacement_and_restart
         strategy,
     )
     assert second == [702]
-    assert D(restarted_store.reprice_chains(active_only=True)[0]["pending_target_rate"]) == D("0.0004")
+    assert D(restarted_store.reprice_chains(active_only=True)[0]["pending_target_rate"]) == D("0.00048")
+
+
+def test_existing_quick_offer_waits_for_configured_stage_and_never_uses_early_correction(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "period-correction.sqlite3")
+    configured = limit_policy(short_floor_apr=D("0.065"))
+    offer = {
+        "id": 711,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0006"),
+        "rate_real": D("0.0006"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "quick",
+        "mts_created": now - 10 * 60_000,
+    }
+    _, intent = store.reserve_intent(
+        {**intent_order(), "submitted_rate": D("0.0006"), "effective_rate": D("0.0006")},
+        D("1000"),
+    )
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    market = build_market_signals_v3(
+        [{"period": 2, "rate": D("0.00015"), "amount": D("-1000")}],
+        [{"mts": now, "rate": D("0.00024"), "amount": D("1000"), "period": 2}],
+        [],
+        configured,
+        now,
+    )
+    client = Client()
+    runtime = LendingRuntimeV3(client, configured, store, hub=object())
+
+    canceled = runtime._cancel_reprice_candidates(
+        {"market": market}, {"plan": [], "plan_hash": "period-aware"}, now, "v3"
+    )
+
+    floor = ceil_rate_tick(gross_daily_floor(configured.short_floor_apr, configured.normal_fee_rate))
+    chain = store.reprice_chains(active_only=True)[0]
+    assert canceled == [offer["id"]]
+    assert client.canceled == [offer["id"]]
+    assert chain["pending_action"] == "AGE_STAGE"
+    assert chain["current_stage"] == 1
+    assert D(chain["fixed_landing_rate"]) == floor
+    assert D(chain["pending_target_rate"]) == _exploration_age_stage_target(
+        1,
+        chain,
+        floor,
+        floor,
+        configured.balanced_landing_stage,
+        len(configured.short_reprice_stages_minutes),
+    )
 
 
 def test_period_switch_requires_20_percent_advantage_without_canceling_old_offer(tmp_path):
@@ -1428,7 +2081,10 @@ def test_stage_three_skip_records_actual_rate_as_market_anchor(tmp_path):
         "layer": "quick",
         "mts_created": now - 60 * 60_000,
     }
-    _, intent = store.reserve_intent(intent_order(), D("1000"))
+    _, intent = store.reserve_intent(
+        {**intent_order(), "pricing_curve_version": "LEGACY"},
+        D("1000"),
+    )
     store.confirm_intent(intent["id"], offer["id"])
     store.reconcile_offers([offer], now)
     chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
@@ -1480,7 +2136,10 @@ def test_legacy_stage_three_chain_uses_current_offer_as_floor_phase_anchor(tmp_p
         "layer": "quick",
         "mts_created": now - 90 * 60_000,
     }
-    _, intent = store.reserve_intent(intent_order(), D("1000"))
+    _, intent = store.reserve_intent(
+        {**intent_order(), "pricing_curve_version": "LEGACY"},
+        D("1000"),
+    )
     store.confirm_intent(intent["id"], offer["id"])
     store.reconcile_offers([offer], now)
     chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
@@ -1497,7 +2156,7 @@ def test_legacy_stage_three_chain_uses_current_offer_as_floor_phase_anchor(tmp_p
             self.canceled.append(offer_id)
             return [0, "SUCCESS"]
 
-    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    runtime = LendingRuntimeV3(Client(), legacy_six_stage_policy(), store, hub=object())
     market = signals(best_bid=D("0.0003"), anchor_rate=D("0.0003"))
     assert runtime._cancel_reprice_candidates(
         {"market": market},
@@ -1551,7 +2210,7 @@ def test_stage_six_respects_minimum_change_threshold(tmp_path):
             return [0, "SUCCESS"]
 
     client = Client()
-    exact_floor_policy = limit_policy(short_floor_apr=D("0.093075"))
+    exact_floor_policy = legacy_six_stage_policy(short_floor_apr=D("0.093075"))
     runtime = LendingRuntimeV3(client, exact_floor_policy, store, hub=object())
     assert (
         runtime._cancel_reprice_candidates(
@@ -1617,9 +2276,11 @@ def test_final_floor_reprice_ignores_dynamic_threshold_and_self_heals(tmp_path, 
             self.canceled.append(value)
             return [0, "SUCCESS"]
 
-    configured = limit_policy(
+    configured = legacy_six_stage_policy(
         short_floor_apr=D("0.0792"),
         minimum_rate_change=D("0.00002"),
+        max_reprices_per_hour=0,
+        reprice_cooldown_minutes=60,
     )
     market = signals(
         best_bid=D("0.0002809"),
@@ -1628,6 +2289,13 @@ def test_final_floor_reprice_ignores_dynamic_threshold_and_self_heals(tmp_path, 
     )
     client = Client()
     runtime = LendingRuntimeV3(client, configured, store, hub=object())
+    store.record_reprice(
+        offer_id,
+        "ordinary_stage_immediately_before_final",
+        D("0.0003"),
+        D("0.00029"),
+        created_at_ms=now - 1,
+    )
 
     assert runtime._repricing_status(market, now)[0]["floorState"] == "REPRICE_REQUIRED"
     assert runtime._cancel_reprice_candidates(
@@ -1643,7 +2311,67 @@ def test_final_floor_reprice_ignores_dynamic_threshold_and_self_heals(tmp_path, 
     assert D(pending["pending_target_rate"]) == D("0.0002553")
 
 
-def test_market_rise_reprice_resets_chain_when_replacement_is_bound(tmp_path):
+def test_partial_offer_below_exchange_minimum_is_not_canceled_and_is_reported(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "partial-reprice.sqlite3")
+    offer = {
+        "id": 7901,
+        "currency": "USD",
+        "amount": D("99.50"),
+        "amount_original": D("150"),
+        "rate": D("0.0004"),
+        "rate_real": D("0.0004"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "balanced",
+        "mts_created": now - 180 * 60_000,
+    }
+    _, intent = store.reserve_intent(
+        {
+            **intent_order(amount="150"),
+            "layer": "balanced",
+            "submitted_rate": D("0.0004"),
+            "effective_rate": D("0.0004"),
+            "fixed_landing_rate": D("0.00028"),
+        },
+        D("1000"),
+    )
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(offer_id)
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    market = signals(best_bid=D("0.00028"), anchor_rate=D("0.00028"))
+    assert runtime._cancel_reprice_candidates(
+        {"market": market},
+        {"plan_hash": "partial", "plan": []},
+        now,
+        "v3",
+    ) == []
+    status = runtime._repricing_status(market, now)[0]
+    assert client.canceled == []
+    assert status["floorState"] == "BELOW_REPOST_MINIMUM"
+    assert status["repriceBlockedReason"] == "BELOW_REPOST_MINIMUM"
+
+
+def test_market_rise_does_not_raise_or_reset_existing_chain(tmp_path):
     now = 1_900_000_000_000
     store = LendingStateStore(tmp_path / "state.sqlite3")
     offer = {
@@ -1694,16 +2422,13 @@ def test_market_rise_reprice_resets_chain_when_replacement_is_bound(tmp_path):
         plan,
         now,
         "v3",
-    ) == [801]
-    pending = store.reprice_chains(active_only=True)[0]
-    assert pending["pending_action"] == "MARKET_RISE"
-    store.set_reprice_market_anchor(pending["chain_key"], D("0.0003"), now_ms=now + 50)
-    store.bind_reprice_replacement("v3:short:quick:0", "v3", 802, D("0.0004999"), now_ms=now + 100)
-    reset = store.reprice_chain_for_offer(802)
-    assert reset["current_stage"] == 0
-    assert reset["started_at_ms"] == now + 100
-    assert D(reset["origin_rate"]) == D("0.0004999")
-    assert reset["market_anchor_rate"] is None
+    ) == []
+    chain = store.reprice_chain_for_offer(801)
+    assert chain["pending_action"] is None
+    assert chain["current_stage"] == 1
+    assert chain["started_at_ms"] == offer["mts_created"]
+    assert D(chain["origin_rate"]) == D("0.0003")
+    assert D(chain["fixed_landing_rate"]) == D("0.0003")
 
 
 def test_pending_stage_target_is_used_for_replacement_submission(tmp_path):
@@ -1730,7 +2455,14 @@ def test_pending_stage_target_is_used_for_replacement_submission(tmp_path):
     store.confirm_intent(intent["id"], 901)
     store.reconcile_offers([offer], now)
     chain = store.ensure_reprice_chain({**offer, "offer_id": 901}, "new", now)
-    store.mark_reprice_pending(chain["chain_key"], "AGE_STAGE", D("0.0005"), stage=1, now_ms=now)
+    store.mark_reprice_pending(
+        chain["chain_key"],
+        "AGE_STAGE",
+        D("0.0005"),
+        stage=1,
+        now_ms=now,
+        source_offer_id=offer["id"],
+    )
     store.reconcile_offers([], now + 1)
 
     class Client:
@@ -1739,27 +2471,97 @@ def test_pending_stage_target_is_used_for_replacement_submission(tmp_path):
 
         def __init__(self):
             self.rate = None
+            self.amount = None
+            self.period = None
 
-        def submit_funding_offer(self, _symbol, _amount, rate, _period, _offer_type, flags=0):
+        def submit_funding_offer(self, _symbol, amount, rate, period, _offer_type, flags=0):
+            self.amount = D(amount)
             self.rate = D(rate)
+            self.period = int(period)
             return [0, "on-req", None, None, [902]]
 
-    row = {
-        **intent_order(),
-        "slice_index": 0,
-        "display_type": "LIMIT",
-        "target_rate": D("0.0003"),
-        "gross_daily_floor": gross_daily_floor(D("0.05"), D("0.15")),
-        "plan_hash": "replacement",
-    }
     client = Client()
     runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
-    submitted = runtime._submit_plan({"plan": [row]}, D("150"), "new")
+    submitted, available = runtime._submit_pending_reprices(D("150"), "new")
     assert client.rate == D("0.0005")
+    assert client.amount == offer["amount"]
+    assert client.period == offer["period"]
     assert submitted[0]["effective_rate"] == D("0.0005")
+    assert available == 0
     rebound = store.reprice_chain_for_offer(902)
     assert rebound["current_stage"] == 1
     assert rebound["started_at_ms"] == offer["mts_created"]
+
+
+def test_shape_replacement_never_raises_and_preserves_chain_timing_and_landing(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "shape.sqlite3")
+    offer = {
+        "id": 920,
+        "currency": "USD",
+        "amount": D("175"),
+        "amount_original": D("175"),
+        "rate": D("0.0004"),
+        "rate_real": D("0.0004"),
+        "period": 30,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "medium",
+        "layer": "high",
+        "mts_created": now - 120 * 60_000,
+    }
+    _, intent = store.reserve_intent(
+        {
+            **intent_order(amount="175"),
+            "slice_key": "v3:medium:high:0",
+            "pool": "medium",
+            "layer": "high",
+            "period": 30,
+            "submitted_rate": D("0.0004"),
+            "effective_rate": D("0.0004"),
+            "fixed_landing_rate": D("0.00031"),
+        },
+        D("1000"),
+    )
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, "v3", now)
+    store.complete_reprice_stage(chain["chain_key"], 2, now - 1)
+    store.mark_reprice_pending(
+        chain["chain_key"],
+        "SHAPE_CHANGE",
+        D("0.0005"),
+        now_ms=now,
+        source_offer_id=offer["id"],
+    )
+    store.reconcile_offers([], now + 1)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.submitted = None
+
+        def submit_funding_offer(self, _symbol, amount, rate, period, offer_type, flags=0):
+            self.submitted = (D(amount), D(rate), int(period), offer_type, int(flags))
+            return [0, "on-req", None, None, [921]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object())
+    submitted, available = runtime._submit_pending_reprices(D("175"), "v3")
+    rebound = store.reprice_chain_for_offer(921)
+
+    assert submitted[0]["effective_rate"] == D("0.0004")
+    assert client.submitted[:3] == (D("175"), D("0.0004"), 30)
+    assert available == 0
+    assert rebound["current_stage"] == 2
+    assert rebound["started_at_ms"] == offer["mts_created"]
+    assert D(rebound["origin_rate"]) == D("0.0004")
+    assert D(rebound["fixed_landing_rate"]) == D("0.00031")
 
 
 def test_stage_three_replacement_preserves_market_anchor(tmp_path):
@@ -1901,6 +2703,50 @@ def test_schema_normalization_preserves_active_reprice_chain_state(tmp_path):
     assert repaired["current_stage"] == 3
     assert repaired["started_at_ms"] == offer["mts_created"]
     assert D(repaired["market_anchor_rate"]) == D("0.00045")
+
+
+def test_strategy_activation_maps_completed_six_stage_chain_to_ten_stages(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: now / 1000)
+    legacy = replace(
+        limit_policy(),
+        short_reprice_stages_minutes=(10, 30, 60, 90, 120, 180),
+        medium_reprice_stages_minutes=(20, 60, 120, 180, 240, 360),
+        long_reprice_stages_minutes=(60, 180, 360, 480, 720, 1440),
+    )
+    old_version = store.save_strategy(json_decimal(legacy.__dict__), "ACTIVE")
+    new_version = store.save_strategy(json_decimal(limit_policy().__dict__), "PENDING")
+    offer = {
+        "id": 1201,
+        "currency": "USD",
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0003"),
+        "rate_real": D("0.0003"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "display_type": "LIMIT",
+        "flags": 0,
+        "status": "ACTIVE",
+        "managed": True,
+        "pool": "short",
+        "layer": "quick",
+        "mts_created": now - 180 * 60_000,
+    }
+    _, intent = store.reserve_intent(
+        {**intent_order(), "pricing_curve_version": "LEGACY"},
+        D("1000"),
+    )
+    store.confirm_intent(intent["id"], offer["id"])
+    store.reconcile_offers([offer], now)
+    old_chain = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, old_version, now)
+    store.complete_reprice_stage(old_chain["chain_key"], 6, now, market_anchor_rate=D("0.0004"))
+
+    inherited = store.ensure_reprice_chain({**offer, "offer_id": offer["id"]}, new_version, now + 1)
+
+    assert inherited["current_stage"] == 10
+    assert inherited["started_at_ms"] == offer["mts_created"]
+    assert D(inherited["market_anchor_rate"]) == D("0.0004")
 
 
 def test_new_strategy_chain_recovers_latest_predecessor_for_existing_offer(tmp_path):
@@ -2593,6 +3439,318 @@ def test_dust_reinvestment_cancels_smallest_short_and_relists_for_current_winner
     assert submitted["submitted"][0]["amount"] == D("161")
     assert client.submitted[0][1] == D("161")
     assert client.submitted[0][3] == 2
+    assert store.consolidation_status()["state"] == "SUBMITTING"
+
+
+def test_dust_reinvestment_prioritizes_short_then_medium_then_long(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "pool-priority.sqlite3", clock=lambda: now / 1000)
+    _managed_short_offer(store, 7121, "190", 2, now)
+    _managed_short_offer(store, 7122, "160", 30, now)
+    _managed_short_offer(store, 7123, "150", 120, now)
+    with store.transaction(immediate=True) as connection:
+        connection.execute("UPDATE offers SET pool='medium' WHERE offer_id=7122")
+        connection.execute("UPDATE offers SET pool='long' WHERE offer_id=7123")
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(
+        periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.986", "0.014"), low_confirmed=True)}}
+    )
+
+    result = runtime._dust_consolidation(
+        {"wallet": D("1"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+
+    assert result["state"] == "CANCELLING"
+    assert client.canceled == [7121]
+
+
+def test_dust_reinvestment_can_consolidate_a_long_offer_when_no_short_candidate(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "long-candidate.sqlite3", clock=lambda: now / 1000)
+    _managed_short_offer(store, 7150, "150", 2, now)
+    with store.transaction(immediate=True) as connection:
+        connection.execute("UPDATE offers SET pool='long', period=120 WHERE offer_id=7150")
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(int(offer_id))
+            return [0, "SUCCESS"]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(
+        periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.986", "0.014"), low_confirmed=True)}}
+    )
+
+    result = runtime._dust_consolidation(
+        {"wallet": D("3.16089453"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+
+    assert result["state"] == "CANCELLING"
+    assert client.canceled == [7150]
+
+
+@pytest.mark.parametrize(
+    ("wallet", "expected"),
+    (
+        ("299.99", (D("299.99"),)),
+        ("300", (D("150"), D("150"))),
+        ("328.60719001", (D("164.30359501"), D("164.30359500"))),
+        ("600.00000003", (D("150.00000001"), D("150.00000001"), D("150.00000001"), D("150"))),
+    ),
+)
+def test_dust_reinvestment_evenly_splits_into_maximum_valid_orders(tmp_path, wallet, expected):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / f"split-{wallet}.sqlite3", clock=lambda: now / 1000)
+    store.begin_consolidation(7200, D("1"), D(wallet) - D("1"), 7, "v3.3", now)
+    store.update_consolidation("READY", now_ms=now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.submitted = []
+
+        def submit_funding_offer(self, symbol, amount, rate, period, offer_type, flags=0):
+            self.submitted.append((symbol, D(amount), D(rate), int(period), offer_type, flags))
+            return [0, "on-req", None, None, [8000 + len(self.submitted)]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    result = runtime._dust_consolidation(
+        {"wallet": D(wallet), "reconciliationStatus": "MATCHED"},
+        signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}}),
+        now,
+        "v3.3",
+    )
+
+    assert tuple(row[1] for row in client.submitted) == expected
+    assert sum((row[1] for row in client.submitted), D("0")) == D(wallet)
+    assert all(row[1] >= D("150") and row[3] == 2 for row in client.submitted)
+    assert result["state"] == "SUBMITTING"
+    assert store.consolidation_status()["state"] == "SUBMITTING"
+
+
+def test_dust_reinvestment_waits_for_snapshot_then_completes_after_multiple_submits(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "multi-complete.sqlite3", clock=lambda: now / 1000)
+    store.begin_consolidation(7201, D("8.60719001"), D("320"), 2, "v3.3", now)
+    store.update_consolidation("READY", now_ms=now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.next_id = 8100
+
+        def submit_funding_offer(self, *_args, **_kwargs):
+            self.next_id += 1
+            return [0, "on-req", None, None, [self.next_id]]
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}})
+    submitted = runtime._dust_consolidation(
+        {"wallet": D("328.60719001"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+    waiting = runtime._dust_consolidation(
+        {"wallet": D("328.60719001"), "reconciliationStatus": "MATCHED"}, market, now + 30_000, "v3.3"
+    )
+    replacement_offers = [
+        {
+            "id": row["offerId"],
+            "currency": "USD",
+            "amount": row["amount"],
+            "amount_original": row["amount"],
+            "rate": row["submitted_rate"],
+            "rate_real": row["effective_rate"],
+            "period": row["period"],
+            "offer_type": row["offer_type"],
+            "display_type": row["display_type"],
+            "flags": row["flags"],
+            "status": "ACTIVE",
+            "managed": True,
+            "pool": row["pool"],
+            "layer": row["layer"],
+            "mts_created": now,
+        }
+        for row in submitted["submitted"]
+    ]
+    store.reconcile_offers(replacement_offers, now + 60_000)
+    completed = runtime._dust_consolidation(
+        {"wallet": D("0"), "reconciliationStatus": "MATCHED"}, market, now + 60_000, "v3.3"
+    )
+
+    assert len(submitted["submitted"]) == 2
+    assert waiting["state"] == "SUBMITTING"
+    assert completed["state"] == "CONFIRMED"
+    assert store.consolidation_status()["state"] == "IDLE"
+
+
+def test_dust_reinvestment_retries_only_remaining_wallet_with_new_slice_indexes(tmp_path, monkeypatch):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "partial.sqlite3", clock=lambda: now / 1000)
+    store.begin_consolidation(7202, D("8.60719001"), D("320"), 2, "v3.3", now)
+    store.update_consolidation("READY", now_ms=now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.submitted = []
+
+        def submit_funding_offer(self, symbol, amount, rate, period, offer_type, flags=0):
+            self.submitted.append(D(amount))
+            return [0, "on-req", None, None, [8200 + len(self.submitted)]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}})
+    monkeypatch.setattr("RuntimeV3.MAX_FUNDING_SUBMISSIONS_PER_WINDOW", 1)
+
+    first = runtime._dust_consolidation(
+        {"wallet": D("328.60719001"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+    assert len(first["submitted"]) == 1
+    assert first["submitted"][0]["slice_index"] == 0
+    first_row = first["submitted"][0]
+    store.reconcile_offers(
+        [
+            {
+                "id": first_row["offerId"],
+                "currency": "USD",
+                "amount": first_row["amount"],
+                "amount_original": first_row["amount"],
+                "rate": first_row["submitted_rate"],
+                "rate_real": first_row["effective_rate"],
+                "period": first_row["period"],
+                "offer_type": first_row["offer_type"],
+                "display_type": first_row["display_type"],
+                "flags": first_row["flags"],
+                "status": "ACTIVE",
+                "managed": True,
+                "pool": first_row["pool"],
+                "layer": first_row["layer"],
+                "mts_created": now,
+            }
+        ],
+        now + 61_000,
+    )
+
+    runtime.clock = lambda: (now + 61_000) / 1000
+    second = runtime._dust_consolidation(
+        {"wallet": D("164.30359500"), "reconciliationStatus": "MATCHED"}, market, now + 61_000, "v3.3"
+    )
+    assert len(second["submitted"]) == 1
+    assert second["submitted"][0]["slice_index"] == 1
+    assert client.submitted == [D("164.30359501"), D("164.30359500")]
+
+
+def test_dust_reinvestment_stops_after_ambiguous_split_submit(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "ambiguous-split.sqlite3", clock=lambda: now / 1000)
+    store.begin_consolidation(7203, D("8.60719001"), D("320"), 2, "v3.3", now)
+    store.update_consolidation("READY", now_ms=now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def __init__(self):
+            self.calls = 0
+
+        def submit_funding_offer(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise BitfinexAmbiguousWriteError("connection ended after send")
+            return [0, "on-req", None, None, [8300 + self.calls]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}})
+    first = runtime._dust_consolidation(
+        {"wallet": D("328.60719001"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+    repeated = runtime._dust_consolidation(
+        {"wallet": D("164.30359500"), "reconciliationStatus": "MATCHED"}, market, now + 30_000, "v3.3"
+    )
+
+    assert len(first["submitted"]) == 1
+    assert first["state"] == "AMBIGUOUS"
+    assert repeated["state"] == "AMBIGUOUS"
+    assert client.calls == 2
+    assert store.consolidation_status()["state"] == "AMBIGUOUS"
+
+
+def test_dust_reinvestment_aborts_when_external_funds_arrive_during_partial_submit(tmp_path, monkeypatch):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "external-funds.sqlite3", clock=lambda: now / 1000)
+    store.begin_consolidation(7204, D("8.60719001"), D("320"), 2, "v3.3", now)
+    store.update_consolidation("READY", now_ms=now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+        def submit_funding_offer(self, *_args, **_kwargs):
+            return [0, "on-req", None, None, [8401]]
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object(), clock=lambda: now / 1000)
+    market = signals(periodSelection={"byPool": {"short": selection_row((2, 7), 2, ("0.9", "0.1"))}})
+    monkeypatch.setattr("RuntimeV3.MAX_FUNDING_SUBMISSIONS_PER_WINDOW", 1)
+    first = runtime._dust_consolidation(
+        {"wallet": D("328.60719001"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+    )
+    first_row = first["submitted"][0]
+    store.reconcile_offers(
+        [
+            {
+                "id": first_row["offerId"],
+                "currency": "USD",
+                "amount": first_row["amount"],
+                "amount_original": first_row["amount"],
+                "rate": first_row["submitted_rate"],
+                "rate_real": first_row["effective_rate"],
+                "period": first_row["period"],
+                "offer_type": first_row["offer_type"],
+                "display_type": first_row["display_type"],
+                "flags": first_row["flags"],
+                "status": "ACTIVE",
+                "managed": True,
+                "pool": first_row["pool"],
+                "layer": first_row["layer"],
+                "mts_created": now,
+            }
+        ],
+        now + 30_000,
+    )
+    aborted = runtime._dust_consolidation(
+        {"wallet": D("314.30359500"), "reconciliationStatus": "MATCHED"}, market, now + 30_000, "v3.3"
+    )
+
+    assert aborted["state"] == "ABORTED_ACCOUNT_CHANGE"
+    assert aborted["blocking"] is False
     assert store.consolidation_status()["state"] == "IDLE"
 
 
@@ -2649,6 +3807,143 @@ def test_dust_unknown_cancel_enters_safe_without_replacement(tmp_path):
     assert store.runtime()["mode"] == "PAUSED"
     assert store.consolidation_status()["state"] == "AMBIGUOUS"
     assert store.intents(states={"PLANNED", "SUBMITTING", "AMBIGUOUS"}) == []
+
+
+def test_stale_ambiguous_dust_cancel_recovers_after_restart_snapshot(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.begin_consolidation(7402, D("12"), D("160"), 2, "v3.3", now)
+    store.update_consolidation("AMBIGUOUS", "connection ended after send", now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    runtime._reconcile_ambiguous_dust_consolidation(set(), now + 30_000)
+
+    assert store.consolidation_status()["state"] == "READY"
+
+
+def test_write_recovery_status_reports_durable_submit_and_dust_blockers(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    _, intent = store.reserve_intent(
+        {
+            "currency": "USD",
+            "slice_key": "v3:short:quick:0",
+            "pool": "short",
+            "layer": "quick",
+            "amount": D("150"),
+            "submitted_rate": D("0.0003"),
+            "effective_rate": D("0.0003"),
+            "period": 2,
+            "offer_type": "LIMIT",
+            "display_type": "LIMIT",
+            "flags": 0,
+            "strategy_version": "v3.3",
+            "plan_hash": "plan",
+        },
+        D("150"),
+    )
+    store.mark_submitting(intent["id"])
+    store.mark_ambiguous(intent["id"], "connection ended after send")
+    store.begin_consolidation(7403, D("5"), D("160"), 2, "v3.3", now)
+    store.update_consolidation("AMBIGUOUS", "cancel result unknown", now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+    status = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())._write_recovery_status()
+
+    assert status["canSubmit"] is False
+    assert {(item["kind"], item["state"]) for item in status["blockers"]} >= {
+        ("SUBMIT", "AMBIGUOUS"),
+        ("DUST_CONSOLIDATION", "AMBIGUOUS"),
+    }
+    assert all(item["blocking"] for item in status["blockers"])
+
+
+def test_observed_external_takeover_is_reported_but_does_not_block_writes(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 5074345800,
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0003"),
+        "rate_real": D("0.0003"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "flags": 0,
+    }
+    store.observe_external_takeover(offer, now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    status = runtime._write_recovery_status()
+
+    assert status["canSubmit"] is True
+    assert status["blockers"] == [
+        {
+            "kind": "EXTERNAL_TAKEOVER",
+            "state": "OBSERVED",
+            "offerId": 5074345800,
+            "reason": None,
+            "createdAt": now,
+            "blocking": False,
+        }
+    ]
+
+
+def test_absent_external_takeover_observation_is_closed_after_authoritative_snapshot(tmp_path):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    offer = {
+        "id": 5074345801,
+        "amount": D("150"),
+        "amount_original": D("150"),
+        "rate": D("0.0003"),
+        "rate_real": D("0.0003"),
+        "period": 2,
+        "offer_type": "LIMIT",
+        "flags": 0,
+    }
+    store.observe_external_takeover(offer, now)
+
+    class Client:
+        api_key = ""
+        api_secret = ""
+
+    runtime = LendingRuntimeV3(Client(), limit_policy(), store, hub=object())
+    runtime._close_absent_external_takeover_observations(set(), now + 30_000)
+
+    assert store.external_takeovers()[0]["state"] == "CLOSED"
+
+
+def test_v35_release_boundary_is_immutable_and_splits_equal_windows(tmp_path):
+    path = tmp_path / "release-boundary.sqlite3"
+    activated = 1_900_000_000_000
+    first = LendingStateStore(path, clock=lambda: activated / 1000)
+
+    assert first.release_boundary() == {
+        "version": "0.3.5",
+        "label": "V3.5",
+        "activatedAtMs": activated,
+    }
+
+    restarted = LendingStateStore(path, clock=lambda: (activated + 3_600_000) / 1000)
+    comparison = restarted.release_comparison(activated + 3_600_000)
+    assert comparison["activatedAtMs"] == activated
+    assert comparison["comparisonDurationMs"] == 3_600_000
+    assert comparison["before"]["fromMs"] == activated - 3_600_000
+    assert comparison["before"]["toMs"] == activated
+    assert comparison["after"]["fromMs"] == activated
+    assert comparison["after"]["toMs"] == activated + 3_600_001
 
 
 def test_external_takeover_requires_two_matching_snapshots_and_cancels_exact_id(tmp_path):

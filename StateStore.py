@@ -25,6 +25,10 @@ AUTO_RECOVERABLE_PAUSE_REASONS = {
     "ACCOUNT_RECONCILIATION_MISMATCH",
     "AMBIGUOUS_WALLET_TRANSFER",
 }
+LEGACY_REPRICE_CURVE = "LEGACY"
+EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V3"
+CURRENT_RELEASE = "0.3.5"
+CURRENT_RELEASE_LABEL = "V3.5"
 
 
 class StateStoreError(Exception):
@@ -95,7 +99,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 13:
+        if version >= 16:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -215,6 +219,8 @@ class LendingStateStore:
                 state TEXT NOT NULL,
                 exchange_offer_id INTEGER UNIQUE,
                 error_text TEXT,
+                pricing_curve_version TEXT NOT NULL DEFAULT 'LEGACY',
+                fixed_landing_rate TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             )""",
@@ -392,7 +398,10 @@ class LendingStateStore:
                 last_reprice_at_ms INTEGER,
                 pending_action TEXT,
                 pending_target_rate TEXT,
+                pending_source_offer_id INTEGER,
                 market_anchor_rate TEXT,
+                fixed_landing_rate TEXT,
+                pricing_curve_version TEXT NOT NULL DEFAULT 'LEGACY',
                 status TEXT NOT NULL DEFAULT 'ACTIVE',
                 updated_at_ms INTEGER NOT NULL
             )""",
@@ -510,9 +519,17 @@ class LendingStateStore:
             self._migrate_v11_allocation_state(connection)
             self._migrate_v12_single_paused_mode(connection)
             self._migrate_v13_unattended_recovery(connection)
+            self._migrate_v14_pricing_curve_columns(connection)
+            self._migrate_v15_exact_reprice_replacements(connection)
+            self._migrate_v16_fixed_landing_rate(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '13')
-                   ON CONFLICT(key) DO UPDATE SET value='13'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '16')
+                   ON CONFLICT(key) DO UPDATE SET value='16'"""
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO schema_meta(key, value)
+                   VALUES('release_0.3.5_activated_at_ms', ?)""",
+                (str(self._now_ms()),),
             )
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
@@ -591,6 +608,53 @@ class LendingStateStore:
                SET manual_required=0,
                    next_probe_at_ms=COALESCE(next_probe_at_ms, started_at_ms)
                WHERE active=1"""
+        )
+
+    @staticmethod
+    def _migrate_v14_pricing_curve_columns(connection):
+        for table in ("order_intents", "reprice_chains"):
+            existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if "pricing_curve_version" not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN pricing_curve_version "
+                    "TEXT NOT NULL DEFAULT 'LEGACY'"
+                )
+
+    @staticmethod
+    def _migrate_v15_exact_reprice_replacements(connection):
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
+        if "pending_source_offer_id" not in existing:
+            connection.execute("ALTER TABLE reprice_chains ADD COLUMN pending_source_offer_id INTEGER")
+        # Older pending rows do not contain enough immutable order shape to be
+        # safely resubmitted. Preserve them for audit but never let future cash
+        # bind to a different term or layer.
+        connection.execute(
+            """UPDATE reprice_chains
+               SET status='ABANDONED_LEGACY', pending_action=NULL,
+                   pending_target_rate=NULL, updated_at_ms=updated_at_ms
+               WHERE current_offer_id IS NULL AND pending_action IS NOT NULL
+                 AND pending_source_offer_id IS NULL"""
+        )
+
+    @staticmethod
+    def _migrate_v16_fixed_landing_rate(connection):
+        for table in ("order_intents", "reprice_chains"):
+            existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if "fixed_landing_rate" not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN fixed_landing_rate TEXT")
+        connection.execute(
+            """UPDATE reprice_chains
+               SET fixed_landing_rate=market_anchor_rate
+               WHERE fixed_landing_rate IS NULL
+                 AND pricing_curve_version='EXACT_TERM_EXPLORATION_V2'
+                 AND market_anchor_rate IS NOT NULL"""
+        )
+        connection.execute(
+            """UPDATE reprice_chains
+               SET status='ABANDONED_LEGACY', pending_action=NULL,
+                   pending_target_rate=NULL, pending_source_offer_id=NULL
+               WHERE current_offer_id IS NULL
+                 AND pending_action IN ('MARKET_RISE', 'QUICK_PERIOD_CORRECTION')"""
         )
 
     @staticmethod
@@ -1159,7 +1223,8 @@ class LendingStateStore:
                            chain_key, strategy_version, base_slice_key, pool, layer,
                            origin_rate, started_at_ms, current_stage, current_offer_id,
                            last_reprice_at_ms, pending_action, pending_target_rate,
-                           market_anchor_rate, status, updated_at_ms
+                           pending_source_offer_id, market_anchor_rate, fixed_landing_rate,
+                           pricing_curve_version, status, updated_at_ms
                        )
                        SELECT
                            ? || CASE
@@ -1169,7 +1234,9 @@ class LendingStateStore:
                            END,
                            ?, base_slice_key, pool, layer, origin_rate, started_at_ms,
                            current_stage, current_offer_id, last_reprice_at_ms,
-                           pending_action, pending_target_rate, market_anchor_rate,
+                           pending_action, pending_target_rate, pending_source_offer_id,
+                           market_anchor_rate, fixed_landing_rate,
+                           pricing_curve_version,
                            status, ?
                        FROM reprice_chains
                        WHERE strategy_version=? AND status='ACTIVE'""",
@@ -1199,7 +1266,8 @@ class LendingStateStore:
                        chain_key, strategy_version, base_slice_key, pool, layer,
                        origin_rate, started_at_ms, current_stage, current_offer_id,
                        last_reprice_at_ms, pending_action, pending_target_rate,
-                       market_anchor_rate, status, updated_at_ms
+                       pending_source_offer_id, market_anchor_rate, fixed_landing_rate,
+                       pricing_curve_version, status, updated_at_ms
                    )
                    SELECT
                        ? || CASE
@@ -1209,7 +1277,9 @@ class LendingStateStore:
                        END,
                        ?, base_slice_key, pool, layer, origin_rate, started_at_ms,
                        current_stage, current_offer_id, last_reprice_at_ms,
-                       pending_action, pending_target_rate, market_anchor_rate,
+                       pending_action, pending_target_rate, pending_source_offer_id,
+                       market_anchor_rate, fixed_landing_rate,
+                       pricing_curve_version,
                        status, ?
                    FROM reprice_chains
                    WHERE strategy_version=? AND status='ACTIVE'""",
@@ -1576,33 +1646,95 @@ class LendingStateStore:
         with self.read_connection() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
-    def period_activity(self, since_ms, currency="USD"):
-        """Return recent robot submissions and managed fills grouped by term."""
+    def release_boundary(self):
+        """Return the immutable local activation boundary for the current release."""
 
         with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='release_0.3.5_activated_at_ms'"
+            ).fetchone()
+        return {
+            "version": CURRENT_RELEASE,
+            "label": CURRENT_RELEASE_LABEL,
+            "activatedAtMs": None if row is None else int(row["value"]),
+        }
+
+    def period_activity(self, since_ms, currency="USD", until_ms=None):
+        """Return recent robot submissions and managed fills grouped by term."""
+
+        end = 9_223_372_036_854_775_807 if until_ms is None else int(until_ms)
+        with self.read_connection() as connection:
             submitted = connection.execute(
-                """SELECT period, COUNT(*) AS order_count, COALESCE(SUM(CAST(amount AS REAL)), 0) AS amount
+                """SELECT period, COUNT(*) AS order_count,
+                          COALESCE(SUM(CAST(amount AS REAL)), 0) AS amount,
+                          COALESCE(
+                              SUM(CAST(amount AS REAL) * CAST(effective_rate AS REAL))
+                              / NULLIF(SUM(CAST(amount AS REAL)), 0), 0
+                          ) AS weighted_rate
                    FROM order_intents
-                   WHERE currency=? AND created_at_ms>=?
+                   WHERE currency=? AND created_at_ms>=? AND created_at_ms<?
                    GROUP BY period ORDER BY period""",
-                (str(currency).upper(), int(since_ms)),
+                (str(currency).upper(), int(since_ms), end),
             ).fetchall()
             traded = connection.execute(
-                """SELECT period, COUNT(*) AS trade_count, COALESCE(SUM(ABS(CAST(amount AS REAL))), 0) AS amount
-                   FROM funding_trades
-                   WHERE currency=? AND managed=1 AND mts>=?
-                   GROUP BY period ORDER BY period""",
-                (str(currency).upper(), int(since_ms)),
+                """SELECT trades.period, COUNT(*) AS trade_count,
+                          COALESCE(SUM(ABS(CAST(trades.amount AS REAL))), 0) AS amount,
+                          COALESCE(
+                              SUM(ABS(CAST(trades.amount AS REAL)) * CAST(trades.rate AS REAL))
+                              / NULLIF(SUM(ABS(CAST(trades.amount AS REAL))), 0), 0
+                          ) AS weighted_rate,
+                          COALESCE(
+                              SUM(CASE WHEN intents.created_at_ms IS NOT NULL
+                                  THEN ABS(CAST(trades.amount AS REAL))
+                                       * MAX(0, trades.mts - intents.created_at_ms)
+                                  ELSE 0 END)
+                              / NULLIF(SUM(CASE WHEN intents.created_at_ms IS NOT NULL
+                                  THEN ABS(CAST(trades.amount AS REAL)) ELSE 0 END), 0)
+                              / 60000.0, 0
+                          ) AS weighted_wait_minutes
+                   FROM funding_trades AS trades
+                   LEFT JOIN order_intents AS intents ON intents.exchange_offer_id=trades.offer_id
+                   WHERE trades.currency=? AND trades.managed=1
+                     AND trades.mts>=? AND trades.mts<?
+                   GROUP BY trades.period ORDER BY trades.period""",
+                (str(currency).upper(), int(since_ms), end),
             ).fetchall()
         return {
+            "fromMs": int(since_ms),
+            "toMs": None if until_ms is None else end,
             "submitted": [
-                {"period": int(row["period"]), "count": int(row["order_count"]), "amount": D(str(row["amount"]))}
+                {
+                    "period": int(row["period"]),
+                    "count": int(row["order_count"]),
+                    "amount": D(str(row["amount"])),
+                    "weightedDailyRate": D(str(row["weighted_rate"])),
+                }
                 for row in submitted
             ],
             "traded": [
-                {"period": int(row["period"]), "count": int(row["trade_count"]), "amount": D(str(row["amount"]))}
+                {
+                    "period": int(row["period"]),
+                    "count": int(row["trade_count"]),
+                    "amount": D(str(row["amount"])),
+                    "weightedDailyRate": D(str(row["weighted_rate"])),
+                    "weightedWaitMinutes": D(str(row["weighted_wait_minutes"])),
+                }
                 for row in traded
             ],
+        }
+
+    def release_comparison(self, now_ms=None, currency="USD"):
+        """Split equal-duration activity windows at the V3.5 activation boundary."""
+
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        boundary = self.release_boundary()
+        activated = int(boundary["activatedAtMs"] or now)
+        elapsed = max(0, now - activated)
+        return {
+            **boundary,
+            "comparisonDurationMs": elapsed,
+            "before": self.period_activity(activated - elapsed, currency, activated),
+            "after": self.period_activity(activated, currency, now + 1),
         }
 
     def reserve_intent(self, order, wallet_available):
@@ -1632,8 +1764,9 @@ class LendingStateStore:
                 """INSERT INTO order_intents(
                     fingerprint, currency, slice_key, pool, layer, amount, submitted_rate,
                     effective_rate, period, offer_type, display_type, flags, strategy_version, plan_hash, state,
-                    write_phase, strategy_variant, created_at_ms, updated_at_ms
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED', 'NOT_SENT', ?, ?, ?)""",
+                    write_phase, strategy_variant, pricing_curve_version, fixed_landing_rate,
+                    created_at_ms, updated_at_ms
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED', 'NOT_SENT', ?, ?, ?, ?, ?)""",
                 (
                     fingerprint,
                     order.get("currency", "USD").upper(),
@@ -1650,6 +1783,10 @@ class LendingStateStore:
                     str(order["strategy_version"]),
                     order.get("plan_hash"),
                     str(order.get("strategy_variant") or "baseline"),
+                    str(order.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE),
+                    None
+                    if order.get("fixed_landing_rate") is None
+                    else _decimal_text(order["fixed_landing_rate"]),
                     now,
                     now,
                 ),
@@ -2062,6 +2199,33 @@ class LendingStateStore:
     def _reprice_chain_key(strategy_version, slice_key):
         return f"{strategy_version}|{base_slice_key(slice_key)}"
 
+    @staticmethod
+    def _strategy_reprice_stage_count(connection, strategy_version, pool):
+        row = connection.execute(
+            "SELECT policy_json FROM strategy_versions WHERE version_id=?",
+            (str(strategy_version),),
+        ).fetchone()
+        if row is None:
+            return 6
+        try:
+            policy = json.loads(row["policy_json"])
+            stages = policy.get(f"{pool}_reprice_stages_minutes")
+            count = len(stages) if isinstance(stages, (list, tuple)) else 6
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 6
+        return count if count in {6, 10} else 6
+
+    @staticmethod
+    def _map_reprice_stage(current_stage, old_stage_count, new_stage_count):
+        stage = max(0, min(int(current_stage or 0), int(old_stage_count)))
+        old_market = max(1, int(old_stage_count) // 2)
+        new_market = max(1, int(new_stage_count) // 2)
+        if stage <= old_market:
+            return min(new_market, (stage * new_market + old_market - 1) // old_market)
+        old_floor_stage = stage - old_market
+        mapped_floor = (old_floor_stage * new_market + old_market - 1) // old_market
+        return min(int(new_stage_count), new_market + mapped_floor)
+
     def ensure_reprice_chain(self, offer, strategy_version, now_ms=None):
         offer_id = int(offer.get("offer_id") or offer.get("id"))
         now = int(now_ms if now_ms is not None else self._now_ms())
@@ -2101,8 +2265,8 @@ class LendingStateStore:
                         """INSERT INTO reprice_chains(
                                chain_key, strategy_version, base_slice_key, pool, layer,
                                origin_rate, started_at_ms, current_stage, current_offer_id,
-                               status, updated_at_ms
-                           ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, 'ACTIVE', ?)""",
+                               fixed_landing_rate, pricing_curve_version, status, updated_at_ms
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'ACTIVE', ?)""",
                         (
                             chain_key,
                             str(strategy_version),
@@ -2112,17 +2276,35 @@ class LendingStateStore:
                             observed_rate,
                             started_at,
                             offer_id,
+                            intent["fixed_landing_rate"],
+                            str(intent["pricing_curve_version"] or LEGACY_REPRICE_CURVE),
                             now,
                         ),
                     )
                 else:
+                    old_stage_count = self._strategy_reprice_stage_count(
+                        connection,
+                        predecessor["strategy_version"],
+                        predecessor["pool"],
+                    )
+                    new_stage_count = self._strategy_reprice_stage_count(
+                        connection,
+                        strategy_version,
+                        predecessor["pool"],
+                    )
+                    mapped_stage = self._map_reprice_stage(
+                        predecessor["current_stage"],
+                        old_stage_count,
+                        new_stage_count,
+                    )
                     connection.execute(
                         """INSERT INTO reprice_chains(
                                chain_key, strategy_version, base_slice_key, pool, layer,
                                origin_rate, started_at_ms, current_stage, current_offer_id,
                                last_reprice_at_ms, pending_action, pending_target_rate,
-                               market_anchor_rate, status, updated_at_ms
-                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)""",
+                               pending_source_offer_id, market_anchor_rate, fixed_landing_rate,
+                               pricing_curve_version, status, updated_at_ms
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)""",
                         (
                             chain_key,
                             str(strategy_version),
@@ -2131,43 +2313,27 @@ class LendingStateStore:
                             predecessor["layer"],
                             predecessor["origin_rate"],
                             predecessor["started_at_ms"],
-                            predecessor["current_stage"],
+                            mapped_stage,
                             offer_id,
                             predecessor["last_reprice_at_ms"],
                             predecessor["pending_action"],
                             predecessor["pending_target_rate"],
+                            predecessor["pending_source_offer_id"],
                             predecessor["market_anchor_rate"],
+                            predecessor["fixed_landing_rate"],
+                            predecessor["pricing_curve_version"],
                             now,
                         ),
                     )
             elif int(current["current_offer_id"] or 0) != offer_id:
-                if current["pending_action"] == "AGE_STAGE":
-                    connection.execute(
-                        """UPDATE reprice_chains
-                           SET current_offer_id=?, pending_action=NULL,
-                               pending_target_rate=NULL, status='ACTIVE', updated_at_ms=?
-                           WHERE chain_key=?""",
-                        (offer_id, now, chain_key),
-                    )
-                else:
-                    connection.execute(
-                        """UPDATE reprice_chains
-                           SET pool=?, layer=?, origin_rate=?, started_at_ms=?,
-                               current_stage=0, current_offer_id=?, last_reprice_at_ms=NULL,
-                               pending_action=NULL, pending_target_rate=NULL,
-                               market_anchor_rate=NULL,
-                               status='ACTIVE', updated_at_ms=?
-                           WHERE chain_key=?""",
-                        (
-                            str(offer.get("pool") or intent["pool"]),
-                            str(offer.get("layer") or intent["layer"]),
-                            observed_rate,
-                            started_at,
-                            offer_id,
-                            now,
-                            chain_key,
-                        ),
-                    )
+                connection.execute(
+                    """UPDATE reprice_chains
+                       SET current_offer_id=?, pending_action=NULL,
+                           pending_target_rate=NULL, pending_source_offer_id=NULL,
+                           status='ACTIVE', updated_at_ms=?
+                       WHERE chain_key=?""",
+                    (offer_id, now, chain_key),
+                )
             row = connection.execute(
                 "SELECT * FROM reprice_chains WHERE chain_key=?",
                 (chain_key,),
@@ -2248,6 +2414,7 @@ class LendingStateStore:
         stage=None,
         now_ms=None,
         market_anchor_rate=None,
+        source_offer_id=None,
     ):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
@@ -2257,6 +2424,7 @@ class LendingStateStore:
                        SET current_stage=MAX(current_stage, ?), current_offer_id=NULL,
                            last_reprice_at_ms=?, pending_action=?,
                            pending_target_rate=?,
+                           pending_source_offer_id=?,
                            market_anchor_rate=COALESCE(market_anchor_rate, ?),
                            updated_at_ms=?
                        WHERE chain_key=?""",
@@ -2265,6 +2433,7 @@ class LendingStateStore:
                         now,
                         str(action),
                         _decimal_text(target_rate),
+                        None if source_offer_id is None else int(source_offer_id),
                         None if market_anchor_rate is None else _decimal_text(market_anchor_rate),
                         now,
                         str(chain_key),
@@ -2274,9 +2443,17 @@ class LendingStateStore:
                 connection.execute(
                     """UPDATE reprice_chains
                        SET current_offer_id=NULL, last_reprice_at_ms=?,
-                           pending_action=?, pending_target_rate=?, updated_at_ms=?
+                           pending_action=?, pending_target_rate=?,
+                           pending_source_offer_id=?, updated_at_ms=?
                        WHERE chain_key=?""",
-                    (now, str(action), _decimal_text(target_rate), now, str(chain_key)),
+                    (
+                        now,
+                        str(action),
+                        _decimal_text(target_rate),
+                        None if source_offer_id is None else int(source_offer_id),
+                        now,
+                        str(chain_key),
+                    ),
                 )
             row = connection.execute(
                 "SELECT * FROM reprice_chains WHERE chain_key=?",
@@ -2305,6 +2482,68 @@ class LendingStateStore:
                         (str(strategy_version), pool, layer),
                     ).fetchone()
         return None if row is None else dict(row)
+
+    def set_fixed_landing_rate(self, chain_key, rate, now_ms=None):
+        """Persist the first exact-term landing rate without ever revising it."""
+
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """UPDATE reprice_chains
+                   SET fixed_landing_rate=COALESCE(fixed_landing_rate, ?), updated_at_ms=?
+                   WHERE chain_key=?""",
+                (_decimal_text(rate), now, str(chain_key)),
+            )
+            row = connection.execute(
+                "SELECT * FROM reprice_chains WHERE chain_key=?",
+                (str(chain_key),),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def pending_reprices(self, strategy_version):
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """SELECT chains.*, offers.currency AS source_currency,
+                          offers.amount AS source_amount, offers.rate AS source_rate,
+                          offers.rate_real AS source_rate_real, offers.period AS source_period,
+                          offers.offer_type AS source_offer_type,
+                          offers.display_type AS source_display_type,
+                          offers.flags AS source_flags
+                   FROM reprice_chains AS chains
+                   JOIN offers ON offers.offer_id=chains.pending_source_offer_id
+                   WHERE chains.strategy_version=? AND chains.status='ACTIVE'
+                     AND chains.current_offer_id IS NULL
+                     AND chains.pending_action IS NOT NULL
+                     AND chains.pending_target_rate IS NOT NULL
+                     AND chains.pending_source_offer_id IS NOT NULL
+                   ORDER BY chains.last_reprice_at_ms, chains.updated_at_ms, chains.chain_key""",
+                (str(strategy_version),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bind_reprice_replacement_chain(self, chain_key, offer_id, effective_rate, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT * FROM reprice_chains
+                   WHERE chain_key=? AND status='ACTIVE' AND pending_action IS NOT NULL""",
+                (str(chain_key),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE reprice_chains
+                   SET current_offer_id=?, pending_action=NULL,
+                       pending_target_rate=NULL, pending_source_offer_id=NULL,
+                       status='ACTIVE', updated_at_ms=?
+                   WHERE chain_key=?""",
+                (int(offer_id), now, str(chain_key)),
+            )
+            result = connection.execute(
+                "SELECT * FROM reprice_chains WHERE chain_key=?",
+                (str(chain_key),),
+            ).fetchone()
+        return None if result is None else dict(result)
 
     def bind_reprice_replacement(
         self,
@@ -2335,24 +2574,14 @@ class LendingStateStore:
             if row is None:
                 return None
             chain_key = row["chain_key"]
-            if row["pending_action"] == "AGE_STAGE":
-                connection.execute(
-                    """UPDATE reprice_chains
-                       SET current_offer_id=?, pending_action=NULL,
-                           pending_target_rate=NULL, status='ACTIVE', updated_at_ms=?
-                       WHERE chain_key=?""",
-                    (int(offer_id), now, chain_key),
-                )
-            else:
-                connection.execute(
-                    """UPDATE reprice_chains
-                       SET origin_rate=?, started_at_ms=?, current_stage=0,
-                           current_offer_id=?, pending_action=NULL,
-                           pending_target_rate=NULL, market_anchor_rate=NULL,
-                           status='ACTIVE', updated_at_ms=?
-                       WHERE chain_key=?""",
-                    (_decimal_text(effective_rate), now, int(offer_id), now, chain_key),
-                )
+            connection.execute(
+                """UPDATE reprice_chains
+                   SET current_offer_id=?, pending_action=NULL,
+                       pending_target_rate=NULL, pending_source_offer_id=NULL,
+                       status='ACTIVE', updated_at_ms=?
+                   WHERE chain_key=?""",
+                (int(offer_id), now, chain_key),
+            )
             result = connection.execute(
                 "SELECT * FROM reprice_chains WHERE chain_key=?",
                 (chain_key,),
@@ -2503,9 +2732,10 @@ class LendingStateStore:
                            fingerprint, currency, slice_key, pool, layer, amount, submitted_rate,
                            effective_rate, period, offer_type, display_type, flags, strategy_version,
                            plan_hash, state, exchange_offer_id, write_phase, resolution,
-                           request_started_at_ms, resolved_at_ms, strategy_variant, created_at_ms, updated_at_ms
+                           request_started_at_ms, resolved_at_ms, strategy_variant, pricing_curve_version,
+                           created_at_ms, updated_at_ms
                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'CONFIRMED', ?,
-                                'CONFIRMED', 'PREFLIGHT_ADOPTED', ?, ?, 'baseline', ?, ?)""",
+                                'CONFIRMED', 'PREFLIGHT_ADOPTED', ?, ?, 'baseline', 'LEGACY', ?, ?)""",
                     (
                         fingerprint,
                         offer["currency"],

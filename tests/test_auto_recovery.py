@@ -217,7 +217,7 @@ def test_manual_dashboard_pause_clears_auto_recovery(tmp_path):
     assert store.runtime()["mode"] == "PAUSED"
 
 
-def test_schema_13_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_path):
+def test_schema_16_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = LendingStateStore(path)
     store.set_mode("PAUSED", "dashboard_stop")
@@ -225,7 +225,7 @@ def test_schema_13_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         recovery_rows = connection.execute("SELECT COUNT(*) FROM recovery_state").fetchone()[0]
-    assert (version, integrity, recovery_rows) == ("13", "ok", 1)
+    assert (version, integrity, recovery_rows) == ("16", "ok", 1)
 
 
 class OneSupervisorIteration:

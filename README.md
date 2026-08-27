@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.3 / V3.3
+# Bitfinex-lendingbot 0.3.5 / V3.5
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -22,19 +22,23 @@
 
 - 仅支持 `USD`，期限限定为 Bitfinex Funding 的 2–120 天。
 - API 必须允许 wallets 读取、funding 读取/写入；withdraw 与 ui_withdraw 写权限必须关闭。
-- 机器人只撤改 SQLite 中能够证明归属的挂单。V3.3 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
+- 机器人只撤改 SQLite 中能够证明归属的挂单。V3.5 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
 - 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；超过 `max(150 USD, 2%)` 容差时分阶段再平衡。
 - 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
 - 除人工暂停/停止外，网络、认证、配置、市场数据、账户数据、程序异常和 Worker 重启故障都会统一进入 PAUSED 的只读恢复循环，并在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
-- SQLite 使用显式 Schema 13。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
+- SQLite 使用显式 Schema 16。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
 
 V3.2 的无人值守恢复边界、退避、双快照确认和 Worker 心跳守护见 [V3.2 自动自愈说明](docs/v3.2-unattended-recovery.md)。
 
 V3.3 的全市场需求分配、150 USD 低需求池保留、小额余额合并复投与外部挂单接管见 [V3.3 策略说明](docs/v3.3-demand-allocation.md)。
+
+V3.5 合并了无人值守安全恢复与精确期限定价升级；固定市场落点、单向阶段调价和最终底线规则见 [V3.5 发布说明](docs/v3.5-release.md)。
+
+状态库会在首次运行 V3.5 时写入不可变的本机上线时间。状态接口以该时间为分界，提供更新前后等长窗口的挂单数、成交数、金额、加权日利率和加权等待时间，便于持续比较本次升级效果；普通重启不会重置分界。
 
 ## 快速开始
 
@@ -102,11 +106,11 @@ python -m pip install -r requirements-dev.txt
 .\verify.ps1
 ```
 
-验证包括 Ruff、Python 编译、140 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
+验证包括 Ruff、Python 编译、310 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.3`
+- 应用/User-Agent：`0.3.5`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`

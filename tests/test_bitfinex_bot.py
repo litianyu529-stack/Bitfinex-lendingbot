@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from unittest import mock
 
-from bitfinex import Bitfinex, BitfinexApiError
+from bitfinex import APP_VERSION, Bitfinex, BitfinexApiError
 from FileUtils import atomic_write_text
 import lendingbot
 
@@ -173,6 +173,9 @@ def build_strategy_settings(extra_bot=None):
 
 
 class BitfinexBotTests(unittest.TestCase):
+    def test_release_version(self):
+        self.assertEqual(APP_VERSION, "0.3.5")
+
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
         path = "v2/auth/r/wallets"
@@ -649,6 +652,29 @@ class BitfinexBotTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as file:
                 self.assertEqual(file.read(), "original")
 
+    def test_atomic_write_retries_transient_permission_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "status.json")
+            with open(path, "w", encoding="utf-8") as file:
+                file.write("original")
+            real_replace = os.replace
+            calls = 0
+
+            def transient_replace(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError(5, "destination is briefly in use", target)
+                return real_replace(source, target)
+
+            with mock.patch("FileUtils.os.replace", side_effect=transient_replace):
+                with mock.patch("FileUtils.time.sleep"):
+                    atomic_write_text(path, "replacement")
+
+            self.assertEqual(calls, 2)
+            with open(path, "r", encoding="utf-8") as file:
+                self.assertEqual(file.read(), "replacement")
+
     def test_dashboard_concurrent_start_creates_one_process(self):
         popen_calls = []
         call_lock = threading.Lock()
@@ -695,7 +721,7 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(len(popen_calls), 1)
             self.assertEqual(sum(result is not None for result in results), 1)
             self.assertIn("--live", popen_calls[0][0][0])
-            self.assertFalse(store.recovery_status()["active"])
+            self.assertTrue(store.recovery_status()["active"])
             lendingbot.stop_controlled_bot(config_path, context=context)
             lendingbot.cleanup_controlled_bot_handle(context)
 

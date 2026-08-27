@@ -1530,17 +1530,15 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None, p
             raise ConfigError("机器人已在运行")
         consume_controlled_bot_preflight(config_path, preflight_id, context=context)
         store, _ = v3_store_for_config(config_path)
-        if not preserve_recovery:
-            # A fresh, human-authorized start supersedes any non-manual
-            # recovery episode left by the previous worker.  Supervisor
-            # restarts retain that episode so the two-snapshot write barrier
-            # still applies.
-            store.clear_recovery()
-            runtime = store.runtime()
-            if runtime.get("safe_manual"):
-                raise ConfigError("存在需要人工确认的未决写入，不能启动实盘")
-            if runtime.get("safe_reason"):
-                store.set_mode("PAUSED", "manual_start_reset")
+        # A restart must never discard a durable recovery episode.  The new
+        # worker first obtains authoritative snapshots and only resumes writes
+        # through the normal recovery barrier.
+        runtime = store.runtime()
+        recovery = store.recovery_status()
+        if runtime.get("safe_manual"):
+            raise ConfigError("存在需要人工确认的未决写入，不能启动实盘")
+        if runtime.get("safe_reason") or recovery.get("active"):
+            store.set_mode("PAUSED", "restart_preserves_recovery")
         os.makedirs(os.path.dirname(status_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(context.process_log_path) or ".", exist_ok=True)
 
@@ -2063,7 +2061,7 @@ def main(argv=None):
     # Preserve a durable protected PAUSED across process restarts so bootstrap can reconcile
     # the uncertain exchange write from authoritative account data. Normal
     # PAUSED starts still transition directly to LIVE after the confirmed preflight.
-    if not state_store_v3.runtime().get("safe_reason"):
+    if not state_store_v3.runtime().get("safe_reason") and not state_store_v3.recovery_status().get("active"):
         state_store_v3.set_mode("LIVE", "live_preflight_confirmed")
     runtime_v3 = LendingRuntimeV3(
         client,

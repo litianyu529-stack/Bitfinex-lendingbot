@@ -16,6 +16,12 @@ DEMAND_CONFIRMATION_CYCLES = 2
 DUST_REINVEST_MINIMUM = D("1")
 RATE_TICK = D("0.0000001")
 RATE_COMPARISON_EPSILON = D("0.000000000000000001")
+EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V3"
+EXACT_TERM_EXPLORATION_CURVES = {
+    "EXACT_TERM_EXPLORATION_V2",
+    EXACT_TERM_EXPLORATION_CURVE,
+}
+LEGACY_REPRICE_CURVE = "LEGACY"
 POOLS = ("short", "medium", "long")
 LAYERS = ("quick", "balanced", "high")
 TERM_PERIOD_RANGES = {
@@ -36,9 +42,9 @@ PERIOD_FALLBACKS = {"short": 2, "medium": 14, "long": 120}
 PERIOD_SWITCH_ADVANTAGE = D("0.20")
 PERIOD_SWITCH_HOLD_MS = 600_000
 REPRICE_STAGE_DEFAULTS = {
-    "short": (10, 30, 60, 90, 120, 180),
-    "medium": (20, 60, 120, 180, 240, 360),
-    "long": (60, 180, 360, 480, 720, 1440),
+    "short": (5, 10, 20, 30, 60, 75, 90, 120, 150, 180),
+    "medium": (10, 20, 40, 60, 120, 150, 180, 240, 300, 360),
+    "long": (30, 60, 120, 180, 360, 480, 720, 960, 1200, 1440),
 }
 REPRICE_STAGE_LEGACY_MULTIPLIERS = {
     "short": (D("1.5"), D("2"), D("3")),
@@ -181,10 +187,14 @@ class StrategyPolicyV3:
     enable_hidden: bool = False
     adopt_external_offers: bool = True
     hidden_max_share: D | None = None
-    minimum_offer_minutes: int = 10
-    reprice_cooldown_minutes: int = 10
-    max_reprices_per_hour: int = 6
-    minimum_rate_change: D = D("0.00002")
+    minimum_offer_minutes: int = 5
+    reprice_cooldown_minutes: int = 5
+    max_reprices_per_hour: int = 12
+    minimum_rate_change: D = D("0.00001")
+    balanced_start_premium_percent: D = D("5")
+    high_start_premium_percent: D = D("12")
+    balanced_landing_stage: int = 5
+    high_landing_stage: int = 7
     short_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["short"]
     medium_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["medium"]
     long_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["long"]
@@ -242,6 +252,10 @@ V3_FIELD_CONVERTERS = {
     "reprice_cooldown_minutes": int,
     "max_reprices_per_hour": int,
     "minimum_rate_change": _d,
+    "balanced_start_premium_percent": _d,
+    "high_start_premium_percent": _d,
+    "balanced_landing_stage": int,
+    "high_landing_stage": int,
     "short_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "short"),
     "medium_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "medium"),
     "long_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "long"),
@@ -285,7 +299,7 @@ def validate_policy_v3(policy, require_live_floors=False):
     if policy.max_lend_percent < 0 or policy.max_lend_percent > 100:
         raise ValueError("max_lend_percent must be 0-100")
     if policy.max_pool_shift != POOL_SHIFT_CAP_PERCENTAGE_POINTS:
-        raise ValueError("V3.3 keeps max_pool_shift at 10 percentage points for policy compatibility")
+        raise ValueError("V3.5 keeps max_pool_shift at 10 percentage points for policy compatibility")
     for pool, (minimum, maximum) in TERM_PERIOD_RANGES.items():
         periods = tuple(getattr(policy, f"{pool}_periods"))
         if (
@@ -315,15 +329,24 @@ def validate_policy_v3(policy, require_live_floors=False):
         raise ValueError("offer and reprice cooldown minutes must be positive")
     if policy.max_reprices_per_hour < 0 or policy.max_reprices_per_hour > 90:
         raise ValueError("max_reprices_per_hour must be 0-90")
+    for name in ("balanced_start_premium_percent", "high_start_premium_percent"):
+        value = getattr(policy, name)
+        if value < 0 or value > 100:
+            raise ValueError(f"{name} must be 0-100")
+    for name in ("balanced_landing_stage", "high_landing_stage"):
+        value = getattr(policy, name)
+        if value < 1 or value > 10:
+            raise ValueError(f"{name} must be 1-10")
     for pool in POOLS:
         stages = policy.reprice_stages(pool)
         if (
-            len(stages) != 6
+            len(stages) not in {6, 10}
             or any(value < 1 or value > MAX_REPRICE_STAGE_MINUTES for value in stages)
             or any(left >= right for left, right in zip(stages, stages[1:]))
         ):
             raise ValueError(
-                f"{pool} reprice stages must contain six increasing minutes between 1 and {MAX_REPRICE_STAGE_MINUTES}"
+                f"{pool} reprice stages must contain six or ten increasing minutes between 1 and "
+                f"{MAX_REPRICE_STAGE_MINUTES}"
             )
     return policy
 
@@ -472,16 +495,28 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
     book_data_present = False
     for period in configured:
         pool = period_pool[period]
+        period_trades = [row for row in filtered_trades if int(row["period"]) == period]
         floor_apr = policy.floor_apr(pool)
         floor_rate = (
             D("0")
             if floor_apr is None or floor_apr <= 0
             else ceil_rate_tick(gross_daily_floor(floor_apr, policy.normal_fee_rate))
         )
-        target_rate = competitive_rate_for_layer("balanced", signals, floor_rate)
+        rate_windows = {}
+        for window in WINDOWS_MS:
+            selected = _window_rows(period_trades, now_ms, window)
+            median = weighted_quantile(selected, D("0.5"))
+            rate_windows[window] = {
+                "median": median,
+                "q25": weighted_quantile(selected, D("0.25")),
+                "q75": weighted_quantile(selected, D("0.75")),
+                "volume": sum((row["amount"] for row in selected), D("0")),
+                "count": len(selected),
+                "volatility": _weighted_std(selected, median),
+            }
         window_metrics = {}
         for window in PERIOD_DEMAND_WINDOW_WEIGHTS:
-            selected = [row for row in _window_rows(filtered_trades, now_ms, window) if int(row["period"]) == period]
+            selected = _window_rows(period_trades, now_ms, window)
             window_metrics[window] = {
                 "tradeCount": len(selected),
                 "tradeVolume": sum((row["amount"] for row in selected), D("0")),
@@ -492,16 +527,40 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
         book_data_present = book_data_present or bool(bids or offers)
         best_bid = max((row["rate"] for row in bids), default=D("0"))
         best_offer = min((row["rate"] for row in offers), default=D("0"))
-        executable_depth = sum((row["amount"] for row in bids if row["rate"] >= target_rate), D("0"))
-        recent_rates = [
-            row["rate"] for row in _window_rows(filtered_trades, now_ms, "7d") if int(row["period"]) == period
+        anchor_values = [
+            value
+            for value in (
+                best_offer,
+                best_bid,
+                rate_windows["1h"]["median"],
+                rate_windows["24h"]["median"],
+            )
+            if value > 0
         ]
+        anchor_rate = sorted(anchor_values)[len(anchor_values) // 2] if anchor_values else floor_rate
+        period_iqr = max(D("0"), rate_windows["24h"]["q75"] - rate_windows["24h"]["q25"])
+        trend_threshold = max(policy.minimum_rate_change, period_iqr * policy.iqr_change_fraction)
+        period_trend = (
+            rate_windows["5m"]["median"] - rate_windows["1h"]["median"]
+            if rate_windows["5m"]["median"] and rate_windows["1h"]["median"]
+            else D("0")
+        )
+        target_rate = ceil_rate_tick(
+            max(floor_rate, anchor_rate, D(rate_windows["1h"].get("median") or 0))
+        )
+        executable_depth = sum((row["amount"] for row in bids if row["rate"] >= target_rate), D("0"))
+        recent_rates = [row["rate"] for row in _window_rows(period_trades, now_ms, "7d")]
         rows[period] = {
             "period": period,
             "pool": pool,
             "windows": window_metrics,
+            "rateWindows": rate_windows,
             "bestBorrowRate": best_bid,
             "bestOfferRate": best_offer,
+            "anchorRate": anchor_rate,
+            "trend": period_trend,
+            "trendThreshold": trend_threshold,
+            "rateDataAvailable": bool(bids or offers or period_trades),
             "executableBorrowDepth": executable_depth,
             "supportedCeiling": max([best_bid, *recent_rates], default=D("0")),
             "targetRate": target_rate,
@@ -939,14 +998,16 @@ def allocate_slices_v3(
         pool: max(D("0"), target_offer_amounts[pool] - offer_exposure[pool]) if pool in active_pools else D("0")
         for pool in POOLS
     }
-    if offer_exposure_by_layer is not None:
-        layer_allocation_basis = "MANAGED_OPEN_OFFERS"
-        layer_budget = offer_budget
-        layer_exposure = {layer: D(offer_exposure_by_layer.get(layer, 0)) for layer in LAYERS}
-    else:
-        layer_allocation_basis = "MANAGED_TOTAL_EXPOSURE"
-        layer_budget = total_principal
-        layer_exposure = {layer: D((exposure_by_layer or {}).get(layer, 0)) for layer in LAYERS}
+    # Layer targets describe the whole managed portfolio, not just the small
+    # amount that happens to be waiting in open offers.  Otherwise every
+    # isolated repayment starts from an empty offer book and the sole new slice
+    # repeatedly falls into the largest configured layer (balanced).
+    layer_allocation_basis = "ATTRIBUTED_MANAGED_EXPOSURE_PLUS_AVAILABLE"
+    cumulative_layer_exposure = exposure_by_layer if exposure_by_layer is not None else offer_exposure_by_layer or {}
+    layer_exposure = {layer: max(D("0"), D(cumulative_layer_exposure.get(layer, 0))) for layer in LAYERS}
+    attributed_layer_exposure = sum(layer_exposure.values(), D("0"))
+    layer_budget = attributed_layer_exposure + available
+    unattributed_layer_exposure = max(D("0"), total_principal - available - attributed_layer_exposure)
     target_layer_amounts = {layer: layer_budget * policy.layer_shares()[layer] / D("100") for layer in LAYERS}
     layer_deficits = {layer: max(D("0"), target_layer_amounts[layer] - layer_exposure[layer]) for layer in LAYERS}
     if sum(layer_deficits.values(), D("0")) <= 0:
@@ -993,6 +1054,7 @@ def allocate_slices_v3(
         "layer_allocation_basis": layer_allocation_basis,
         "target_layer_amounts": target_layer_amounts,
         "current_layer_amounts": layer_exposure,
+        "unattributed_layer_amount": unattributed_layer_exposure,
         "layer_deviation_amounts": {layer: layer_exposure[layer] - target_layer_amounts[layer] for layer in LAYERS},
     }
     if available < USD_ORDER_CHUNK or insufficient:
@@ -1148,11 +1210,157 @@ def competitive_rate_for_layer(layer, signals, floor_rate):
     return ceil_rate_tick(max(floor_rate, target))
 
 
-def _candidate_target_rate(item, signals, floor_rate):
+def period_pricing_context(signals, pool, period, floor_rate):
+    """Return pricing inputs isolated to one exact funding term."""
+
     floor_rate = ceil_rate_tick(floor_rate)
-    target = competitive_rate_for_layer(item["layer"], signals, floor_rate)
-    target += RATE_TICK * D((item["slice_index"] % 5) - 2)
+    selection = signals.get("periodSelection") or signals.get("period_selection") or {}
+    pool_payload = selection.get("byPool", {}).get(str(pool), {})
+    row = next(
+        (candidate for candidate in pool_payload.get("scores", []) if int(candidate.get("period", 0)) == int(period)),
+        {},
+    )
+    if not row or "rateWindows" not in row:
+        # Compatibility for legacy replay fixtures that predate exact-period
+        # signals. Live market construction always emits rateWindows, including
+        # an explicit empty context that safely falls back to the term floor.
+        legacy_windows = signals.get("windows", {})
+        legacy_24h = legacy_windows.get("24h", {})
+        legacy_q25 = D(legacy_24h.get("q25") or 0)
+        legacy_q75 = D(legacy_24h.get("q75") or 0)
+        legacy_7d = legacy_windows.get("7d", {})
+        legacy_q25_7d = D(legacy_7d.get("q25") or 0)
+        legacy_q75_7d = D(legacy_7d.get("q75") or 0)
+        legacy_anchor = D(signals.get("anchor_rate") or floor_rate)
+        return {
+            "pool": str(pool),
+            "period": int(period),
+            "bestBorrowRate": D(signals.get("best_bid") or 0),
+            "bestOfferRate": D(signals.get("best_offer") or 0),
+            "rawAnchorRate": legacy_anchor,
+            "anchorRate": max(floor_rate, legacy_anchor),
+            "median1h": D(legacy_windows.get("1h", {}).get("median") or 0),
+            "q25_24h": legacy_q25,
+            "q75_24h": legacy_q75,
+            "iqr24h": max(D("0"), legacy_q75 - legacy_q25),
+            "q25_7d": legacy_q25_7d,
+            "q75_7d": legacy_q75_7d,
+            "iqr7d": max(D("0"), legacy_q75_7d - legacy_q25_7d),
+            "trend": D(signals.get("trend") or 0),
+            "trendThreshold": D(signals.get("trend_threshold") or 0),
+            "supportedCeiling": max(
+                D(signals.get("best_bid") or 0),
+                D(signals.get("best_offer") or 0),
+                legacy_q75,
+            ),
+            "rateDataAvailable": bool(legacy_windows or signals.get("best_bid") or signals.get("best_offer")),
+            "rateWindows": legacy_windows,
+            "source": "LEGACY_SIGNAL_FALLBACK",
+        }
+    windows = row.get("rateWindows") or {}
+    window_1h = windows.get("1h", {})
+    window_24h = windows.get("24h", {})
+    window_7d = windows.get("7d", {})
+    best_borrow = D(row.get("bestBorrowRate") or 0)
+    best_offer = D(row.get("bestOfferRate") or 0)
+    anchor = D(row.get("anchorRate") or floor_rate)
+    q25 = D(window_24h.get("q25") or 0)
+    q75 = D(window_24h.get("q75") or 0)
+    iqr = max(D("0"), q75 - q25)
+    q25_7d = D(window_7d.get("q25") or 0)
+    q75_7d = D(window_7d.get("q75") or 0)
+    return {
+        "pool": str(pool),
+        "period": int(period),
+        "bestBorrowRate": best_borrow,
+        "bestOfferRate": best_offer,
+        "rawAnchorRate": anchor,
+        "anchorRate": max(floor_rate, anchor),
+        "median1h": D(window_1h.get("median") or 0),
+        "q25_24h": q25,
+        "q75_24h": q75,
+        "iqr24h": iqr,
+        "q25_7d": q25_7d,
+        "q75_7d": q75_7d,
+        "iqr7d": max(D("0"), q75_7d - q25_7d),
+        "trend": D(row.get("trend") or 0),
+        "trendThreshold": D(row.get("trendThreshold") or 0),
+        "supportedCeiling": D(row.get("supportedCeiling") or 0),
+        "rateDataAvailable": bool(row.get("rateDataAvailable", False)),
+        "rateWindows": windows,
+        "source": "EXACT_PERIOD" if row else "PERIOD_FLOOR_FALLBACK",
+    }
+
+
+def competitive_rate_for_period(layer, pool, period, signals, floor_rate):
+    """Price one order without borrowing signals from any other term."""
+
+    floor_rate = ceil_rate_tick(floor_rate)
+    context = period_pricing_context(signals, pool, period, floor_rate)
+    if layer == "quick":
+        best_borrow = context["bestBorrowRate"]
+        target = floor_rate if best_borrow <= 0 else max(floor_rate, best_borrow - RATE_TICK)
+    elif layer == "balanced":
+        target = max(floor_rate, context["rawAnchorRate"], context["median1h"])
+    else:
+        target = max(
+            floor_rate,
+            context["q75_24h"],
+            context["rawAnchorRate"] + context["iqr24h"] * D("0.25"),
+        )
     return ceil_rate_tick(max(floor_rate, target))
+
+
+def exploration_start_rate_for_period(layer, pool, period, signals, floor_rate, policy):
+    """Return a same-term starting rate that deliberately explores above the floor."""
+
+    floor_rate = ceil_rate_tick(floor_rate)
+    landing = competitive_rate_for_period(layer, pool, period, signals, floor_rate)
+    if layer == "quick":
+        return landing
+    context = period_pricing_context(signals, pool, period, floor_rate)
+    if layer == "balanced":
+        premium = D(policy.balanced_start_premium_percent) / D("100")
+        target = max(landing, floor_rate * (D("1") + premium), context["q75_24h"])
+    else:
+        premium = D(policy.high_start_premium_percent) / D("100")
+        target = max(
+            landing,
+            floor_rate * (D("1") + premium),
+            context["q75_24h"],
+            context["q75_7d"],
+            context["rawAnchorRate"] + context["iqr24h"] * D("0.50"),
+        )
+    return ceil_rate_tick(max(floor_rate, target))
+
+
+def _candidate_target_rate(item, signals, floor_rate, policy=None):
+    floor_rate = ceil_rate_tick(floor_rate)
+    if item.get("pool") is not None and item.get("period") is not None:
+        target = (
+            competitive_rate_for_period(item["layer"], item["pool"], item["period"], signals, floor_rate)
+            if policy is None
+            else exploration_start_rate_for_period(
+                item["layer"], item["pool"], item["period"], signals, floor_rate, policy
+            )
+        )
+        pricing = period_pricing_context(signals, item["pool"], item["period"], floor_rate)
+    else:
+        # Retain the small private-helper compatibility used by offline callers;
+        # every real order carries both pool and exact period.
+        target = competitive_rate_for_layer(item["layer"], signals, floor_rate)
+        pricing = {"q75_24h": D(signals.get("windows", {}).get("24h", {}).get("q75") or 0)}
+    start_guard = floor_rate
+    if item["layer"] == "balanced":
+        # A newly returned slice should first try a market-supported rate
+        # before the ordinary age stages walk it down.  Keep this guard local
+        # to new offers so existing balanced repricing retains its benchmark.
+        start_guard = ceil_rate_tick(max(target, D(pricing.get("q75_24h") or 0)))
+    ladder_step = (item["slice_index"] % 5) if policy is not None and item["layer"] in {"balanced", "high"} else (
+        (item["slice_index"] % 5) - 2
+    )
+    target += RATE_TICK * D(ladder_step)
+    return ceil_rate_tick(max(floor_rate, start_guard, target))
 
 
 def _score_candidate(candidate, item, signals, policy, floor_apr):
@@ -1161,8 +1369,15 @@ def _score_candidate(candidate, item, signals, policy, floor_apr):
     net_apr = net_apr_from_daily(candidate["effective_rate"], fee)
     floor_apr = max(D("0.00000001"), floor_apr)
     yield_score = min(D("1"), net_apr / (floor_apr * D("1.5")))
-    anchor = max(D("0.00000001"), D(signals.get("anchor_rate") or candidate["effective_rate"]))
-    distance = max(D("0"), candidate["effective_rate"] - D(signals.get("best_bid") or anchor)) / anchor
+    pricing = period_pricing_context(
+        signals,
+        item["pool"],
+        item["period"],
+        candidate.get("gross_daily_floor") or candidate["effective_rate"],
+    )
+    anchor = max(D("0.00000001"), D(pricing.get("anchorRate") or candidate["effective_rate"]))
+    best_borrow = D(pricing.get("bestBorrowRate") or anchor)
+    distance = max(D("0"), candidate["effective_rate"] - best_borrow) / anchor
     layer_base = {"quick": D("0.90"), "balanced": D("0.65"), "high": D("0.30")}[item["layer"]]
     fill = max(D("0"), min(D("1"), layer_base - distance * D("10")))
     wait = fill
@@ -1296,23 +1511,24 @@ def build_strategy_plan_v3(
         if floor_apr is None or floor_apr <= 0:
             continue
         visible_floor = gross_daily_floor(floor_apr, policy.normal_fee_rate)
-        window_24h = signals.get("windows", {}).get("24h", {})
-        q25 = D(window_24h.get("q25") or 0)
-        q75 = D(window_24h.get("q75") or 0)
-        iqr = max(D("0"), q75 - q25)
+        pricing = period_pricing_context(signals, item["pool"], item["period"], visible_floor)
         supported_ceiling = max(
-            D(signals.get("best_bid") or 0),
-            D(signals.get("best_offer") or 0),
-            D(signals.get("anchor_rate") or 0),
-            D(signals.get("frr_daily_rate") or 0),
-            q75 + iqr,
+            D(pricing.get("bestBorrowRate") or 0),
+            D(pricing.get("bestOfferRate") or 0),
+            D(pricing.get("anchorRate") or 0),
+            D(pricing.get("q75_24h") or 0) + D(pricing.get("iqr24h") or 0),
         )
-        support_margin = D(signals.get("trend_threshold") or policy.minimum_rate_change)
+        if not pricing.get("rateDataAvailable"):
+            supported_ceiling = visible_floor
+        support_margin = max(
+            policy.minimum_rate_change,
+            D(pricing.get("trendThreshold") or 0),
+        )
         if (supported_ceiling <= 0 or visible_floor > supported_ceiling + support_margin) and not item.get(
             "minimum_floor_order", False
         ):
             continue
-        target = _candidate_target_rate(item, signals, visible_floor)
+        target = _candidate_target_rate(item, signals, visible_floor, policy=policy)
         visible = []
         hidden = []
         for offer_type, submitted_rate, effective_rate, display_type in _candidate_types(policy, frr, target):
@@ -1333,6 +1549,13 @@ def build_strategy_plan_v3(
                     "submitted_rate": submitted_rate,
                     "effective_rate": effective_rate,
                     "target_rate": target,
+                    "fixed_landing_rate": competitive_rate_for_period(
+                        item["layer"],
+                        item["pool"],
+                        item["period"],
+                        signals,
+                        floor_rate,
+                    ),
                     "hidden": is_hidden,
                     "flags": 64 if is_hidden else 0,
                     "gross_daily_floor": floor_rate,

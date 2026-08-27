@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 
 
 def atomic_write_text(path, text, encoding="utf-8"):
@@ -23,7 +24,18 @@ def atomic_write_text(path, text, encoding="utf-8"):
             temp_file.write(text)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        os.replace(temp_path, target)
+        # On Windows a reader that opened the destination without delete sharing
+        # can make an otherwise atomic replacement fail briefly with WinError 5.
+        # Dashboard polling is read-only, so retry the transient collision before
+        # treating it as a runtime failure.
+        for attempt in range(8):
+            try:
+                os.replace(temp_path, target)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(min(0.01 * (2**attempt), 0.25))
         temp_path = None
     finally:
         if temp_path is not None:

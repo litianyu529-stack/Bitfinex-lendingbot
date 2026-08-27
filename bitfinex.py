@@ -11,7 +11,7 @@ from urllib import error, parse, request
 from DomainTypes import WriteOutcome, WriteResult
 
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.5"
 
 
 class BitfinexApiError(Exception):
@@ -45,6 +45,7 @@ class BitfinexTransientError(BitfinexApiError):
 
 FUNDING_OFFER_TYPES = {"LIMIT", "FRR", "FRRDELTAFIX", "FRRDELTAVAR"}
 HIDDEN_OFFER_FLAG = 64
+READ_RETRY_DELAYS = (0.25, 1.0)
 
 
 def _write_rejection_category(message):
@@ -58,10 +59,19 @@ class Bitfinex:
     AUTH_BASE_URL = "https://api.bitfinex.com"
     PUBLIC_BASE_URL = "https://api-pub.bitfinex.com"
 
-    def __init__(self, api_key="", api_secret="", timeout=30):
+    def __init__(
+        self,
+        api_key="",
+        api_secret="",
+        timeout=30,
+        read_retry_delays=READ_RETRY_DELAYS,
+        retry_sleeper=time.sleep,
+    ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.timeout = timeout
+        self.read_retry_delays = tuple(float(delay) for delay in read_retry_delays)
+        self.retry_sleeper = retry_sleeper
         self._last_nonce = 0
         # Bitfinex nonces are scoped to an API key.  Keep nonce creation and the
         # corresponding authenticated request in one critical section so a
@@ -108,6 +118,33 @@ class Bitfinex:
         return self._headers(path, nonce, body)
 
     def _request_json(self, url, method="GET", data=None, headers=None, ambiguous_on_failure=False):
+        """Return one JSON response, retrying only requests known to be read-only.
+
+        Authenticated Bitfinex reads use POST, so HTTP method alone cannot
+        distinguish them from writes. ``ambiguous_on_failure`` is the safety
+        boundary: writes still fail immediately as UNKNOWN, while idempotent
+        reads may retry transient transport, HTTP, decoding, or JSON failures.
+        """
+
+        authenticated = "bfx-nonce" in {str(key).lower() for key in (headers or {})}
+        # Authenticated retries must generate a new nonce and signature, so
+        # ``_auth_post`` owns that retry loop instead of reusing these headers.
+        delays = () if ambiguous_on_failure or authenticated else self.read_retry_delays
+        for attempt in range(len(delays) + 1):
+            try:
+                return self._request_json_once(
+                    url,
+                    method=method,
+                    data=data,
+                    headers=headers,
+                    ambiguous_on_failure=ambiguous_on_failure,
+                )
+            except BitfinexTransientError:
+                if attempt >= len(delays):
+                    raise
+                self.retry_sleeper(delays[attempt])
+
+    def _request_json_once(self, url, method="GET", data=None, headers=None, ambiguous_on_failure=False):
         data_bytes = None
         if data is not None:
             data_bytes = data.encode("utf-8")
@@ -172,15 +209,22 @@ class Bitfinex:
             raise BitfinexApiError("Bitfinex API key/secret are not configured")
         with self._auth_lock:
             body = self._body(payload)
-            nonce = self._nonce()
-            headers = self._headers(path, nonce, body)
-            return self._request_json(
-                f"{self.AUTH_BASE_URL}/{path}",
-                method="POST",
-                data=body,
-                headers=headers,
-                ambiguous_on_failure=ambiguous_on_failure,
-            )
+            delays = () if ambiguous_on_failure else self.read_retry_delays
+            for attempt in range(len(delays) + 1):
+                nonce = self._nonce()
+                headers = self._headers(path, nonce, body)
+                try:
+                    return self._request_json(
+                        f"{self.AUTH_BASE_URL}/{path}",
+                        method="POST",
+                        data=body,
+                        headers=headers,
+                        ambiguous_on_failure=ambiguous_on_failure,
+                    )
+                except BitfinexTransientError:
+                    if attempt >= len(delays):
+                        raise
+                    self.retry_sleeper(delays[attempt])
 
     def _auth_write(self, path, payload=None):
         response = self._auth_post(path, payload, ambiguous_on_failure=True)

@@ -305,21 +305,36 @@ function repriceLabel(offer) {
     const state = offer.repriceState;
     if (!state) return age;
     const floorState = state.floorState;
-    if (floorState === "REPRICE_PENDING") return `${age} · 正在重挂到策略底线`;
-    if (floorState === "REPRICE_REQUIRED") return `${age} · 已到第 6 阶段 · 等待重挂到底线`;
-    if (floorState === "SATISFIED_WITHIN_TOLERANCE") return `${age} · 已达到策略底线（容差内）`;
+    const landingState = state.landingState;
+    const explorationCurve = ["EXACT_TERM_EXPLORATION_V2", "EXACT_TERM_EXPLORATION_V3"].includes(state.curveVersion);
+    const totalStages = Math.max(1, safeNumber(state.totalStages) || 6);
+    const pricing = state.landingPolicy === "FIXED_AT_CREATION"
+        ? `固定落点 ${formatPercent(safeNumber(state.landingRate) * 100, 5)} · 当前市场 ${formatPercent(safeNumber(state.currentMarketRate) * 100, 5)} · 底线 ${formatPercent(safeNumber(state.floorRate) * 100, 5)}`
+        : "";
+    const describe = (message) => pricing ? `${message} · ${pricing}` : message;
+    if (state.repriceBlockedReason === "BELOW_REPOST_MINIMUM") {
+        return describe(`${age} · 剩余金额低于 150 USD，无法安全撤单重挂`);
+    }
+    if (floorState === "REPRICE_PENDING") return describe(`${age} · 正在重挂到策略底线`);
+    if (floorState === "REPRICE_REQUIRED") return describe(`${age} · 已到第 ${totalStages} 阶段 · 等待重挂到底线`);
+    if (floorState === "SATISFIED_WITHIN_TOLERANCE") return describe(`${age} · 已达到策略底线（容差内）`);
     const stage = safeNumber(state.stage);
     const stageType = state.stageType === "FLOOR" ? "底线" : "市场";
     const nextStageType = state.nextStageType === "FLOOR" ? "底线" : "市场";
+    if (explorationCurve && landingState === "SATISFIED_WITHIN_TOLERANCE" && state.nextStageAtMs) {
+        const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
+        const minutes = Math.ceil(remaining / 60000);
+        return describe(`${age} · 已接近固定期限市场落点（容差内） · ${minutes} 分钟后继续向底线调价`);
+    }
     if (stage <= 0 && state.nextStageAtMs) {
         const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
         const minutes = Math.ceil(remaining / 60000);
-        return `${age} · 等待${nextStageType}第 1 阶段 · ${minutes} 分钟后检查`;
+        return describe(`${age} · 等待${nextStageType}第 1 阶段 · ${minutes} 分钟后检查`);
     }
-    if (!state.nextStageAtMs) return `${age} · ${stageType}第 ${stage} 阶段已检查`;
+    if (!state.nextStageAtMs) return describe(`${age} · ${stageType}第 ${stage} 阶段已检查`);
     const remaining = Math.max(0, safeNumber(state.nextStageAtMs) - Date.now());
     const minutes = Math.ceil(remaining / 60000);
-    return `${age} · ${stageType}第 ${stage} 阶段 · ${minutes} 分钟后检查 · 下一阶段：${nextStageType}`;
+    return describe(`${age} · ${stageType}第 ${stage} 阶段 · ${minutes} 分钟后检查 · 下一阶段：${nextStageType}`);
 }
 
 function appendCell(row, text, className = "") {
@@ -608,6 +623,10 @@ function renderStatus() {
     $("chartTotal").textContent = accountValid ? formatAmount(total) : "--";
     const safeReason = status.runtime?.safe_reason;
     const recovery = status.recovery || {};
+    const writeRecovery = status.writeRecovery || {};
+    const writeBlockers = Array.isArray(writeRecovery.blockers) ? writeRecovery.blockers : [];
+    const blockingWriteItems = writeBlockers.filter((item) => item.blocking !== false);
+    const writeBlocked = writeRecovery.canSubmit === false;
     const recoverySyncs = Math.max(0, Number(recovery.successfulSnapshots || 0));
     const recoveryRequired = Math.max(2, Number(recovery.requiredSnapshots || 2));
     const nextRetrySeconds = recovery.nextProbeAt
@@ -622,16 +641,27 @@ function renderStatus() {
         ? "状态已过期，请检查实盘进程或网络。"
         : (recovery.active
             ? `${recovery.manualRequired ? "需要人工处理" : "自动修复中"}：${recovery.reason || safeReason || "正在重新读取权威数据"}${recoveryDetail}`
+            : (writeBlocked
+                ? `自动恢复中：${blockingWriteItems.length
+                    ? blockingWriteItems.map((item) => `${item.kind}:${item.state}`).join("，")
+                    : "等待写入对账"}`
             : (safeReason
                 ? `PAUSED：${safeReason}`
-                : (status.last_status || "实盘状态已同步。")));
+                : (status.last_status || "实盘状态已同步。"))));
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.3 · ${mode}`);
-    badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active);
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.3 · 已过期" : `V3.3 · ${mode}`);
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.5 · ${mode}`);
+    badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active || writeBlocked);
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.5 · 已过期" : `V3.5 · ${mode}`);
+    const releaseComparison = status.releaseComparison || {};
+    $("releaseBoundary").textContent = releaseComparison.activatedAtMs
+        ? formatDateTime(releaseComparison.activatedAtMs)
+        : "等待首次启动";
+    $("releaseBoundary").title = releaseComparison.activatedAtMs
+        ? "订单与成交统计以此时间分为 V3.5 更新前和更新后，并使用等长时间窗口进行对比。"
+        : "首次使用 V3.5 状态库时自动写入，不会随重启改变。";
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
     const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
@@ -679,10 +709,12 @@ function renderControl() {
     const mode = statusMode();
     const stale = state.status?.last_update ? statusIsStale() : false;
     const recovery = state.status?.recovery || {};
+    const writeRecovery = state.status?.writeRecovery || {};
+    const writeBlocked = writeRecovery.canSubmit === false;
     $("controlTitle").textContent = running
         ? (recovery.active
             ? (recovery.manualRequired ? "等待人工处理" : "自动修复中")
-            : (mode === "PAUSED" ? "PAUSED" : (stale ? "进程运行 · 状态过期" : "运行中")))
+            : (writeBlocked ? "自动恢复中" : (mode === "PAUSED" ? "PAUSED" : (stale ? "进程运行 · 状态过期" : "运行中"))))
         : "已停止";
     $("controlDetail").textContent = running
         ? (recovery.active
@@ -825,7 +857,7 @@ function renderPreflight(data) {
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3.3 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    items.push(["实际 V3.5 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );
