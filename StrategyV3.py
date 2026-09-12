@@ -16,9 +16,10 @@ DEMAND_CONFIRMATION_CYCLES = 2
 DUST_REINVEST_MINIMUM = D("1")
 RATE_TICK = D("0.0000001")
 RATE_COMPARISON_EPSILON = D("0.000000000000000001")
-EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V3"
+EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
 EXACT_TERM_EXPLORATION_CURVES = {
     "EXACT_TERM_EXPLORATION_V2",
+    "EXACT_TERM_EXPLORATION_V3",
     EXACT_TERM_EXPLORATION_CURVE,
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
@@ -45,6 +46,11 @@ REPRICE_STAGE_DEFAULTS = {
     "short": (5, 10, 20, 30, 60, 75, 90, 120, 150, 180),
     "medium": (10, 20, 40, 60, 120, 150, 180, 240, 300, 360),
     "long": (30, 60, 120, 180, 360, 480, 720, 960, 1200, 1440),
+}
+QUICK_REPRICE_STAGE_DEFAULTS = {
+    "short": (5, 10, 15, 20, 30, 40, 50, 60, 75, 90),
+    "medium": (5, 10, 20, 30, 60, 75, 90, 120, 150, 180),
+    "long": (15, 30, 60, 90, 180, 240, 360, 480, 600, 720),
 }
 REPRICE_STAGE_LEGACY_MULTIPLIERS = {
     "short": (D("1.5"), D("2"), D("3")),
@@ -131,8 +137,8 @@ def normalize_term_period_range(value, pool):
     return tuple(sorted(periods))
 
 
-def normalize_reprice_stages(value, pool):
-    stages = _tuple_of_ints(value, REPRICE_STAGE_DEFAULTS[pool])
+def normalize_reprice_stages(value, pool, fallback=None):
+    stages = _tuple_of_ints(value, fallback or REPRICE_STAGE_DEFAULTS[pool])
     if len(stages) != 3:
         return stages
     last = D(stages[-1])
@@ -198,6 +204,9 @@ class StrategyPolicyV3:
     short_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["short"]
     medium_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["medium"]
     long_reprice_stages_minutes: tuple[int, ...] = REPRICE_STAGE_DEFAULTS["long"]
+    quick_short_reprice_stages_minutes: tuple[int, ...] = QUICK_REPRICE_STAGE_DEFAULTS["short"]
+    quick_medium_reprice_stages_minutes: tuple[int, ...] = QUICK_REPRICE_STAGE_DEFAULTS["medium"]
+    quick_long_reprice_stages_minutes: tuple[int, ...] = QUICK_REPRICE_STAGE_DEFAULTS["long"]
     iqr_change_fraction: D = D("0.25")
     spike_volume_ratio: D = D("1.5")
     outlier_min_volume_share: D = D("0.005")
@@ -217,7 +226,9 @@ class StrategyPolicyV3:
     def layer_shares(self):
         return {layer: getattr(self, f"{layer}_share") for layer in LAYERS}
 
-    def reprice_stages(self, pool):
+    def reprice_stages(self, pool, layer=None, pricing_curve_version=None):
+        if layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE:
+            return getattr(self, f"quick_{pool}_reprice_stages_minutes")
         return getattr(self, f"{pool}_reprice_stages_minutes")
 
 
@@ -259,6 +270,15 @@ V3_FIELD_CONVERTERS = {
     "short_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "short"),
     "medium_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "medium"),
     "long_reprice_stages_minutes": lambda value: normalize_reprice_stages(value, "long"),
+    "quick_short_reprice_stages_minutes": lambda value: normalize_reprice_stages(
+        value, "short", QUICK_REPRICE_STAGE_DEFAULTS["short"]
+    ),
+    "quick_medium_reprice_stages_minutes": lambda value: normalize_reprice_stages(
+        value, "medium", QUICK_REPRICE_STAGE_DEFAULTS["medium"]
+    ),
+    "quick_long_reprice_stages_minutes": lambda value: normalize_reprice_stages(
+        value, "long", QUICK_REPRICE_STAGE_DEFAULTS["long"]
+    ),
     "iqr_change_fraction": _d,
     "spike_volume_ratio": _d,
     "outlier_min_volume_share": _d,
@@ -337,15 +357,20 @@ def validate_policy_v3(policy, require_live_floors=False):
         value = getattr(policy, name)
         if value < 1 or value > 10:
             raise ValueError(f"{name} must be 1-10")
-    for pool in POOLS:
-        stages = policy.reprice_stages(pool)
+    stage_sets = [
+        (pool, policy.reprice_stages(pool)) for pool in POOLS
+    ] + [
+        (f"quick {pool}", policy.reprice_stages(pool, "quick", EXACT_TERM_EXPLORATION_CURVE))
+        for pool in POOLS
+    ]
+    for label, stages in stage_sets:
         if (
             len(stages) not in {6, 10}
             or any(value < 1 or value > MAX_REPRICE_STAGE_MINUTES for value in stages)
             or any(left >= right for left, right in zip(stages, stages[1:]))
         ):
             raise ValueError(
-                f"{pool} reprice stages must contain six or ten increasing minutes between 1 and "
+                f"{label} reprice stages must contain six or ten increasing minutes between 1 and "
                 f"{MAX_REPRICE_STAGE_MINUTES}"
             )
     return policy
@@ -1292,15 +1317,22 @@ def period_pricing_context(signals, pool, period, floor_rate):
     }
 
 
-def competitive_rate_for_period(layer, pool, period, signals, floor_rate):
+def competitive_rate_for_period(
+    layer,
+    pool,
+    period,
+    signals,
+    floor_rate,
+    pricing_curve_version=EXACT_TERM_EXPLORATION_CURVE,
+):
     """Price one order without borrowing signals from any other term."""
 
     floor_rate = ceil_rate_tick(floor_rate)
     context = period_pricing_context(signals, pool, period, floor_rate)
-    if layer == "quick":
+    if layer == "quick" and pricing_curve_version != EXACT_TERM_EXPLORATION_CURVE:
         best_borrow = context["bestBorrowRate"]
         target = floor_rate if best_borrow <= 0 else max(floor_rate, best_borrow - RATE_TICK)
-    elif layer == "balanced":
+    elif layer in {"quick", "balanced"}:
         target = max(floor_rate, context["rawAnchorRate"], context["median1h"])
     else:
         target = max(
@@ -1311,15 +1343,30 @@ def competitive_rate_for_period(layer, pool, period, signals, floor_rate):
     return ceil_rate_tick(max(floor_rate, target))
 
 
-def exploration_start_rate_for_period(layer, pool, period, signals, floor_rate, policy):
+def exploration_start_rate_for_period(
+    layer,
+    pool,
+    period,
+    signals,
+    floor_rate,
+    policy,
+    pricing_curve_version=EXACT_TERM_EXPLORATION_CURVE,
+):
     """Return a same-term starting rate that deliberately explores above the floor."""
 
     floor_rate = ceil_rate_tick(floor_rate)
-    landing = competitive_rate_for_period(layer, pool, period, signals, floor_rate)
-    if layer == "quick":
+    landing = competitive_rate_for_period(
+        layer,
+        pool,
+        period,
+        signals,
+        floor_rate,
+        pricing_curve_version,
+    )
+    if layer == "quick" and pricing_curve_version != EXACT_TERM_EXPLORATION_CURVE:
         return landing
     context = period_pricing_context(signals, pool, period, floor_rate)
-    if layer == "balanced":
+    if layer in {"quick", "balanced"}:
         premium = D(policy.balanced_start_premium_percent) / D("100")
         target = max(landing, floor_rate * (D("1") + premium), context["q75_24h"])
     else:
@@ -1351,14 +1398,13 @@ def _candidate_target_rate(item, signals, floor_rate, policy=None):
         target = competitive_rate_for_layer(item["layer"], signals, floor_rate)
         pricing = {"q75_24h": D(signals.get("windows", {}).get("24h", {}).get("q75") or 0)}
     start_guard = floor_rate
-    if item["layer"] == "balanced":
+    if item["layer"] in {"quick", "balanced"}:
         # A newly returned slice should first try a market-supported rate
         # before the ordinary age stages walk it down.  Keep this guard local
         # to new offers so existing balanced repricing retains its benchmark.
         start_guard = ceil_rate_tick(max(target, D(pricing.get("q75_24h") or 0)))
-    ladder_step = (item["slice_index"] % 5) if policy is not None and item["layer"] in {"balanced", "high"} else (
-        (item["slice_index"] % 5) - 2
-    )
+    uses_positive_ladder = policy is not None and item["layer"] in {"quick", "balanced", "high"}
+    ladder_step = (item["slice_index"] % 5) if uses_positive_ladder else (item["slice_index"] % 5) - 2
     target += RATE_TICK * D(ladder_step)
     return ceil_rate_tick(max(floor_rate, start_guard, target))
 
@@ -1585,6 +1631,58 @@ def build_strategy_plan_v3(
         if chosen["hidden"]:
             hidden_used += chosen["amount"]
         plan.append(chosen)
+    planned_amount = sum((row["amount"] for row in plan), D("0"))
+    absorbable_remainder = max(D("0"), available - planned_amount).quantize(SATOSHI, rounding=ROUND_DOWN)
+    absorbed_remainder = D("0")
+    remainder_absorption_pool = None
+    if plan and D("0") < absorbable_remainder < USD_ORDER_CHUNK:
+        planned_by_pool = {
+            pool: sum((D(row["amount"]) for row in plan if row["pool"] == pool), D("0"))
+            for pool in POOLS
+        }
+        target_by_pool = allocation.get("target_offer_amounts", {})
+        current_by_pool = allocation.get("current_offer_amounts", {})
+        pool_scores = allocation.get("eligible_pool_weights", {})
+
+        def safe_capacity(row):
+            capacity = absorbable_remainder
+            if row["offer_type"] == "FRRDELTAVAR":
+                capacity = min(capacity, max(D("0"), variable_limit - variable_used))
+            if row["hidden"]:
+                capacity = min(capacity, max(D("0"), hidden_limit - hidden_used))
+            return capacity.quantize(SATOSHI, rounding=ROUND_DOWN)
+
+        candidates = [(row, safe_capacity(row)) for row in plan]
+        full_capacity = [item for item in candidates if item[1] >= absorbable_remainder]
+        eligible = full_capacity or [item for item in candidates if item[1] > 0]
+        if eligible:
+            def absorption_rank(item):
+                row, capacity = item
+                pool = row["pool"]
+                remaining_deficit = max(
+                    D("0"),
+                    D(target_by_pool.get(pool, 0))
+                    - D(current_by_pool.get(pool, 0))
+                    - planned_by_pool[pool],
+                )
+                return (
+                    remaining_deficit > 0,
+                    min(remaining_deficit, capacity),
+                    D(pool_scores.get(pool, 0)),
+                    row["offer_type"] == "LIMIT" and not row["hidden"],
+                    -D(row["amount"]),
+                    -int(row["slice_index"]),
+                )
+
+            chosen_row, capacity = max(eligible, key=absorption_rank)
+            absorbed_remainder = min(absorbable_remainder, capacity)
+            chosen_row["amount"] = (D(chosen_row["amount"]) + absorbed_remainder).quantize(SATOSHI)
+            remainder_absorption_pool = chosen_row["pool"]
+            if chosen_row["offer_type"] == "FRRDELTAVAR":
+                variable_used += absorbed_remainder
+            if chosen_row["hidden"]:
+                hidden_used += absorbed_remainder
+
     new_variable_amount = max(D("0"), variable_used - max(D("0"), D(existing_exposure.get("variable", 0))))
     new_hidden_amount = max(D("0"), hidden_used - max(D("0"), D(existing_exposure.get("hidden", 0))))
     plan_hash = _plan_hash(strategy_version, total_principal, available, exposure_by_pool, existing_exposure, plan)
@@ -1607,6 +1705,8 @@ def build_strategy_plan_v3(
         "existing_exposure": account_exposure,
         "cap_remaining": cap_remaining,
         "cap_limited_available": available,
+        "absorbed_remainder": absorbed_remainder,
+        "remainder_absorption_pool": remainder_absorption_pool,
         "over_cap": account_exposure > hard_cap,
         "empty_reason": empty_reason,
         "rebalance_cancellations": [],
@@ -1628,6 +1728,8 @@ def build_strategy_plan_v3(
             "poolCapPercentages": response.get("pool_cap_percentages", {}),
             "primaryTermMaxShare": response.get("primary_term_max_share"),
             "termAllocations": response.get("term_allocations", {}),
+            "absorbedRemainder": response["absorbed_remainder"],
+            "remainderAbsorptionPool": response["remainder_absorption_pool"],
         }
     )
     return response

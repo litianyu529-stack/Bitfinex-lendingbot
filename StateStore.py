@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
 
@@ -26,8 +27,8 @@ AUTO_RECOVERABLE_PAUSE_REASONS = {
     "AMBIGUOUS_WALLET_TRANSFER",
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
-EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V3"
-CURRENT_RELEASE = "0.3.5.1"
+EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
+CURRENT_RELEASE = "0.3.5.2"
 CURRENT_RELEASE_LABEL = "V3.5"
 
 
@@ -564,7 +565,8 @@ class LendingStateStore:
         first_curve = connection.execute(
             """SELECT MIN(created_at_ms) AS first_ms FROM order_intents
                WHERE pricing_curve_version IN (
-                   'EXACT_TERM_EXPLORATION_V2', 'EXACT_TERM_EXPLORATION_V3'
+                   'EXACT_TERM_EXPLORATION_V2', 'EXACT_TERM_EXPLORATION_V3',
+                   'EXACT_TERM_EXPLORATION_V4'
                )"""
         ).fetchone()["first_ms"]
         source = "FIRST_V35_START"
@@ -1730,11 +1732,181 @@ class LendingStateStore:
             "evidenceAtMs": None if evidence is None else int(evidence),
         }
 
+    @staticmethod
+    def _funding_wait_records(connection, currency, since_ms, until_ms):
+        """Resolve waits using explicit offer/chain evidence, never slice similarity.
+
+        All reads run in the caller's snapshot. Histories are loaded in batches;
+        the number of queries does not grow with the number of fills.
+        """
+        trades = connection.execute(
+            """SELECT * FROM funding_trades
+               WHERE currency=? AND managed=1 AND mts>=? AND mts<? ORDER BY mts, trade_id""",
+            (currency, int(since_ms), int(until_ms)),
+        ).fetchall()
+        if not trades:
+            return []
+        intents = {row["id"]: dict(row) for row in connection.execute("SELECT * FROM order_intents")}
+        offer_intents = defaultdict(list)
+        for intent in intents.values():
+            if intent["exchange_offer_id"] is not None:
+                offer_intents[intent["exchange_offer_id"]].append(intent)
+        offer_times = defaultdict(set)
+        for table in ("offers", "offer_history"):
+            for row in connection.execute(f"SELECT offer_id, currency, period, mts_created FROM {table}"):
+                offer_times[row["offer_id"]].add((row["currency"], row["period"], row["mts_created"]))
+
+        chains = {row["chain_key"]: dict(row) for row in connection.execute("SELECT * FROM reprice_chains")}
+        members = {key: set() for key in chains}
+        invalid_chains = set()
+        for key, chain in chains.items():
+            for field in ("current_offer_id", "pending_source_offer_id"):
+                if chain[field] is not None:
+                    members[key].add(chain[field])
+            # This is an explicit original-intent ID in the stored chain key,
+            # not an inference from a reusable base_slice_key.
+            _, marker, root_id = key.rpartition("|intent:")
+            if marker:
+                root = intents.get(int(root_id)) if root_id.isdigit() else None
+                if root is None or root["exchange_offer_id"] is None:
+                    invalid_chains.add(key)
+                else:
+                    members[key].add(root["exchange_offer_id"])
+
+        unresolved_offers = set()
+        for event in connection.execute("SELECT offer_id, chain_key FROM reprice_events WHERE chain_key IS NOT NULL"):
+            if event["chain_key"] in chains and event["offer_id"] is not None:
+                members[event["chain_key"]].add(event["offer_id"])
+            elif event["offer_id"] is not None:
+                unresolved_offers.add(event["offer_id"])
+
+        merged_offers = {}
+        for event in connection.execute(
+            """SELECT offer_id, details_json, created_at_ms FROM ownership_events
+               WHERE event_type='DUST_CHAIN_BOUND'"""
+        ):
+            offer_id = event["offer_id"]
+            if offer_id is None:
+                continue
+            merged_offers[offer_id] = min(merged_offers.get(offer_id, event["created_at_ms"]), event["created_at_ms"])
+            try:
+                details = json.loads(event["details_json"])
+            except (TypeError, ValueError):
+                details = {}
+            if isinstance(details, dict) and details.get("chainKey") in members:
+                members[details["chainKey"]].add(offer_id)
+
+        for offer_id, rows in offer_intents.items():
+            for row in rows:
+                if ":dust-" in row["slice_key"]:
+                    merged_offers[offer_id] = min(
+                        merged_offers.get(offer_id, row["created_at_ms"]), row["created_at_ms"]
+                    )
+
+        # Copies created during strategy migration share exact offer IDs.
+        # Join these evidence components so conflicts and merged-fund ancestry
+        # survive later replacements, without selecting an arbitrary earliest date.
+        parents = {key: key for key in chains}
+
+        def root(key):
+            while parents[key] != key:
+                parents[key] = parents[parents[key]]
+                key = parents[key]
+            return key
+
+        offer_chains = defaultdict(set)
+        for key, ids in members.items():
+            for offer_id in ids:
+                offer_chains[offer_id].add(key)
+        for keys in offer_chains.values():
+            ordered = sorted(keys)
+            for key in ordered[1:]:
+                parents[root(key)] = root(ordered[0])
+        starts = defaultdict(set)
+        invalid_roots = set()
+        merged_at = {}
+        for key, chain in chains.items():
+            component = root(key)
+            starts[component].add(chain["started_at_ms"])
+            if key in invalid_chains:
+                invalid_roots.add(component)
+            for offer_id in members[key]:
+                if offer_id in merged_offers:
+                    cutoff = merged_offers[offer_id]
+                    merged_at[component] = min(merged_at.get(component, cutoff), cutoff)
+
+        result = []
+        for trade in trades:
+            offer_id, filled_at = trade["offer_id"], int(trade["mts"])
+            known_times = offer_times.get(offer_id, set())
+            timestamps = {item[2] for item in known_times}
+            linked = offer_intents.get(offer_id, [])
+            valid_offer = (
+                offer_id not in unresolved_offers
+                and len(linked) <= 1
+                and all(item["currency"] == currency and item["period"] == trade["period"] for item in linked)
+                and len(timestamps) <= 1
+                and all(item[0] == currency and item[1] == trade["period"] for item in known_times)
+                and all(t is not None and 0 < t <= filled_at for t in timestamps)
+            )
+            start = None
+            keys = offer_chains.get(offer_id)
+            if keys:
+                component = root(next(iter(keys)))
+                candidates = starts[component]
+                if (
+                    component not in invalid_roots
+                    and len(candidates) == 1
+                    and filled_at < merged_at.get(component, until_ms)
+                ):
+                    start = next(iter(candidates))
+            else:
+                # Fallback only for a proven original exchange offer. Replacements
+                # and consolidation intents cannot masquerade as fresh orders.
+                if len(linked) == 1 and len(timestamps) == 1 and offer_id not in merged_offers:
+                    intent = linked[0]
+                    if base_slice_key(intent["slice_key"]) == intent["slice_key"]:
+                        start = next(iter(timestamps))
+            if (
+                not valid_offer
+                or start is None
+                or start <= 0
+                or start > filled_at
+                or any(start > t for t in timestamps)
+            ):
+                start = None
+            amount = abs(D(trade["amount"]))
+            result.append({
+                **dict(trade),
+                "amount": amount,
+                "wait_seconds": None if start is None or amount <= 0 else D(filled_at - start) / D("1000"),
+            })
+        return result
+
+    @staticmethod
+    def _funding_wait_summary(records):
+        valid = [row for row in records if row["wait_seconds"] is not None]
+        total_amount = sum((row["amount"] for row in records), D("0"))
+        valid_amount = sum((row["amount"] for row in valid), D("0"))
+        average = (
+            sum((row["amount"] * row["wait_seconds"] for row in valid), D("0")) / valid_amount
+            if valid_amount > 0 else None
+        )
+        return {
+            "averageWaitSeconds": None if average is None else _decimal_text(average),
+            "waitValidCount": len(valid),
+            "waitMissingCount": len(records) - len(valid),
+            "waitCoveragePercent": (
+                _decimal_text(valid_amount / total_amount * D("100")) if total_amount > 0 else None
+            ),
+        }
+
     def period_activity(self, since_ms, currency="USD", until_ms=None):
         """Return recent robot submissions and managed fills grouped by term."""
 
         end = 9_223_372_036_854_775_807 if until_ms is None else int(until_ms)
         with self.read_connection() as connection:
+            connection.execute("BEGIN")
             submitted = connection.execute(
                 """SELECT period, COUNT(*) AS order_count,
                           COALESCE(SUM(CAST(amount AS REAL)), 0) AS amount,
@@ -1747,29 +1919,26 @@ class LendingStateStore:
                    GROUP BY period ORDER BY period""",
                 (str(currency).upper(), int(since_ms), end),
             ).fetchall()
-            traded = connection.execute(
-                """SELECT trades.period, COUNT(*) AS trade_count,
-                          COALESCE(SUM(ABS(CAST(trades.amount AS REAL))), 0) AS amount,
-                          COALESCE(
-                              SUM(ABS(CAST(trades.amount AS REAL)) * CAST(trades.rate AS REAL))
-                              / NULLIF(SUM(ABS(CAST(trades.amount AS REAL))), 0), 0
-                          ) AS weighted_rate,
-                          COALESCE(
-                              SUM(CASE WHEN intents.created_at_ms IS NOT NULL
-                                  THEN ABS(CAST(trades.amount AS REAL))
-                                       * MAX(0, trades.mts - intents.created_at_ms)
-                                  ELSE 0 END)
-                              / NULLIF(SUM(CASE WHEN intents.created_at_ms IS NOT NULL
-                                  THEN ABS(CAST(trades.amount AS REAL)) ELSE 0 END), 0)
-                              / 60000.0, 0
-                          ) AS weighted_wait_minutes
-                   FROM funding_trades AS trades
-                   LEFT JOIN order_intents AS intents ON intents.exchange_offer_id=trades.offer_id
-                   WHERE trades.currency=? AND trades.managed=1
-                     AND trades.mts>=? AND trades.mts<?
-                   GROUP BY trades.period ORDER BY trades.period""",
-                (str(currency).upper(), int(since_ms), end),
-            ).fetchall()
+            records = self._funding_wait_records(connection, str(currency).upper(), since_ms, end)
+        by_period = defaultdict(list)
+        for row in records:
+            by_period[int(row["period"])].append(row)
+        traded = []
+        for period, rows in sorted(by_period.items()):
+            amount = sum((row["amount"] for row in rows), D("0"))
+            summary = self._funding_wait_summary(rows)
+            seconds = summary.pop("averageWaitSeconds")
+            traded.append({
+                "period": period,
+                "count": len(rows),
+                "amount": amount,
+                "weightedDailyRate": (
+                    sum((row["amount"] * D(row["rate"]) for row in rows), D("0")) / amount
+                    if amount else D("0")
+                ),
+                "weightedWaitMinutes": None if seconds is None else D(seconds) / D("60"),
+                **summary,
+            })
         return {
             "fromMs": int(since_ms),
             "toMs": None if until_ms is None else end,
@@ -1782,16 +1951,7 @@ class LendingStateStore:
                 }
                 for row in submitted
             ],
-            "traded": [
-                {
-                    "period": int(row["period"]),
-                    "count": int(row["trade_count"]),
-                    "amount": D(str(row["amount"])),
-                    "weightedDailyRate": D(str(row["weighted_rate"])),
-                    "weightedWaitMinutes": D(str(row["weighted_wait_minutes"])),
-                }
-                for row in traded
-            ],
+            "traded": traded,
         }
 
     def release_comparison(self, now_ms=None, currency="USD"):
@@ -2271,7 +2431,13 @@ class LendingStateStore:
         return f"{strategy_version}|{base_slice_key(slice_key)}"
 
     @staticmethod
-    def _strategy_reprice_stage_count(connection, strategy_version, pool):
+    def _strategy_reprice_stage_count(
+        connection,
+        strategy_version,
+        pool,
+        layer=None,
+        pricing_curve_version=None,
+    ):
         row = connection.execute(
             "SELECT policy_json FROM strategy_versions WHERE version_id=?",
             (str(strategy_version),),
@@ -2280,8 +2446,21 @@ class LendingStateStore:
             return 6
         try:
             policy = json.loads(row["policy_json"])
-            stages = policy.get(f"{pool}_reprice_stages_minutes")
-            count = len(stages) if isinstance(stages, (list, tuple)) else 6
+            field = (
+                f"quick_{pool}_reprice_stages_minutes"
+                if layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE
+                else f"{pool}_reprice_stages_minutes"
+            )
+            stages = policy.get(field)
+            if stages is None and layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE:
+                # A pre-0.3.5.2 ACTIVE policy can create V4 orders after the
+                # application upgrade even though its raw JSON predates the
+                # quick-stage fields. Parsed runtime policy supplies the V4
+                # ten-stage defaults, so later strategy transitions must map
+                # that chain as ten stages too.
+                count = 10
+            else:
+                count = len(stages) if isinstance(stages, (list, tuple)) else 6
         except (TypeError, ValueError, json.JSONDecodeError):
             return 6
         return count if count in {6, 10} else 6
@@ -2357,11 +2536,15 @@ class LendingStateStore:
                         connection,
                         predecessor["strategy_version"],
                         predecessor["pool"],
+                        predecessor["layer"],
+                        predecessor["pricing_curve_version"],
                     )
                     new_stage_count = self._strategy_reprice_stage_count(
                         connection,
                         strategy_version,
                         predecessor["pool"],
+                        predecessor["layer"],
+                        predecessor["pricing_curve_version"],
                     )
                     mapped_stage = self._map_reprice_stage(
                         predecessor["current_stage"],
@@ -2613,6 +2796,49 @@ class LendingStateStore:
             result = connection.execute(
                 "SELECT * FROM reprice_chains WHERE chain_key=?",
                 (str(chain_key),),
+            ).fetchone()
+        return None if result is None else dict(result)
+
+    def bind_consolidation_replacement(self, source_offer_id, replacement_offer_id, now_ms=None):
+        """Move one active reprice chain to the first confirmed dust replacement.
+
+        Dust consolidation is an amount-only rewrite.  Unlike an ordinary
+        reprice it must not advance or reset any timing, stage, anchor, landing,
+        or cooldown fields.  The compare-and-set on ``current_offer_id`` makes
+        the operation restart-safe and guarantees that only the first
+        successful split replacement inherits the source chain.
+        """
+
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        source_offer_id = int(source_offer_id)
+        replacement_offer_id = int(replacement_offer_id)
+        with self.transaction(immediate=True) as connection:
+            already_bound = connection.execute(
+                """SELECT * FROM reprice_chains
+                   WHERE current_offer_id=? AND status='ACTIVE'
+                   ORDER BY updated_at_ms DESC LIMIT 1""",
+                (replacement_offer_id,),
+            ).fetchone()
+            if already_bound is not None:
+                return None
+            source = connection.execute(
+                """SELECT * FROM reprice_chains
+                   WHERE current_offer_id=? AND status='ACTIVE'
+                     AND pending_action IS NULL
+                   ORDER BY updated_at_ms DESC LIMIT 1""",
+                (source_offer_id,),
+            ).fetchone()
+            if source is None:
+                return None
+            connection.execute(
+                """UPDATE reprice_chains SET current_offer_id=?, updated_at_ms=?
+                   WHERE chain_key=? AND current_offer_id=?
+                     AND status='ACTIVE' AND pending_action IS NULL""",
+                (replacement_offer_id, now, source["chain_key"], source_offer_id),
+            )
+            result = connection.execute(
+                "SELECT * FROM reprice_chains WHERE chain_key=?",
+                (source["chain_key"],),
             ).fetchone()
         return None if result is None else dict(result)
 
@@ -3506,21 +3732,16 @@ class LendingStateStore:
         now = int(now_ms if now_ms is not None else self._now_ms())
         start = 0 if window_days is None else now - int(window_days) * 86_400_000
         with self.read_connection() as connection:
+            connection.execute("BEGIN")
             rows = connection.execute("SELECT * FROM account_samples WHERE mts >= ? ORDER BY mts", (start,)).fetchall()
             reprices = connection.execute(
                 "SELECT COUNT(*) AS count FROM reprice_events WHERE created_at_ms >= ?", (start,)
             ).fetchone()["count"]
-            waits = connection.execute(
-                """SELECT created_at_ms, updated_at_ms FROM order_intents
-                   WHERE state IN ('CONFIRMED', 'CLOSED') AND exchange_offer_id IS NOT NULL
-                   AND updated_at_ms >= ?""",
-                (start,),
-            ).fetchall()
+            waits = self._funding_wait_records(connection, "USD", start, now + 1)
             closures = connection.execute(
                 "SELECT * FROM credit_closures WHERE closed_at_ms >= ? ORDER BY closed_at_ms",
                 (start,),
             ).fetchall()
-        wait_ms = [max(0, row["updated_at_ms"] - row["created_at_ms"]) for row in waits]
         attributed = {}
         early = 0
         for row in closures:
@@ -3536,7 +3757,7 @@ class LendingStateStore:
             key = f"{pool}:{order_type}"
             attributed[key] = attributed.get(key, D("0")) + earned
         details = {
-            "averageWaitSeconds": _decimal_text(D(sum(wait_ms)) / D(len(wait_ms)) / D("1000")) if wait_ms else "0",
+            **self._funding_wait_summary(waits),
             "earlyReturnPercent": _decimal_text(D(early) / D(len(closures)) * D("100")) if closures else "0",
             "closedCreditCount": len(closures),
             "returnsByPoolAndType": {key: _decimal_text(value) for key, value in sorted(attributed.items())},

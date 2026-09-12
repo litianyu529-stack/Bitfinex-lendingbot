@@ -47,6 +47,18 @@ const state = {
     previousFocus: null,
 };
 
+function formatFundingWait(summary, field = "averageWaitSeconds", unitsPerMinute = 60) {
+    const raw = summary?.[field];
+    const minutes = raw == null || raw === "" ? NaN : Number(raw) / unitsPerMinute;
+    const value = Number.isFinite(minutes) && minutes >= 0 ? `${minutes.toFixed(1)} 分钟` : "—";
+    const coverageRaw = summary?.waitCoveragePercent;
+    const coverage = coverageRaw == null || coverageRaw === "" ? NaN : Number(coverageRaw);
+    const coverageText = Number.isFinite(coverage) ? `${coverage.toFixed(1)}%` : "—";
+    const valid = summary?.waitValidCount ?? "—";
+    const missing = summary?.waitMissingCount ?? "—";
+    return `首次挂单至成交平均等待：${value} · 按成交金额加权 · 金额覆盖率 ${coverageText} · 有效 ${valid} 笔 / 缺失 ${missing} 笔`;
+}
+
 function safeNumber(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : 0;
@@ -152,6 +164,7 @@ function normalizedOffer(offer) {
         managedByBot: offer.managedByBot ?? Boolean(offer.managed),
         bucket: offer.bucket || [offer.pool, offer.layer].filter(Boolean).join(" · "),
         created: offer.created || offer.mts_created,
+        elapsedMinutes: offerElapsedMinutes(offer),
     };
 }
 
@@ -291,22 +304,37 @@ function renderLegend(values, total) {
     }
 }
 
-function ageLabel(created) {
-    const milliseconds = Date.now() - safeNumber(created);
-    if (!created || milliseconds < 0) return "--";
-    const minutes = Math.floor(milliseconds / 60000);
+function durationSortValue(value) {
+    if (value == null || value === "") return Infinity;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : Infinity;
+}
+
+function offerElapsedMinutes(offer) {
+    const cumulative = durationSortValue(offer.repriceState?.elapsedMinutes);
+    if (Number.isFinite(cumulative)) return cumulative;
+    const created = Number(offer.created || offer.mts_created);
+    return Number.isFinite(created) && created > 0 && created <= Date.now()
+        ? (Date.now() - created) / 60000 : null;
+}
+
+function ageLabel(elapsedMinutes) {
+    if (!Number.isFinite(durationSortValue(elapsedMinutes))) return "--";
+    const minutes = Math.floor(Number(elapsedMinutes));
     if (minutes < 60) return `${minutes} 分钟`;
     const hours = Math.floor(minutes / 60);
-    return hours < 24 ? `${hours} 小时` : `${Math.floor(hours / 24)} 天`;
+    return hours < 24
+        ? `${hours} 小时 ${minutes % 60} 分钟`
+        : `${Math.floor(hours / 24)} 天 ${hours % 24} 小时 ${minutes % 60} 分钟`;
 }
 
 function repriceLabel(offer) {
-    const age = ageLabel(offer.created);
+    const age = ageLabel(offer.elapsedMinutes);
     const state = offer.repriceState;
     if (!state) return age;
     const floorState = state.floorState;
     const landingState = state.landingState;
-    const explorationCurve = ["EXACT_TERM_EXPLORATION_V2", "EXACT_TERM_EXPLORATION_V3"].includes(state.curveVersion);
+    const explorationCurve = ["EXACT_TERM_EXPLORATION_V2", "EXACT_TERM_EXPLORATION_V3", "EXACT_TERM_EXPLORATION_V4"].includes(state.curveVersion);
     const totalStages = Math.max(1, safeNumber(state.totalStages) || 6);
     const pricing = state.landingPolicy === "FIXED_AT_CREATION"
         ? `固定落点 ${formatPercent(safeNumber(state.landingRate) * 100, 5)} · 当前市场 ${formatPercent(safeNumber(state.currentMarketRate) * 100, 5)} · 底线 ${formatPercent(safeNumber(state.floorRate) * 100, 5)}`
@@ -351,7 +379,10 @@ function appendCell(row, text, className = "") {
 }
 
 function renderOffers() {
-    const offers = Array.isArray(state.status?.openOffers) ? state.status.openOffers.map(normalizedOffer) : [];
+    const offers = Array.isArray(state.status?.openOffers)
+        ? state.status.openOffers.map(normalizedOffer)
+            .sort((left, right) => durationSortValue(left.elapsedMinutes) - durationSortValue(right.elapsedMinutes))
+        : [];
     const snapshotAvailable = state.status?.snapshotAvailable !== false;
     const table = $("offersTable");
     const cards = $("offersCards");
@@ -386,7 +417,7 @@ function renderOffers() {
         status.textContent = offer.status || "ACTIVE";
         header.append(currency, status);
         const list = document.createElement("dl");
-        for (const [label, value] of [["金额", formatAmount(offer.amount)], ["日利率", formatPercent(offer.dailyRatePercent)], ["周期", `${offer.period || "--"} 天`], ["类型", offer.offerType || "LIMIT"], ["归属", offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单"], ["等待", repriceLabel(offer)]]) {
+        for (const [label, value] of [["金额", formatAmount(offer.amount)], ["日利率", formatPercent(offer.dailyRatePercent)], ["周期", `${offer.period || "--"} 天`], ["类型", offer.offerType || "LIMIT"], ["归属", offer.managedByBot ? `机器人 · ${offer.bucket || "--"}` : "外部挂单"], ["累计挂单时间", repriceLabel(offer)]]) {
             const block = document.createElement("div");
             const term = document.createElement("dt");
             const detail = document.createElement("dd");
@@ -556,7 +587,7 @@ function renderCredits(valid, stale, total) {
     for (const definition of creditGroupDefinitions) {
         const rows = credits
             .filter((credit) => credit.displayPool === definition.key)
-            .sort((left, right) => safeNumber(right.amount) - safeNumber(left.amount));
+            .sort((left, right) => durationSortValue(left.elapsedDays) - durationSortValue(right.elapsedDays));
         container.append(renderCreditGroup(definition, groups[definition.key] || {}, rows));
     }
     const empty = $("creditsEmpty");
@@ -601,6 +632,7 @@ function renderStatus() {
         : (statistics["30d"] ? formatAmount(statistics["30d"].netInterest) : "--");
     $("earningsLifetime").textContent = realized.lifetime != null ? formatAmount(realized.lifetime) : "--";
     $("earningsApy").textContent = statistics["30d"] ? formatPercent(statistics["30d"].actualNetAprPercent, 2) : "--";
+    $("fundingWaitSummary").textContent = `近30日 · ${formatFundingWait(statistics["30d"])}`;
     const earliestIncomeDate = incomeSync.earliestMts
         ? new Date(Number(incomeSync.earliestMts)).toLocaleDateString("zh-CN")
         : "尚无记录";

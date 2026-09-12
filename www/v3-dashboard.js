@@ -59,13 +59,16 @@
             details: true,
             fields: [
                 ["minimum_offer_minutes", "最短挂单时间", "number", "分钟", { min: 1 }],
-                ["balanced_start_premium_percent", "平衡层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
+                ["balanced_start_premium_percent", "快速/平衡层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
                 ["high_start_premium_percent", "高收益层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
-                ["balanced_landing_stage", "平衡层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
+                ["balanced_landing_stage", "快速/平衡层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
                 ["high_landing_stage", "高收益层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
-                ["short_reprice_stages_minutes", "短期降价阶段", "text", "分钟", { placeholder: "5 / 10 / 20 / 30 / 60 / 75 / 90 / 120 / 150 / 180" }],
-                ["medium_reprice_stages_minutes", "中期降价阶段", "text", "分钟", { placeholder: "10 / 20 / 40 / 60 / 120 / 150 / 180 / 240 / 300 / 360" }],
-                ["long_reprice_stages_minutes", "长期降价阶段", "text", "分钟", { placeholder: "30 / 60 / 120 / 180 / 360 / 480 / 720 / 960 / 1200 / 1440" }],
+                ["quick_short_reprice_stages_minutes", "快速层短期降价阶段", "text", "分钟", { placeholder: "5 / 10 / 15 / 20 / 30 / 40 / 50 / 60 / 75 / 90" }],
+                ["quick_medium_reprice_stages_minutes", "快速层中期降价阶段", "text", "分钟", { placeholder: "5 / 10 / 20 / 30 / 60 / 75 / 90 / 120 / 150 / 180" }],
+                ["quick_long_reprice_stages_minutes", "快速层长期降价阶段", "text", "分钟", { placeholder: "15 / 30 / 60 / 90 / 180 / 240 / 360 / 480 / 600 / 720" }],
+                ["short_reprice_stages_minutes", "平衡/高收益层短期降价阶段", "text", "分钟", { placeholder: "5 / 10 / 20 / 30 / 60 / 75 / 90 / 120 / 150 / 180" }],
+                ["medium_reprice_stages_minutes", "平衡/高收益层中期降价阶段", "text", "分钟", { placeholder: "10 / 20 / 40 / 60 / 120 / 150 / 180 / 240 / 300 / 360" }],
+                ["long_reprice_stages_minutes", "平衡/高收益层长期降价阶段", "text", "分钟", { placeholder: "30 / 60 / 120 / 180 / 360 / 480 / 720 / 960 / 1200 / 1440" }],
                 ["reprice_cooldown_minutes", "重定价冷却", "number", "分钟", { min: 1 }],
                 ["max_reprices_per_hour", "每小时重定价上限", "number", "次", { min: 0, max: 90 }],
                 ["minimum_rate_change", "显著利率变化", "number", "%/日", { min: 0, step: 0.0001 }],
@@ -88,6 +91,7 @@
     const listFields = new Set([
         "short_periods", "medium_periods", "long_periods",
         "short_reprice_stages_minutes", "medium_reprice_stages_minutes", "long_reprice_stages_minutes",
+        "quick_short_reprice_stages_minutes", "quick_medium_reprice_stages_minutes", "quick_long_reprice_stages_minutes",
     ]);
 
     function createField([name, label, type, unit, options]) {
@@ -279,15 +283,22 @@
                 throw new Error(`${name.startsWith("short") ? "短期" : name.startsWith("medium") ? "中期" : "长期"}天数必须是 ${minimum}–${maximum} 范围内、不重复的整数，用逗号分隔`);
             }
         }
-        for (const pool of ["short", "medium", "long"]) {
-            const name = `${pool}_reprice_stages_minutes`;
+        const stageFields = [
+            ["quick_short_reprice_stages_minutes", "快速层短期"],
+            ["quick_medium_reprice_stages_minutes", "快速层中期"],
+            ["quick_long_reprice_stages_minutes", "快速层长期"],
+            ["short_reprice_stages_minutes", "平衡/高收益层短期"],
+            ["medium_reprice_stages_minutes", "平衡/高收益层中期"],
+            ["long_reprice_stages_minutes", "平衡/高收益层长期"],
+        ];
+        for (const [name, label] of stageFields) {
             const stages = input(name).value.split(/[,/、\s]+/).filter(Boolean).map(Number);
             if (
                 stages.length !== 10
                 || stages.some((value) => !Number.isInteger(value) || value < 1 || value > 10080)
                 || stages.some((value, index) => index > 0 && stages[index - 1] >= value)
             ) {
-                throw new Error(`${pool === "short" ? "短期" : pool === "medium" ? "中期" : "长期"}降价阶段必须是十个递增的 1–10080 分钟整数`);
+                throw new Error(`${label}降价阶段必须是十个递增的 1–10080 分钟整数`);
             }
         }
         if (input("enable_hidden").checked && numberValue("hidden_max_share") <= 0) throw new Error("启用Hidden时必须设置最高占比");
@@ -362,6 +373,11 @@
         for (const [label, rows] of [["提交", activity?.submitted], ["成交", activity?.traded]]) {
             const line = document.createElement("p");
             line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} USD`).join("；") || "暂无"}`;
+            activityContainer.append(line);
+        }
+        for (const row of activity?.traded || []) {
+            const line = document.createElement("p");
+            line.textContent = `${row.period}天 · ${formatFundingWait(row, "weightedWaitMinutes", 1)}`;
             activityContainer.append(line);
         }
     }

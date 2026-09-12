@@ -139,6 +139,9 @@ V3_LIST_FIELDS = {
     "short_reprice_stages_minutes",
     "medium_reprice_stages_minutes",
     "long_reprice_stages_minutes",
+    "quick_short_reprice_stages_minutes",
+    "quick_medium_reprice_stages_minutes",
+    "quick_long_reprice_stages_minutes",
 }
 V3_PERIOD_FIELDS = {"short_periods", "medium_periods", "long_periods"}
 V3_FIXED_FIELDS = {"max_pool_shift", "adopt_external_offers"}

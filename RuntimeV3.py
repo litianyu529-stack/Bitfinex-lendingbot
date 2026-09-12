@@ -1,5 +1,6 @@
 import threading
 import time
+from decimal import ROUND_DOWN
 
 from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
 from DomainTypes import WriteOutcome, WriteResult
@@ -23,6 +24,7 @@ from StrategyV3 import (
     EXACT_TERM_EXPLORATION_CURVE,
     EXACT_TERM_EXPLORATION_CURVES,
     POOLS,
+    SATOSHI,
     StrategyPolicyV3,
     USD_ORDER_CHUNK,
     build_market_signals_v3,
@@ -1124,8 +1126,8 @@ class LendingRuntimeV3:
             if chain is None or pool not in POOLS or self.policy.floor_apr(pool) is None:
                 continue
             stage = int(chain.get("current_stage") or 0)
-            stages = self.policy.reprice_stages(pool)
             curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
+            stages = self.policy.reprice_stages(pool, layer, curve_version)
             exploration_curve = curve_version in EXACT_TERM_EXPLORATION_CURVES
             landing_stage = min(
                 len(stages),
@@ -1143,7 +1145,7 @@ class LendingRuntimeV3:
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
             benchmark = competitive_rate_for_period(
-                layer, pool, int(offer["period"]), signals, floor_rate
+                layer, pool, int(offer["period"]), signals, floor_rate, curve_version
             )
             fixed_landing = (
                 max(floor_rate, min(D(chain["origin_rate"]), D(chain["fixed_landing_rate"])))
@@ -1322,7 +1324,13 @@ class LendingRuntimeV3:
                 self.log.refreshStatus(f"V3.5 {runtime['mode']} 状态已同步。")
         return status
 
-    def _submit_plan(self, plan_result, wallet_available, strategy_version):
+    def _submit_plan(
+        self,
+        plan_result,
+        wallet_available,
+        strategy_version,
+        continuation_offer_id=None,
+    ):
         submitted = []
         remaining = D(wallet_available)
         now = int(self.clock() * 1000)
@@ -1345,7 +1353,9 @@ class LendingRuntimeV3:
                 "currency": "USD",
                 "slice_key": self.store.replenishment_slice_key(base_slice_key),
                 "strategy_version": strategy_version,
-                "pricing_curve_version": EXACT_TERM_EXPLORATION_CURVE,
+                "pricing_curve_version": submit_row.get("pricing_curve_version")
+                or EXACT_TERM_EXPLORATION_CURVE,
+                "fixed_landing_rate": submit_row.get("fixed_landing_rate"),
             }
             try:
                 created, intent = self.store.reserve_intent(order, remaining)
@@ -1372,7 +1382,44 @@ class LendingRuntimeV3:
                 if offer_id is None:
                     self.store.mark_ambiguous(intent["id"], "successful notification omitted offer id")
                     break
-                self.store.confirm_intent(intent["id"], offer_id)
+                intent = self.store.confirm_intent(intent["id"], offer_id)
+                if continuation_offer_id is not None:
+                    rebound = self.store.bind_consolidation_replacement(
+                        continuation_offer_id,
+                        offer_id,
+                    )
+                    if rebound is not None:
+                        self.store.record_ownership_event(
+                            "DUST_CHAIN_BOUND",
+                            offer_id=offer_id,
+                            details={
+                                "sourceOfferId": int(continuation_offer_id),
+                                "chainKey": rebound["chain_key"],
+                            },
+                        )
+                    elif self.store.reprice_chain_for_offer(offer_id) is None:
+                        sibling_chain = self.store.ensure_reprice_chain(
+                            {
+                                "offer_id": offer_id,
+                                "rate": intent["submitted_rate"],
+                                "rate_real": intent["effective_rate"],
+                                "pool": intent["pool"],
+                                "layer": intent["layer"],
+                                "mts_created": intent["updated_at_ms"],
+                            },
+                            strategy_version,
+                            intent["updated_at_ms"],
+                        )
+                        if sibling_chain is not None:
+                            self.store.record_ownership_event(
+                                "DUST_CHAIN_STARTED",
+                                offer_id=offer_id,
+                                details={
+                                    "sourceOfferId": int(continuation_offer_id),
+                                    "chainKey": sibling_chain["chain_key"],
+                                    "stage": 0,
+                                },
+                            )
                 remaining -= submit_row["amount"]
                 submitted.append({"intentId": intent["id"], "offerId": offer_id, **submit_row})
             elif result.outcome == WriteOutcome.UNKNOWN:
@@ -1393,11 +1440,42 @@ class LendingRuntimeV3:
                     break
         return submitted
 
-    def _submit_pending_reprices(self, wallet_available, strategy_version):
+    def _submit_pending_reprices(
+        self,
+        wallet_available,
+        strategy_version,
+        cap_limited_available=None,
+    ):
         """Restore canceled offers before new wallet cash is allocated."""
 
         submitted = []
         remaining = D(wallet_available)
+        pending_rows = self.store.pending_reprices(strategy_version)
+        replacement_principal = sum((D(row["source_amount"]) for row in pending_rows), D("0"))
+        cap_available = D(
+            wallet_available if cap_limited_available is None else cap_limited_available
+        )
+        replacement_surplus = min(
+            max(D("0"), remaining - replacement_principal),
+            max(D("0"), cap_available - replacement_principal),
+        ).quantize(SATOSHI, rounding=ROUND_DOWN)
+        absorption_chain = None
+        if D("0") < replacement_surplus < USD_ORDER_CHUNK:
+            absorption_chain = next(
+                (
+                    row["chain_key"]
+                    for row in pending_rows
+                    if str(
+                        row.get("source_display_type")
+                        or row.get("source_offer_type")
+                        or "LIMIT"
+                    ).upper()
+                    == "LIMIT"
+                    and str(row.get("source_offer_type") or "LIMIT").upper() == "LIMIT"
+                    and not (int(row.get("source_flags") or 0) & 64)
+                ),
+                None,
+            )
         now = int(self.clock() * 1000)
         recent_attempts = self.store.submission_attempt_count_since(
             now - FUNDING_SUBMISSION_WINDOW_MS,
@@ -1405,10 +1483,14 @@ class LendingRuntimeV3:
         )
         attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
         attempts = 0
-        for pending in self.store.pending_reprices(strategy_version):
+        for pending in pending_rows:
             if attempts >= attempt_budget:
                 break
             amount = D(pending["source_amount"])
+            absorbed_remainder = D("0")
+            if pending["chain_key"] == absorption_chain:
+                absorbed_remainder = replacement_surplus
+                amount += absorbed_remainder
             if amount > remaining:
                 break
             pool = str(pending["pool"])
@@ -1434,6 +1516,8 @@ class LendingRuntimeV3:
                     "target_rate": source_effective,
                     "gross_daily_floor": floor_rate,
                     "plan_hash": f"reprice:{pending['chain_key']}",
+                    "absorbed_remainder": absorbed_remainder,
+                    "remainder_absorption_pool": pool if absorbed_remainder > 0 else None,
                 },
                 pending,
             )
@@ -1538,13 +1622,19 @@ class LendingRuntimeV3:
 
         def reprice_priority(offer):
             pool = offer.get("pool") or pool_for_period(offer.get("period") or 0)
+            layer = offer.get("layer") or "balanced"
             chain = self.store.reprice_chain_for_offer(int(offer["offer_id"]))
             started_at = int(
                 (chain or {}).get("started_at_ms")
                 or offer.get("mts_created")
                 or now
             )
-            stages = self.policy.reprice_stages(pool) if pool in POOLS else (0,)
+            curve_version = str((chain or {}).get("pricing_curve_version") or "LEGACY")
+            stages = (
+                self.policy.reprice_stages(pool, layer, curve_version)
+                if pool in POOLS
+                else (0,)
+            )
             final_due_at = started_at + int(stages[-1]) * 60_000
             return (
                 0 if now >= final_due_at else 1,
@@ -1574,10 +1664,10 @@ class LendingRuntimeV3:
             hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
-            benchmark = competitive_rate_for_period(
-                layer, pool, int(offer["period"]), signals, floor_rate
-            )
             curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
+            benchmark = competitive_rate_for_period(
+                layer, pool, int(offer["period"]), signals, floor_rate, curve_version
+            )
             exploration_curve = curve_version in EXACT_TERM_EXPLORATION_CURVES
             if exploration_curve and chain.get("fixed_landing_rate") is None:
                 fixed_landing = max(
@@ -1622,7 +1712,7 @@ class LendingRuntimeV3:
                 desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, benchmark)))
             else:
                 current_stage = int(chain.get("current_stage") or 0)
-                stages = self.policy.reprice_stages(pool)
+                stages = self.policy.reprice_stages(pool, layer, curve_version)
                 if current_stage >= len(stages):
                     next_stage = len(stages)
                     desired_rate = floor_rate
@@ -1692,9 +1782,7 @@ class LendingRuntimeV3:
                 reason = f"age_stage_{stage}"
 
             desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, desired_rate)))
-            final_floor_priority = action == "AGE_STAGE" and int(stage or 0) >= len(
-                self.policy.reprice_stages(pool)
-            )
+            final_floor_priority = action == "AGE_STAGE" and int(stage or 0) >= len(stages)
             if (
                 not final_floor_priority
                 and self.store.reprice_count_since(now - 3_600_000) >= self.policy.max_reprices_per_hour
@@ -1858,7 +1946,7 @@ class LendingRuntimeV3:
         return canceled
 
     def _dust_consolidation(self, account, signals, now_ms, strategy_version):
-        """Merge wallet dust, preferring short, then medium, then long managed offers."""
+        """Merge wallet dust without changing the selected offer's strategy identity."""
 
         status = self.store.consolidation_status()
         state = status.get("state", "IDLE")
@@ -1881,6 +1969,42 @@ class LendingRuntimeV3:
                 self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
                 return {"blocking": True, "state": "SUBMITTING", "canceled": [], "submitted": []}
 
+            # A process may stop after exchange confirmation but before the
+            # source chain is rebound.  Replaying this compare-and-set is safe;
+            # only the first successful split replacement can inherit it.
+            for intent in sorted(related, key=lambda row: int(row["id"])):
+                replacement_id = intent.get("exchange_offer_id")
+                if replacement_id is None or intent["state"] not in {"CONFIRMED", "CLOSED"}:
+                    continue
+                rebound = self.store.bind_consolidation_replacement(
+                    status["offer_id"],
+                    replacement_id,
+                    now_ms,
+                )
+                if rebound is not None:
+                    self.store.record_ownership_event(
+                        "DUST_CHAIN_BOUND",
+                        offer_id=replacement_id,
+                        details={
+                            "sourceOfferId": int(status["offer_id"]),
+                            "chainKey": rebound["chain_key"],
+                            "recovered": True,
+                        },
+                    )
+                elif self.store.reprice_chain_for_offer(replacement_id) is None:
+                    self.store.ensure_reprice_chain(
+                        {
+                            "offer_id": replacement_id,
+                            "rate": intent["submitted_rate"],
+                            "rate_real": intent["effective_rate"],
+                            "pool": intent["pool"],
+                            "layer": intent["layer"],
+                            "mts_created": intent["updated_at_ms"],
+                        },
+                        strategy_version,
+                        intent["updated_at_ms"],
+                    )
+
             active_offer_ids = set(active_offers)
             invisible_confirmed = [
                 row
@@ -1896,51 +2020,87 @@ class LendingRuntimeV3:
                 D("0"),
             )
             expected_remaining = max(D("0"), expected - deployed)
-            if wallet >= expected_remaining + USD_ORDER_CHUNK:
+            if expected_remaining == 0:
                 self.store.clear_consolidation(now_ms)
-                return {"blocking": False, "state": "ABORTED_ACCOUNT_CHANGE", "canceled": [], "submitted": []}
-            if wallet < USD_ORDER_CHUNK:
+                return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
+            if wallet < expected_remaining or expected_remaining < USD_ORDER_CHUNK:
                 if deployed > 0 and expected_remaining < USD_ORDER_CHUNK:
                     self.store.clear_consolidation(now_ms)
                     return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
                 self.store.update_consolidation("READY", now_ms=now_ms)
                 return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
-            selection = (
-                (signals.get("periodSelection") or signals.get("period_selection") or {})
-                .get("byPool", {})
-                .get("short", {})
+
+            source_offer = next(
+                (
+                    row
+                    for row in self.store.offers()
+                    if int(row["offer_id"]) == int(status["offer_id"])
+                ),
+                None,
             )
-            period = int(selection.get("selectedPeriod") or status.get("target_period") or 2)
-            floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.short_floor_apr, self.policy.normal_fee_rate))
-            target_rate = competitive_rate_for_period(
-                "quick", "short", period, signals, floor_rate
-            )
-            slice_count = int(wallet // USD_ORDER_CHUNK)
-            amounts = evenly_distributed_amounts(wallet, slice_count)
+            if source_offer is None:
+                self.store.update_consolidation("AMBIGUOUS", "source offer metadata missing", now_ms)
+                self.store.enter_protected_pause(f"DUST_SOURCE_MISSING:{status['offer_id']}")
+                return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
+
+            source_chain = self.store.reprice_chain_for_offer(int(status["offer_id"]))
+            if source_chain is None:
+                for intent in sorted(related, key=lambda row: int(row["id"])):
+                    replacement_id = intent.get("exchange_offer_id")
+                    if replacement_id is None:
+                        continue
+                    source_chain = self.store.reprice_chain_for_offer(int(replacement_id))
+                    if source_chain is not None:
+                        break
+            if source_chain is None:
+                self.store.update_consolidation("AMBIGUOUS", "source reprice chain missing", now_ms)
+                self.store.enter_protected_pause(f"DUST_CHAIN_MISSING:{status['offer_id']}")
+                return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
+
+            pool = str(source_offer.get("pool") or pool_for_period(source_offer["period"]))
+            layer = str(source_offer.get("layer") or "balanced")
+            hidden = bool(int(source_offer.get("flags") or 0) & 64)
+            fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
+            floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
+            submitted_rate = D(source_offer["rate"])
+            effective_rate = D(source_offer.get("rate_real") or source_offer["rate"])
+            slice_count = int(expected_remaining // USD_ORDER_CHUNK)
+            amounts = evenly_distributed_amounts(expected_remaining, slice_count)
             slice_offset = len(related)
             dust_plan = {
                 "plan_hash": dust_hash,
                 "plan": [
                     {
                         "slice_index": slice_offset + index,
-                        "pool": "short",
-                        "layer": "quick",
+                        "pool": pool,
+                        "layer": layer,
                         "amount": amount,
-                        "period": period,
-                        "offer_type": "LIMIT",
-                        "display_type": "LIMIT",
-                        "flags": 0,
-                        "submitted_rate": target_rate,
-                        "effective_rate": target_rate,
-                        "target_rate": target_rate,
+                        "period": int(source_offer["period"]),
+                        "offer_type": str(source_offer.get("offer_type") or "LIMIT"),
+                        "display_type": str(
+                            source_offer.get("display_type")
+                            or source_offer.get("offer_type")
+                            or "LIMIT"
+                        ),
+                        "flags": int(source_offer.get("flags") or 0),
+                        "submitted_rate": submitted_rate,
+                        "effective_rate": effective_rate,
+                        "target_rate": effective_rate,
                         "gross_daily_floor": floor_rate,
                         "plan_hash": dust_hash,
+                        "pricing_curve_version": source_chain.get("pricing_curve_version"),
+                        "fixed_landing_rate": source_chain.get("fixed_landing_rate"),
                     }
                     for index, amount in enumerate(amounts)
                 ],
             }
             self.store.update_consolidation("SUBMITTING", now_ms=now_ms)
-            submitted = self._submit_plan(dust_plan, wallet, strategy_version)
+            submitted = self._submit_plan(
+                dust_plan,
+                expected_remaining,
+                strategy_version,
+                continuation_offer_id=status["offer_id"],
+            )
             related = [row for row in self.store.intents() if row.get("plan_hash") == dust_hash]
             if any(row["state"] == "AMBIGUOUS" for row in related):
                 self.store.update_consolidation("AMBIGUOUS", "unknown replacement submit", now_ms)
@@ -1961,25 +2121,24 @@ class LendingRuntimeV3:
             return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
         if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
             return {"blocking": False, "state": "RATE_LIMITED", "canceled": [], "submitted": []}
-        selection = (
-            (signals.get("periodSelection") or signals.get("period_selection") or {}).get("byPool", {}).get("short", {})
-        )
-        winner = selection.get("selectedPeriod")
-        if winner is None or selection.get("insufficientMarketData"):
-            return {"blocking": False, "state": "NO_WINNER", "canceled": [], "submitted": []}
-        last_family = self.store.last_reprice_for_family("short", "quick")
-        if last_family is not None and now_ms - int(last_family) < self.policy.reprice_cooldown_minutes * 60_000:
-            return {"blocking": False, "state": "COOLDOWN", "canceled": [], "submitted": []}
         candidates = []
         for offer in active_offers.values():
             display = str(offer.get("display_type") or offer.get("offer_type") or "LIMIT").upper()
             age = now_ms - int(offer.get("mts_created") or now_ms)
             amount = D(offer["amount"])
+            pool = str(offer.get("pool") or pool_for_period(offer["period"]))
+            layer = str(offer.get("layer") or "balanced")
+            last_family = self.store.last_reprice_for_family(pool, layer)
+            cooling_down = (
+                last_family is not None
+                and now_ms - int(last_family) < self.policy.reprice_cooldown_minutes * 60_000
+            )
             if (
                 offer.get("managed")
                 and display == "LIMIT"
                 and int(offer["offer_id"]) not in self._pending_cancel_requested
                 and not (self.store.reprice_chain_for_offer(int(offer["offer_id"])) or {}).get("pending_action")
+                and not cooling_down
                 and age >= self.policy.minimum_offer_minutes * 60_000
                 and amount + wallet >= USD_ORDER_CHUNK
             ):
@@ -1994,12 +2153,21 @@ class LendingRuntimeV3:
                     3,
                 ),
                 D(offer["amount"]),
-                int(offer["period"]) == int(winner),
                 int(offer.get("mts_created") or now_ms),
             ),
         )
         offer_id = int(candidate["offer_id"])
-        self.store.begin_consolidation(offer_id, wallet, candidate["amount"], winner, strategy_version, now_ms)
+        source_chain = self.store.ensure_reprice_chain(candidate, strategy_version, now_ms)
+        if source_chain is None or source_chain.get("pending_action"):
+            return {"blocking": False, "state": "NO_CHAIN", "canceled": [], "submitted": []}
+        self.store.begin_consolidation(
+            offer_id,
+            wallet,
+            candidate["amount"],
+            candidate["period"],
+            strategy_version,
+            now_ms,
+        )
         result = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
         if result.outcome == WriteOutcome.UNKNOWN:
             self.store.update_consolidation("AMBIGUOUS", result.error, now_ms)
@@ -2023,7 +2191,14 @@ class LendingRuntimeV3:
         self.store.record_ownership_event(
             "CANCEL_CONFIRMED",
             offer_id=offer_id,
-            details={"reason": "dust_consolidation", "wallet": format(wallet, "f")},
+            details={
+                "reason": "dust_consolidation",
+                "wallet": format(wallet, "f"),
+                "pool": source_chain["pool"],
+                "layer": source_chain["layer"],
+                "period": int(candidate["period"]),
+                "chainKey": source_chain["chain_key"],
+            },
         )
         self.store.update_consolidation("CANCELLING", now_ms=now_ms)
         self._pending_cancel_requested.add(offer_id)
@@ -2273,7 +2448,9 @@ class LendingRuntimeV3:
                         result["submitted"] = []
                     else:
                         replacement_submitted, new_cash_available = self._submit_pending_reprices(
-                            account["wallet"], version
+                            account["wallet"],
+                            version,
+                            result.get("cap_limited_available"),
                         )
                         result["submitted"] = replacement_submitted + self._submit_plan(
                             result, new_cash_available, version

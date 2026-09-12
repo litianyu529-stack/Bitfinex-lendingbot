@@ -1,4 +1,4 @@
-# Bitfinex-lendingbot 0.3.5.1 / V3.5
+# Bitfinex-lendingbot 0.3.5.2 / V3.5
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
@@ -36,7 +36,7 @@ V3.2 的无人值守恢复边界、退避、双快照确认和 Worker 心跳守�
 
 V3.3 的全市场需求分配、150 USD 低需求池保留、小额余额合并复投与外部挂单接管见 [V3.3 策略说明](docs/v3.3-demand-allocation.md)。
 
-V3.5 合并了无人值守安全恢复与精确期限定价升级；固定市场落点、单向阶段调价和最终底线规则见 [V3.5 发布说明](docs/v3.5-release.md)。
+V3.5 合并了无人值守安全恢复与精确期限定价升级；0.3.5.2 起，快速层与平衡层共享同期限起价和固定市场落点，但使用独立的约两倍速调价时间表。固定市场落点、单向阶段调价和最终底线规则见 [V3.5 发布说明](docs/v3.5-release.md)。
 
 状态库会从首笔精确期限探索订单向前关联其所在 LIVE 会话，以该会话启动时间作为 V3.5 数据分界；没有旧数据的新安装使用首次 V3.5 启动时间。状态接口提供更新前后等长窗口的挂单数、成交数、金额、加权日利率和加权等待时间，普通重启不会重置分界。
 
@@ -110,7 +110,7 @@ python -m pip install -r requirements-dev.txt
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.5.1`
+- 应用/User-Agent：`0.3.5.2`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`
