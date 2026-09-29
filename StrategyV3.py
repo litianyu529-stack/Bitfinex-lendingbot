@@ -1115,6 +1115,25 @@ def allocate_slices_v3(
     }
     pool_counts = _capped_weighted_counts(target_count, POOLS, pool_additions, pool_maximum_counts)
     pool_plan_amounts = {pool: D(pool_counts[pool]) * USD_ORDER_CHUNK for pool in POOLS}
+    fragmented_pool = None
+    if not any(pool_counts.values()):
+        # Cash can exceed the minimum while every pool deficit is below it.
+        # Permit one order within the existing 150 USD allocation tolerance.
+        receivers = [
+            pool for pool in active_pools
+            if pool_additions[pool] > 0
+            and pool_allocation[pool]["additionalQualified"]
+            and not pool_allocation[pool]["lowDemandConfirmed"]
+        ]
+        if receivers:
+            fragmented_pool = max(
+                receivers,
+                key=lambda pool: (pool_additions[pool], pool_allocation[pool]["compositeScore"]),
+            )
+            pool_counts[fragmented_pool] = 1
+            pool_plan_amounts[fragmented_pool] = min(
+                target_deployable, pool_additions[fragmented_pool] + USD_ORDER_CHUNK
+            ).quantize(SATOSHI, rounding=ROUND_DOWN)
     unassigned = target_deployable - sum(pool_plan_amounts.values(), D("0"))
     while unassigned > SATOSHI:
         rooms = {
@@ -1202,6 +1221,7 @@ def allocate_slices_v3(
             "layer": layer_sequence[index] if index < len(layer_sequence) else "balanced",
             "amount": order_amounts[index],
             "period": period,
+            "fragmented_pool_fallback": pool == fragmented_pool,
             "minimum_floor_order": bool(
                 pool_allocation[pool]["minimumApplied"] and offer_exposure[pool] < USD_ORDER_CHUNK
             ),
@@ -1646,6 +1666,11 @@ def build_strategy_plan_v3(
 
         def safe_capacity(row):
             capacity = absorbable_remainder
+            if row.get("fragmented_pool_fallback"):
+                capacity = min(capacity, max(
+                    D("0"), D(target_by_pool[row["pool"]]) + USD_ORDER_CHUNK
+                    - D(current_by_pool[row["pool"]]) - planned_by_pool[row["pool"]]
+                ))
             if row["offer_type"] == "FRRDELTAVAR":
                 capacity = min(capacity, max(D("0"), variable_limit - variable_used))
             if row["hidden"]:

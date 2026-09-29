@@ -302,7 +302,7 @@ def test_small_balance_respects_minimum_and_pool_caps(available, expected_count,
         assert result["empty_reason"] in {"BELOW_MINIMUM", "CONCENTRATION_CAP_OR_MINIMUM"}
 
 
-def test_small_live_balance_stays_idle_when_no_safe_pool_slice_fits():
+def test_fragmented_pool_deficits_use_one_order_within_allocation_tolerance():
     available = D("240.12179174")
     result = build_strategy_plan_v3(
         D("13169.46811969"),
@@ -319,8 +319,33 @@ def test_small_live_balance_stays_idle_when_no_safe_pool_slice_fits():
         },
     )
 
-    assert result["plan"] == []
-    assert result["idle_amount"] == available
+    assert len(result["plan"]) == 1
+    row = result["plan"][0]
+    assert row["amount"] >= D("150")
+    assert result["planned_amount"] + result["idle_amount"] == available
+    pool = row["pool"]
+    assert result["current_offer_amounts"][pool] + row["amount"] <= result["target_offer_amounts"][pool] + D("150")
+
+
+@pytest.mark.parametrize("cap", [None, D("13600")])
+def test_166_wallet_fragmentation_regression(monkeypatch, cap):
+    monkeypatch.setattr("StrategyV3._pool_targets_v33", lambda *_args: (
+        {"short": D("287.72823020"), "medium": D("180.74051923"), "long": D("150")},
+        ("short", "medium", "long"),
+    ))
+    result = build_strategy_plan_v3(
+        D("13778.90784513"), D("166.00781590"), {},
+        limit_policy(max_lend_amount=cap), signals(), "fragmented-166",
+        existing_exposure={"total": D("13612.90002923")},
+        offer_exposure_by_pool={"short": D("150"), "medium": D("152.46093353"), "long": D("150")},
+    )
+    if cap is None:
+        assert len(result["plan"]) == 1
+        assert result["plan"][0]["pool"] == "short"
+        assert result["planned_amount"] == D("166.00781590")
+        assert result["idle_amount"] == 0
+    else:
+        assert result["plan"] == []
 
 
 def test_small_balance_uses_largest_eligible_deficit_instead_of_pool_order():
