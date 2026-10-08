@@ -157,7 +157,7 @@ class V4DashboardService:
         for currency in selected:
             try:
                 if currency not in settings.enabled_currencies:
-                    raise ConfigError(f"{currency} is disabled; enable it in the currency settings")
+                    raise ConfigError(f"{currency} 尚未启用，请在该币种总览中勾选启用放贷，等待保存成功后重新预检。")
                 with funding_sizing(gate.minimum(currency)):
                     profiles[currency] = app.evaluate_live_preflight(
                         self.config_path,
@@ -167,7 +167,7 @@ class V4DashboardService:
                     )
             except Exception as exc:
                 profiles[currency] = {
-                    "checks": [{"id": "config", "label": currency, "status": "fail", "detail": str(exc)}],
+                    "checks": [{"id": "config", "label": "币种启用与配置", "status": "fail", "detail": str(exc)}],
                     "warnings": [],
                     "summary": {"strategyVersion": 4},
                 }

@@ -36,7 +36,8 @@ window.mikaBuildReady = (async () => {
     }
 })();
 
-const $ = (id) => document.getElementById(id);
+window.createCurrencyOverview = function(root, currency, context) {
+const $ = (id) => root.querySelector(`[data-ref="${id}"]`) || document.getElementById(id);
 const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
 const state = {
     config: null,
@@ -45,6 +46,8 @@ const state = {
     preflight: null,
     activeDialog: null,
     previousFocus: null,
+    preflightSequence: 0,
+    settingsRevision: -1,
 };
 
 function formatFundingWait(summary, field = "averageWaitSeconds", unitsPerMinute = 60) {
@@ -80,12 +83,12 @@ function apiError(response, data) {
 }
 
 async function getJson(url) {
-    const response = await window.mikaV4.request(url, { cache: "no-store" });
+    const response = await window.mikaV4.request(currency, url, { cache: "no-store" });
     return apiError(response, await response.json());
 }
 
 async function postJson(url, payload = {}) {
-    const response = await window.mikaV4.request(url, {
+    const response = await window.mikaV4.request(currency, url, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Mika-CSRF": dashboardCsrf },
         body: JSON.stringify(payload),
@@ -106,39 +109,6 @@ function showToast(message) {
     toast.classList.add("visible");
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
-}
-
-function activeRoute() {
-    const route = (location.hash || "#overview").slice(1);
-    return ["overview", "strategy", "logs"].includes(route) ? route : "overview";
-}
-
-function renderRoute() {
-    const route = activeRoute();
-    for (const name of ["overview", "strategy", "logs"]) {
-        const tab = $(`${name}Tab`);
-        const panel = $(`${name}Panel`);
-        const selected = name === route;
-        tab.setAttribute("aria-selected", String(selected));
-        tab.tabIndex = selected ? 0 : -1;
-        panel.hidden = !selected;
-    }
-    if (route === "overview") window.requestAnimationFrame(drawDistribution);
-}
-
-function navigateTabs(event) {
-    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-    const tabs = [...document.querySelectorAll('.tabs [role="tab"]')];
-    const current = tabs.indexOf(document.activeElement);
-    if (current < 0) return;
-    event.preventDefault();
-    let target = current;
-    if (event.key === 'Home') target = 0;
-    else if (event.key === 'End') target = tabs.length - 1;
-    else if (event.key === 'ArrowLeft') target = (current - 1 + tabs.length) % tabs.length;
-    else target = (current + 1) % tabs.length;
-    tabs[target].focus();
-    tabs[target].click();
 }
 
 function statusMode(status = state.status || {}) {
@@ -341,7 +311,7 @@ function repriceLabel(offer) {
         : "";
     const describe = (message) => pricing ? `${message} · ${pricing}` : message;
     if (state.repriceBlockedReason === "BELOW_REPOST_MINIMUM") {
-        return describe(`${age} · 剩余金额低于 150 ${window.mikaV4.currency}，无法安全撤单重挂`);
+        return describe(`${age} · 剩余金额低于 150 ${currency}，无法安全撤单重挂`);
     }
     if (floorState === "REPRICE_PENDING") return describe(`${age} · 正在重挂到策略底线`);
     if (floorState === "REPRICE_REQUIRED") return describe(`${age} · 已到第 ${totalStages} 阶段 · 等待重挂到底线`);
@@ -464,7 +434,7 @@ function renderCreditGroup(definition, summary, credits) {
     const titleText = document.createElement("strong");
     const titleMeta = document.createElement("small");
     titleText.textContent = `${definition.label}贷出`;
-    titleMeta.textContent = `${definition.range} · ${summary.orderCount || 0} 笔 · ${formatAmount(summary.principal)} ${window.mikaV4.currency}`;
+    titleMeta.textContent = `${definition.range} · ${summary.orderCount || 0} 笔 · ${formatAmount(summary.principal)} ${currency}`;
     title.append(titleText, titleMeta);
     heading.append(title);
     appendCreditGroupStat(heading, "加权平均日利率", formatPercent(summary.averageDailyRatePercent, 5));
@@ -496,7 +466,7 @@ function renderCreditGroup(definition, summary, credits) {
     const body = document.createElement("tbody");
     for (const credit of credits) {
         const row = document.createElement("tr");
-        appendCell(row, `${formatAmount(credit.amount)} ${credit.currency || "USD"}`);
+        appendCell(row, `${formatAmount(credit.amount)} ${credit.currency || currency}`);
         appendCell(row, formatPercent(credit.dailyRatePercent, 5));
         appendCell(row, formatPercent(credit.netAprPercent, 2));
         appendCell(row, `${credit.period || "--"} 天`);
@@ -520,7 +490,7 @@ function renderCreditGroup(definition, summary, credits) {
         const cardHeader = document.createElement("header");
         const amount = document.createElement("strong");
         const status = document.createElement("span");
-        amount.textContent = `${formatAmount(credit.amount)} ${credit.currency || "USD"}`;
+        amount.textContent = `${formatAmount(credit.amount)} ${credit.currency || currency}`;
         status.className = "status-pill";
         status.textContent = credit.status || "ACTIVE";
         cardHeader.append(amount, status);
@@ -558,7 +528,7 @@ function renderCredits(valid, stale, total) {
         ? formatPercent(overall.utilizationPercent, 1)
         : "--";
     $("creditIdleAmount").textContent = valid && snapshotAvailable
-        ? `未计息资金 ${formatAmount(Math.max(0, total - principal))} ${window.mikaV4.currency}`
+        ? `未计息资金 ${formatAmount(Math.max(0, total - principal))} ${currency}`
         : "未计息资金 --";
     $("creditAverageRate").textContent = valid && snapshotAvailable
         ? formatPercent(overall.averageDailyRatePercent, 5)
@@ -573,7 +543,7 @@ function renderCredits(valid, stale, total) {
         ? `平均已贷 ${formatDays(overall.averageElapsedDays)}`
         : "平均已贷 --";
     $("creditDailyIncome").textContent = valid && snapshotAvailable
-        ? `${formatAmount(overall.estimatedNetIncomePerDay, 4)} ${window.mikaV4.currency}`
+        ? `${formatAmount(overall.estimatedNetIncomePerDay, 4)} ${currency}`
         : "--";
     $("currentLendingRate").textContent = valid && snapshotAvailable
         ? formatPercent(overall.averageDailyRatePercent, 5)
@@ -612,17 +582,16 @@ function renderStatus() {
     const statistics = valid ? status.statistics || {} : {};
     const realized = valid ? status.realizedIncome || {} : {};
     const incomeSync = valid ? status.incomeHistorySync || {} : {};
-    const currency = status.strategyV3?.currency || status.outputCurrency?.currency || window.mikaV4.currency;
 
     $("totalCoins").textContent = accountValid ? formatAmount(total) : "--";
     $("totalLent").textContent = accountValid ? formatAmount(lent) : "--";
     $("totalOffers").textContent = accountValid ? formatAmount(offers) : "--";
     $("totalAvailable").textContent = accountValid ? formatAmount(available) : "--";
     $("totalCoins").title = accountValid
-        ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} ${window.mikaV4.currency}；组成项对账 ${account.reconciliationStatus || "--"}`
+        ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} ${currency}；组成项对账 ${account.reconciliationStatus || "--"}`
         : "";
     $("totalLent").title = accountValid
-        ? `Funding Credits ${formatAmount(account.creditPrincipal)} ${window.mikaV4.currency} + Funding Loans ${formatAmount(account.loanPrincipal)} ${window.mikaV4.currency}`
+        ? `Funding Credits ${formatAmount(account.creditPrincipal)} ${currency} + Funding Loans ${formatAmount(account.loanPrincipal)} ${currency}`
         : "";
     $("earningsToday").textContent = realized.today != null
         ? formatAmount(realized.today)
@@ -638,13 +607,13 @@ function renderStatus() {
         : "尚无记录";
     const incomeState = $("incomeHistoryState");
     if (incomeSync.status === "COMPLETE") {
-        incomeState.textContent = `${window.mikaV4.currency} · 全部历史真实入账`;
+        incomeState.textContent = `${currency} · 全部历史真实入账`;
         incomeState.title = earliestIncomeDate === "尚无记录" ? "未发现利息入账" : `已覆盖至 ${earliestIncomeDate}`;
     } else if (incomeSync.status === "ERROR") {
-        incomeState.textContent = `${window.mikaV4.currency} · 同步警告 · 已保留结果`;
+        incomeState.textContent = `${currency} · 同步警告 · 已保留结果`;
         incomeState.title = incomeSync.error || "历史收益将在后台自动重试";
     } else {
-        incomeState.textContent = `${window.mikaV4.currency} · 同步中 · 已覆盖至 ${earliestIncomeDate}`;
+        incomeState.textContent = `${currency} · 同步中 · 已覆盖至 ${earliestIncomeDate}`;
         incomeState.title = "正在后台向更早历史回填，不影响实盘交易";
     }
     incomeState.classList.toggle("income-warning", incomeSync.status === "ERROR");
@@ -711,34 +680,14 @@ function renderStatus() {
     renderLegend(values, total);
     renderCredits(valid, stale, total);
     renderOffers();
-    renderLogs(status.log || []);
+    window.mikaV4.receiveLogs(currency, status.log || []);
     drawDistribution();
-}
-
-function renderLogs(lines) {
-    const filter = ($("logFilter").value || "").trim().toLowerCase();
-    const visible = (Array.isArray(lines) ? lines : []).filter((line) => String(line).toLowerCase().includes(filter));
-    const stream = $("logStream");
-    stream.replaceChildren();
-    if (!visible.length) {
-        const empty = document.createElement("p");
-        empty.className = "log-empty";
-        empty.textContent = filter ? "没有匹配的日志" : "暂无运行日志";
-        stream.append(empty);
-        return;
-    }
-    for (const line of visible) {
-        const item = document.createElement("div");
-        item.className = "log-line";
-        item.textContent = String(line);
-        stream.append(item);
-    }
 }
 
 function renderControl() {
     const control = state.control || {};
     const running = Boolean(control.running);
-    const rail = document.querySelector(".control-rail");
+    const rail = root.querySelector(".control-rail");
     rail.classList.toggle("running", running);
     const mode = statusMode();
     const stale = state.status?.last_update ? statusIsStale() : false;
@@ -755,12 +704,14 @@ function renderControl() {
             ? `${recovery.manualRequired ? "自动写入保持关闭。" : "正在只读同步，恢复后将在下一正常周期继续放贷。"} 已尝试 ${Number(recovery.attempts || 0)} 次。`
             : `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
         : "普通启动不会下单。启动实盘前必须完成只读安全预检。";
-    $("primaryControlButton").textContent = running ? "停止机器人" : "启动实盘";
+    $("primaryControlButton").textContent = running ? `暂停 ${currency}` : `启动 ${currency}`;
+    $("primaryControlButton").disabled = !running && !context.settings.ready;
     $("credentialState").textContent = state.config?.credentialsConfigured ? "已配置" : "未配置";
     $("permissionState").textContent = running
         ? "启动前已通过"
         : (state.preflight ? (state.preflight.canStart ? "预检通过" : "存在阻断项") : "待预检");
-    $("preflightButton").disabled = running;
+    $("preflightButton").textContent = `${currency} 实盘预检`;
+    $("preflightButton").disabled = running || !context.settings.ready;
 }
 
 function renderConfig() {
@@ -768,12 +719,15 @@ function renderConfig() {
 }
 
 async function loadConfig() {
-    state.config = await getJson("/api/config");
+    await context.settings.refresh();
+    state.config = context.settings.confirmed;
     renderConfig();
 }
 
 async function loadStatus() {
     state.status = await getJson("/api/status");
+    context.runtime = state.status;
+    context.renderSettings();
     renderStatus();
 }
 
@@ -801,8 +755,11 @@ function focusableElements(dialog) {
 
 function openDialog(backdropId) {
     const backdrop = $(backdropId);
+    if (window.mikaV4.dialogOwner && window.mikaV4.dialogOwner !== controller) window.mikaV4.dialogOwner.closeDialog();
+    window.mikaV4.dialogOwner = controller;
     state.previousFocus = document.activeElement;
     state.activeDialog = backdrop;
+    state.preflightSequence += 1;
     backdrop.hidden = false;
     document.body.style.overflow = "hidden";
     window.requestAnimationFrame(() => focusableElements(backdrop)[0]?.focus());
@@ -812,6 +769,8 @@ function closeDialog(backdrop = state.activeDialog) {
     if (!backdrop) return;
     backdrop.hidden = true;
     state.activeDialog = null;
+    state.preflightSequence += 1;
+    if (window.mikaV4.dialogOwner === controller) window.mikaV4.dialogOwner = null;
     document.body.style.overflow = "";
     state.previousFocus?.focus();
 }
@@ -839,6 +798,7 @@ function allocationPercentages(allocation) {
     return entries.map(([name, value]) => `${name} ${formatAmount(value / total * 100, 1)}%`).join(" / ");
 }
 
+function preflightAmount(value) { return value == null || value === "" ? "—" : formatAmount(value); }
 function renderPreflight(data) {
     $("preflightLoading").hidden = true;
     $("preflightContent").hidden = false;
@@ -872,32 +832,32 @@ function renderPreflight(data) {
         throw new Error("后端返回了非 V3 预检，已阻断启动");
     }
     const items = [
-        ["币种", summary.currency || window.mikaV4.currency],
+        ["币种", summary.currency || currency],
         ["策略来源", `SQLite ACTIVE · ${summary.activeStrategyVersion || "--"}`],
-        ["真实账户本金", `${formatAmount(summary.account?.total)} ${window.mikaV4.currency}`],
-        ["真实可用余额", `${formatAmount(summary.account?.wallet)} ${window.mikaV4.currency}`],
+        ["真实账户本金", `${preflightAmount(summary.account?.total)} ${currency}`],
+        ["真实可用余额", `${preflightAmount(summary.account?.wallet)} ${currency}`],
         ["允许订单类型", (summary.enabledOrderTypes || []).join(" / ") || "--"],
         ["目标期限资金池", Object.entries(summary.fundingPools || {}).map(([name, row]) => `${name} ${row.share}%`).join(" / ") || "--"],
         ["当前机器人挂单期限", allocationPercentages(summary.offerPoolAllocation)],
         ["目标成交层", Object.entries(summary.executionLayers || {}).map(([name, value]) => `${name} ${value}%`).join(" / ") || "--"],
         ["当前机器人挂单成交层", allocationPercentages(summary.offerLayerAllocation)],
-        ["资金上限", `${formatAmount(summary.fundingLimit?.effectiveCap)} ${window.mikaV4.currency} · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
+        ["资金上限", `${preflightAmount(summary.fundingLimit?.effectiveCap)} ${currency} · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
         ["切片", `${summary.actualSlices ?? 0} / ${summary.targetSlices ?? 0} 笔`],
         ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
         ["启动后先撤销", `${(summary.pendingCancellations || []).length} 笔不兼容机器人挂单`],
         ["确认后接管外部挂单", `${(summary.externalAdoptionCandidates || []).length} 笔`],
         ["比例再平衡预计撤销", `${(summary.ratioRebalanceCancellations || []).length} 笔`],
         ["无法撤销的贷款", `${(summary.nonChangeableCredits || []).length} 笔`],
-        ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
+        ["账户快照", !summary.account ? "未读取" : summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
-    const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} ${window.mikaV4.currency}`);
+    const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} ${currency}`);
     items.push(["实际 V4 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
-        (row) => `#${row.id} · ${formatAmount(row.amount)} ${window.mikaV4.currency} · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
+        (row) => `#${row.id} · ${formatAmount(row.amount)} ${currency} · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );
     if (adoptionRows.length) items.push(["待接管外部挂单明细", adoptionRows.join("；")]);
     const ratioRows = (summary.ratioRebalanceCancellations || []).map(
-        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} ${window.mikaV4.currency} · ${row.period}天`
+        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} ${currency} · ${row.period}天`
     );
     if (ratioRows.length) items.push(["比例再平衡撤单明细", ratioRows.join("；")]);
     if (data.preflightId) {
@@ -924,7 +884,8 @@ function renderPreflight(data) {
 }
 
 async function runPreflight() {
-    if (state.control?.running) return;
+    if (state.control?.running || !context.settings.ready) return;
+    $("preflightTitle").textContent = `${currency} · 启动实盘前确认`;
     state.preflight = null;
     $("preflightError").hidden = true;
     $("preflightError").textContent = "";
@@ -933,11 +894,14 @@ async function runPreflight() {
     $("confirmStartButton").disabled = true;
     $("goStrategyButton").hidden = true;
     openDialog("preflightDialog");
+    const sequence = ++state.preflightSequence;
     try {
         const data = await postJson("/api/control/preflight", {});
+        if (window.mikaV4.dialogOwner !== controller || !state.activeDialog || sequence !== state.preflightSequence) return;
         state.preflight = data;
         renderPreflight(data);
     } catch (error) {
+        if (window.mikaV4.dialogOwner !== controller || sequence !== state.preflightSequence) return;
         $("preflightLoading").hidden = true;
         $("preflightError").hidden = false;
         $("preflightError").textContent = error.message;
@@ -947,16 +911,20 @@ async function runPreflight() {
 async function confirmStart() {
     const button = $("confirmStartButton");
     const errorBox = $("preflightError");
+    if (!context.settings.ready || !state.preflight?.canStart || window.mikaV4.dialogOwner !== controller) return;
     button.disabled = true;
     errorBox.hidden = true;
+    const sequence = state.preflightSequence;
     try {
         const data = await postJson("/api/control/start", { preflightId: state.preflight?.preflightId || "" });
         state.control = data.bot;
-        closeDialog($("preflightDialog"));
+        state.preflight = null;
+        if (window.mikaV4.dialogOwner === controller && sequence === state.preflightSequence) closeDialog();
         renderControl();
         await loadStatus();
         showToast("实盘机器人已启动");
     } catch (error) {
+        if (window.mikaV4.dialogOwner !== controller || sequence !== state.preflightSequence) return;
         errorBox.hidden = false;
         errorBox.textContent = `${error.message}。请修正后重新运行预检。`;
         $("goStrategyButton").hidden = false;
@@ -970,61 +938,47 @@ async function confirmStop() {
     const errorBox = $("stopError");
     button.disabled = true;
     errorBox.hidden = true;
+    const sequence = state.preflightSequence;
     try {
         const data = await postJson("/api/control/stop", {});
         state.control = data.bot;
-        closeDialog($("stopDialog"));
+        if (window.mikaV4.dialogOwner === controller && sequence === state.preflightSequence) closeDialog();
         renderControl();
         showToast("机器人进程已停止；账户已有挂单未撤销");
     } catch (error) {
+        if (window.mikaV4.dialogOwner !== controller || sequence !== state.preflightSequence) return;
         errorBox.hidden = false;
         errorBox.textContent = error.message;
     } finally {
-        button.disabled = false;
+        if (window.mikaV4.dialogOwner === controller && sequence === state.preflightSequence) button.disabled = false;
     }
 }
 
-function primaryControl() {
-    if (state.control?.running) {
-        $("stopError").hidden = true;
-        openDialog("stopDialog");
-    } else {
-        runPreflight();
-    }
+async function pauseCurrency() {
+    try {
+        await postJson("/api/runtime/v4/mode", {mode: "PAUSED"});
+        await refreshAll();
+        showToast(`${currency} 已暂停；已有挂单保留`);
+    } catch (error) { $("railError").textContent = error.message; }
 }
-
-function bindEvents() {
-    window.addEventListener("hashchange", renderRoute);
-    window.addEventListener("resize", drawDistribution);
-    document.addEventListener("keydown", trapDialogKey);
-    document.querySelector(".tabs").addEventListener("keydown", navigateTabs);
-    $("refreshButton").addEventListener("click", () => refreshAll(true));
-    $("logFilter").addEventListener("input", () => renderLogs(state.status?.log || []));
-    $("primaryControlButton").addEventListener("click", primaryControl);
-    $("preflightButton").addEventListener("click", runPreflight);
-    $("confirmStartButton").addEventListener("click", confirmStart);
-    $("confirmStopButton").addEventListener("click", confirmStop);
-    $("goStrategyButton").addEventListener("click", () => {
-        const action = $("goStrategyButton").dataset.action;
-        closeDialog();
-        if (action === "retry") runPreflight();
-        else location.hash = "#strategy";
-    });
-    document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(button.closest(".dialog-backdrop"))));
-    document.querySelectorAll(".dialog-backdrop").forEach((backdrop) => backdrop.addEventListener("mousedown", (event) => { if (event.target === backdrop) closeDialog(backdrop); }));
-}
-
-window.mikaBuildReady.then((compatible) => {
-    if (!compatible) return;
-    bindEvents();
-    renderRoute();
-    refreshAll();
-    window.setInterval(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false)), 30000);
-    window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
-});
-
-window.addEventListener("mika:currency-change", () => {
-    state.preflight = null; state.status = {}; state.config = null; state.control = null;
-    renderStatus(); renderControl(); refreshAll(true);
-});
-window.addEventListener("mika:currency-settings-change", () => refreshAll(true));
+function primaryControl() { if (state.control?.running) pauseCurrency(); else runPreflight(); }
+function openStop() { $("stopError").hidden = true; $("confirmStopButton").disabled = false; openDialog("stopDialog"); }
+const controller = {currency, refreshAll, runPreflight, confirmStart, confirmStop, closeDialog, trapDialogKey,
+    drawDistribution, openStop, settingsChanged() {
+        if (state.settingsRevision !== context.settings.revision) {
+            state.settingsRevision = context.settings.revision; state.preflight = null;
+            if (window.mikaV4.dialogOwner === controller) $("confirmStartButton").disabled = true;
+        }
+        state.config = context.settings.confirmed; renderControl();
+    },
+    goStrategy() {const retry = $("goStrategyButton").dataset.action === "retry"; closeDialog();
+        if (retry) runPreflight(); else {location.hash = "#strategy"; document.getElementById(`strategy-${currency}`).scrollIntoView({block:"start"});}}
+};
+$("primaryControlButton").addEventListener("click", primaryControl);
+$("preflightButton").addEventListener("click", runPreflight);
+window.addEventListener("resize", drawDistribution);
+refreshAll();
+window.setInterval(() => refreshAll(), 30000);
+window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
+return controller;
+};

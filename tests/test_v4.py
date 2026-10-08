@@ -636,3 +636,43 @@ def test_watchdog_renews_only_confirmed_policy_mirror(tmp_path, monkeypatch):
     original_control = authorization["controlDigest"]
     path.write_text(path.read_text(encoding="utf-8").replace("fixture-secret", "different-secret"), encoding="utf-8")
     assert restart_control_digest(str(path)) != original_control
+
+
+def test_settings_autosave_is_currency_scoped_and_preserves_live_usd(tmp_path):
+    path, settings = configuration(tmp_path)
+    client = FundingClient()
+    context = AppContext.for_project(tmp_path, config_path=str(path), client_factory=lambda *_args: client)
+    stores = stores_for_profiles(settings)
+    stores["USD"].set_mode("LIVE")
+    service = V4DashboardService(str(path), context.status_path, context)
+    result = service.settings({"currency": "USDT", "enabled": False, "autoTransfer": True})
+    assert result["enabled"] is False and result["autoTransfer"] is True
+    assert stores["USD"].runtime()["mode"] == "LIVE"
+    with pytest.raises(ConfigError, match="先暂停"):
+        service.settings({"currency": "USD", "enabled": False, "autoTransfer": True})
+    preflight = service.preflight(["USDT"])
+    assert preflight["canStart"] is False
+    assert "尚未启用" in preflight["checks"][0]["detail"]
+    assert "account" not in preflight["summary"]
+    assert client.submissions == []
+
+
+def test_dashboard_pause_is_single_currency_and_stop_pauses_both(tmp_path, monkeypatch):
+    path, settings = configuration(tmp_path)
+    context = AppContext.for_project(tmp_path, config_path=str(path))
+    stores = stores_for_profiles(settings)
+    for store in stores.values():
+        store.set_mode("LIVE")
+    context.process_state.auto_restart_authorization = {"v4": True, "currencies": ["USD", "USDT"]}
+    stopped = []
+    monkeypatch.setattr(lendingbot, "stop_controlled_bot", lambda *_args, **_kwargs: stopped.append(True))
+    service = V4DashboardService(str(path), context.status_path, context)
+    service.pause("USDT")
+    assert stores["USDT"].runtime()["mode"] == "PAUSED"
+    assert stores["USD"].runtime()["mode"] == "LIVE"
+    assert context.process_state.auto_restart_authorization["currencies"] == ["USD"]
+    assert stopped == []
+    stores["USDT"].set_mode("LIVE")
+    service.stop()
+    assert stopped == [True]
+    assert all(store.runtime()["mode"] == "PAUSED" for store in stores.values())

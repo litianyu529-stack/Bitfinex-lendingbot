@@ -1,4 +1,4 @@
-(async () => {
+window.createCurrencyStrategy = async function(surface, currency, context) {
     "use strict";
 
     if (!(await (window.mikaBuildReady || Promise.resolve(false)))) return;
@@ -6,10 +6,10 @@
     const state = {
         policy: null, runtime: null, preview: null, previewPolicy: null, dirty: false,
         draftVersionId: null, applyToken: null,
+        editRevision: 0, loadSequence: 0, previewSequence: 0, saving: false,
     };
-    const byId = (id) => document.getElementById(id);
+    const byId = (id) => surface.querySelector(`[data-ref="${id}"]`);
     const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
-    const surface = byId("v3StrategySurface");
     if (!surface) return;
 
     const groups = [
@@ -32,7 +32,7 @@
             title: "切片与目标成交层",
             description: "订单以 150 美元等值 为最低基数尽可能多地拆分，尾数平均分摊到所有订单；每 60 秒最多新建 60 单，后续循环自动补齐。成交层比例约束机器人可控的未成交挂单。",
             fields: [
-                ["max_lend_amount", "最大放贷金额", "number", window.mikaV4.currency, { min: 0, step: 0.01, placeholder: "不限制" }],
+                ["max_lend_amount", "最大放贷金额", "number", currency, { min: 0, step: 0.01, placeholder: "不限制" }],
                 ["max_lend_percent", "最大放贷比例", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["quick_share", "快速成交层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["balanced_share", "平衡层", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -149,9 +149,9 @@
                 <div><span>市场行情</span><strong id="v3MarketSource">--</strong></div>
                 <div><span>市场状态</span><strong id="v3Regime">--</strong></div>
                 <div class="v3-mode-actions">
-                    <button id="v3PauseButton" class="button secondary" type="button">暂停</button>
-                    <button id="v3ReplayButton" class="button secondary" type="button">回放</button>
-                    <button id="v3LiveButton" class="button danger" type="button">实盘预检</button>
+                    <button id="v3PauseButton" class="button secondary" type="button">暂停 ${currency}</button>
+                    <button id="v3ReplayButton" class="button secondary" type="button">回放 ${currency}</button>
+                    <button id="v3LiveButton" class="button danger" type="button">${currency} 实盘预检</button>
                 </div>
             </div>
             <div class="v3-workspace">
@@ -171,6 +171,7 @@
                     <section><h2>近24小时期限分布</h2><div id="v3PeriodActivity" class="v3-period-activity"><p>等待运行数据</p></div></section>
                 </aside>
             </div>`;
+        window.mikaV4.scopeIds(surface, currency);
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
@@ -197,17 +198,18 @@
         }
         const actions = document.createElement("div");
         actions.className = "v3-form-actions";
-        actions.innerHTML = `<p id="v3FormMessage" role="status">等待载入 v3 配置</p><div>
+        actions.innerHTML = `<div><small id="v3AllocationHint"></small><p id="v3FormMessage" role="status">等待载入 ${currency} V4 配置</p></div><div>
             <button id="v3PreviewButton" class="button secondary" type="button">重新计算</button>
             <button id="v3DiscardButton" class="button secondary" type="button">放弃草稿</button>
             <button class="button primary" type="submit">保存草稿</button>
             <button id="v3ApplyButton" class="button danger" type="button">应用策略</button>
         </div>`;
         form.append(actions);
+        window.mikaV4.scopeIds(actions, currency);
     }
 
     async function requestJson(path, options = {}) {
-        const response = await window.mikaV4.request(path, { cache: "no-store", ...options });
+        const response = await window.mikaV4.request(currency, path, { cache: "no-store", ...options });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
         return data;
@@ -318,7 +320,7 @@
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
-        byId("v3FormMessage").textContent = `资金池 ${poolTotal}% · 成交层 ${layerTotal}%${state.dirty ? " · 未保存" : ""}`;
+        byId("v3AllocationHint").textContent = `资金池 ${poolTotal}% · 成交层 ${layerTotal}%`;
     }
 
     function percentDaily(value) {
@@ -350,7 +352,7 @@
                 : `挑战 ${data.challengerPeriod} 天已持续 ${challengerMinutes}/10 分钟`;
             const allocation = data.poolAllocation || {};
             const minimum = allocation.minimumApplied ? " · 最低150 美元等值" : "";
-            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 配置 ${allocation.configuredShare ?? "--"}% · 全市场需求 ${scorePercent(allocation.absoluteDemandShare)} · 目标 ${Number(allocation.targetAmount || 0).toFixed(2)} / 当前 ${Number(allocation.currentManagedOffers || 0).toFixed(2)} ${window.mikaV4.currency}${minimum} · ${challenger}`;
+            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 配置 ${allocation.configuredShare ?? "--"}% · 全市场需求 ${scorePercent(allocation.absoluteDemandShare)} · 目标 ${Number(allocation.targetAmount || 0).toFixed(2)} / 当前 ${Number(allocation.currentManagedOffers || 0).toFixed(2)} ${currency}${minimum} · ${challenger}`;
             block.append(title);
             for (const row of data.scores || []) {
                 const item = document.createElement("div");
@@ -373,7 +375,7 @@
         activityContainer.replaceChildren();
         for (const [label, rows] of [["提交", activity?.submitted], ["成交", activity?.traded]]) {
             const line = document.createElement("p");
-            line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} ${window.mikaV4.currency}`).join("；") || "暂无"}`;
+            line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} ${currency}`).join("；") || "暂无"}`;
             activityContainer.append(line);
         }
         for (const row of activity?.traded || []) {
@@ -392,7 +394,7 @@
         byId("v3BestBid").textContent = percentDaily(signals.best_bid);
         byId("v3BestOffer").textContent = percentDaily(signals.best_offer);
         byId("v3Utilization").textContent = signals.utilization == null ? "--" : `${(Number(signals.utilization) * 100).toFixed(1)}%`;
-        byId("v3Principal").textContent = `${Number(data.principal || plan.planned_amount || 0).toLocaleString("zh-CN")} ${window.mikaV4.currency}`;
+        byId("v3Principal").textContent = `${data.principal == null ? "—" : Number(data.principal).toLocaleString("zh-CN")} ${currency}`;
         byId("v3PlanCount").textContent = `${(plan.plan || []).length} / ${plan.target_slice_count || 0}`;
         renderPeriodSelection(data.periodSelection || signals.periodSelection, data.periodActivity);
         const basis = data.accountSnapshot || {};
@@ -433,7 +435,7 @@
             const value = document.createElement("b");
             heading.textContent = `${pool} · ${layer}`;
             detail.textContent = `${type} · ${period}天 · ${row.count}笔`;
-            value.textContent = `${row.amount.toFixed(2)} ${window.mikaV4.currency} · ${((row.rate / row.count) * 100).toFixed(5)}%`;
+            value.textContent = `${row.amount.toFixed(2)} ${currency} · ${((row.rate / row.count) * 100).toFixed(5)}%`;
             item.append(heading, detail, value);
             list.append(item);
         }
@@ -465,7 +467,7 @@
         if (market.best_bid != null) byId("v3BestBid").textContent = percentDaily(market.best_bid);
         if (market.best_offer != null) byId("v3BestOffer").textContent = percentDaily(market.best_offer);
         if (market.utilization != null) byId("v3Utilization").textContent = `${(Number(market.utilization) * 100).toFixed(1)}%`;
-        if (status?.account?.total != null) byId("v3Principal").textContent = `${Number(status.account.total).toLocaleString("zh-CN")} ${window.mikaV4.currency}`;
+        if (status?.account?.total != null) byId("v3Principal").textContent = `${Number(status.account.total).toLocaleString("zh-CN")} ${currency}`;
         const dust = status?.strategyV3?.dustConsolidation || {};
         const takeoverRows = status?.strategyV3?.externalTakeover?.offers || [];
         const activeTakeovers = takeoverRows.filter((row) => !["CLOSED", "ERROR"].includes(row.state));
@@ -486,7 +488,6 @@
         byId("v3ApplyButton").disabled = !data.draftStrategy;
         const canDiscardPending = Boolean(
             data.pendingStrategy
-            && !data.process?.running
             && runtime.mode !== "LIVE"
         );
         const discardButton = byId("v3DiscardButton");
@@ -496,6 +497,11 @@
             : canDiscardPending
                 ? "撤销待应用策略"
                 : "放弃草稿";
+        renderControls();
+    }
+
+    function renderControls() {
+        byId("v3LiveButton").disabled = !context.settings.ready || state.runtime?.mode === "LIVE" || Boolean(context.runtime.recovery?.active);
     }
 
     function renderStats(statistics) {
@@ -513,7 +519,7 @@
             const coverage = document.createElement("small");
             heading.textContent = key === "all" ? "全部" : key;
             utilization.textContent = `利用率 ${Number(row.utilizationPercent).toFixed(1)}%`;
-            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} ${window.mikaV4.currency}`;
+            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} ${currency}`;
             apr.textContent = `净APR ${Number(row.actualNetAprPercent).toFixed(2)}%`;
             coverage.textContent = `本金采样覆盖 ${Number(row.sampleDays || 0).toFixed(2)} 天`;
             item.append(heading, utilization, interest, apr, coverage);
@@ -522,13 +528,14 @@
     }
 
     async function loadAll() {
-        const currency = window.mikaV4.currency;
+        const sequence = ++state.loadSequence, revision = state.editRevision;
         let config;
         try {
             config = await requestJson("/api/config");
-            if (!state.dirty) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
+            if (sequence !== state.loadSequence) return false;
+            if (!state.dirty && revision === state.editRevision) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
         } catch (error) {
-            if (currency !== window.mikaV4.currency) return false;
+            if (sequence !== state.loadSequence) return false;
             byId("v3FormMessage").textContent = `配置载入失败：${error.message}`;
             return false;
         }
@@ -538,7 +545,7 @@
                 requestJson("/api/status"),
                 requestJson("/api/stats/v3"),
         ]);
-        if (currency !== window.mikaV4.currency) return false;
+        if (sequence !== state.loadSequence) return false;
         const runtime = runtimeResult.status === "fulfilled" ? runtimeResult.value : {};
         const status = statusResult.status === "fulfilled" ? statusResult.value : {};
         const stats = statsResult.status === "fulfilled" ? statsResult.value : {};
@@ -554,39 +561,48 @@
     }
 
     async function preview() {
+        const sequence = ++state.previewSequence, revision = state.editRevision;
         try {
             validateForm();
             byId("v3FormMessage").textContent = "正在读取公共市场并生成计划…";
-            const data = await postJson("/api/strategy/v3/preview", { strategyV3: collectPolicy() });
+            const strategyV3 = collectPolicy();
+            const data = await postJson("/api/strategy/v3/preview", { strategyV3 });
+            if (sequence !== state.previewSequence || revision !== state.editRevision) return;
             renderPreview(data);
-            state.previewPolicy = JSON.stringify(collectPolicy());
+            state.previewPolicy = JSON.stringify(strategyV3);
             byId("v3FormMessage").textContent = (data.warnings || []).join("；") || "预览完成";
         } catch (error) {
+            if (sequence !== state.previewSequence || revision !== state.editRevision) return;
             byId("v3FormMessage").textContent = error.message;
         }
     }
 
     async function saveDraft(event) {
         event.preventDefault();
+        if (state.saving) return;
+        state.saving = true;
+        const revision = state.editRevision, sequence = ++state.previewSequence;
         try {
             validateForm();
             const strategyV3 = collectPolicy();
             byId("v3FormMessage").textContent = "正在生成影响预览…";
             const impact = await postJson("/api/strategy/v3/preview", { strategyV3 });
+            if (sequence !== state.previewSequence || revision !== state.editRevision) throw new Error("编辑已变化，请重新保存草稿。");
             renderPreview(impact);
             state.previewPolicy = JSON.stringify(strategyV3);
             const result = await postJson("/api/strategy/v3/draft", {
                 strategyV3,
                 previewToken: impact.previewToken,
             });
-            state.dirty = false;
+            if (revision === state.editRevision) state.dirty = false;
+            state.loadSequence += 1;
             state.draftVersionId = result.draftVersionId || null;
             state.applyToken = result.applyToken || null;
             byId("v3FormMessage").textContent = result.status === "DRAFT" ? "草稿已保存；预览后点击应用策略" : "策略已保存并生效";
             await loadAll();
         } catch (error) {
             byId("v3FormMessage").textContent = error.message;
-        }
+        } finally {state.saving = false;}
     }
 
     async function applyDraft() {
@@ -595,13 +611,14 @@
                 throw new Error("配置已变化，请先重新计算影响预览");
             }
             const plan = state.preview.plan || {};
-            const accepted = window.confirm(
-                `确认应用当前 V4 策略？\n` +
-                `预计新计划 ${(plan.plan || []).length} 笔，金额 ${Number(plan.planned_amount || 0).toFixed(2)} ${window.mikaV4.currency}。\n` +
+            const accepted = await window.mikaV4.confirmStrategy(currency,
+                `确认应用 ${currency} V4 策略？\n` +
+                `预计新计划 ${(plan.plan || []).length} 笔，金额 ${Number(plan.planned_amount || 0).toFixed(2)} ${currency}。\n` +
                 `将先撤销 ${(state.preview.incompatibleOffers || []).filter((row) => row.managed).length} 笔不兼容机器人挂单。\n` +
                 `${(state.preview.nonChangeableCredits || []).length} 笔已成交贷款无法改变。`
             );
             if (!accepted) return;
+            if (state.previewPolicy !== JSON.stringify(collectPolicy())) throw new Error("配置已变化，请重新计算并保存草稿。");
             if (!state.draftVersionId || !state.applyToken) {
                 throw new Error("应用确认已失效，请重新计算并保存草稿");
             }
@@ -622,7 +639,7 @@
         try {
             const result = await postJson("/api/runtime/v3/mode", { mode });
             if (result.replay) renderPreview({ signals: result.replay.signals || {}, plan: { plan: result.replay.orders || [] }, replay: result.replay });
-            await loadAll();
+            await Promise.all([loadAll(), context.overview.refreshAll()]);
         } catch (error) {
             byId("v3FormMessage").textContent = error.message;
         }
@@ -647,32 +664,22 @@
         }
     }
 
-    window.addEventListener("mika:before-currency-change", (event) => {
-        if (state.dirty && !window.confirm("当前策略有未保存修改，确认切换币种并放弃这些修改？")) event.preventDefault();
-    });
-    window.addEventListener("mika:currency-change", () => {
-        state.dirty = false; state.preview = null; state.previewPolicy = null;
-        state.draftVersionId = null; state.applyToken = null;
-        byId("v3StrategyForm").querySelectorAll(".v3-unit").forEach((node) => {
-            if (["USD", "USDT"].includes(node.textContent)) node.textContent = window.mikaV4.currency;
-        });
-        byId("v3PlanList").textContent = "等待当前币种预览";
-        for (const id of ["v3Principal", "v3Utilization", "v3PlanCount", "v3AccountSource", "v3ActiveVersion", "v3DraftVersion", "v3PendingVersion"]) byId(id).textContent = "--";
-        byId("v3Stats").replaceChildren();
-        byId("v3PeriodSelection").replaceChildren();
-        byId("v3PeriodActivity").replaceChildren();
-        loadAll().then((loaded) => { if (loaded) preview(); });
-    });
     renderShell();
-    byId("v3StrategyForm").addEventListener("input", () => { state.dirty = true; updateDerived(); });
-    byId("v3StrategyForm").addEventListener("change", () => { state.dirty = true; updateDerived(); });
+    function edited() {
+        state.dirty = true; state.editRevision += 1; state.previewPolicy = null; updateDerived();
+        byId("v3FormMessage").textContent = `${currency} 有未保存编辑；请重新计算并保存草稿。`;
+    }
+    byId("v3StrategyForm").addEventListener("input", edited);
+    byId("v3StrategyForm").addEventListener("change", edited);
     byId("v3StrategyForm").addEventListener("submit", saveDraft);
     byId("v3PreviewButton").addEventListener("click", preview);
     byId("v3ApplyButton").addEventListener("click", applyDraft);
     byId("v3DiscardButton").addEventListener("click", discardDraft);
     byId("v3PauseButton").addEventListener("click", () => setMode("PAUSED"));
     byId("v3ReplayButton").addEventListener("click", () => setMode("REPLAY"));
-    byId("v3LiveButton").addEventListener("click", () => byId("preflightButton")?.click());
-    loadAll().then((loaded) => { if (loaded) preview(); });
+    byId("v3LiveButton").addEventListener("click", () => context.overview.runPreflight());
+    renderControls();
+    loadAll().then((loaded) => { if (loaded && !state.dirty && !state.saving) preview(); });
     window.setInterval(loadAll, 15000);
-})();
+    return {loadAll, renderControls};
+};

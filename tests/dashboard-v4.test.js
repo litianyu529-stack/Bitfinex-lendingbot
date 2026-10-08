@@ -1,0 +1,140 @@
+"use strict";
+const {test} = require("node:test");
+const assert = require("node:assert/strict");
+const {readFileSync} = require("node:fs");
+const vm = require("node:vm");
+const {CurrencySettings, createCurrencyRequester, logCurrency} = require("../www/v4-dashboard.js");
+const initial = () => ({enabled:false, autoTransfer:false});
+const deferred = () => {let resolve, reject; const promise = new Promise((yes,no) => {resolve=yes; reject=no;}); return {promise,resolve,reject};};
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test("a polling response requested before a change cannot uncheck it", async () => {
+    const read = deferred(), write = deferred(); let reads = 0;
+    const model = new CurrencySettings(() => ++reads === 1 ? initial() : read.promise, () => write.promise);
+    await model.refresh(); const polling = model.refresh(); const saving = model.change({enabled:true});
+    read.resolve(initial()); await polling;
+    assert.equal(model.desired.enabled,true); assert.equal(model.ready,false);
+    write.resolve({enabled:true,autoTransfer:false}); await saving; assert.equal(model.ready,true);
+});
+
+test("a stale GET cannot overwrite a completed save", async () => {
+    const read = deferred(); let reads=0;
+    const model = new CurrencySettings(() => ++reads === 1 ? initial() : read.promise, async value => value);
+    await model.refresh(); const polling = model.refresh(); await model.change({enabled:true});
+    read.resolve(initial()); await polling;
+    assert.equal(model.confirmed.enabled,true); assert.equal(model.desired.enabled,true);
+});
+
+test("rapid clicks serialize writes and retain the latest two checkbox values", async () => {
+    const first = deferred(), second = deferred(), writes=[];
+    const model = new CurrencySettings(async () => initial(), value => {writes.push(value); return writes.length === 1 ? first.promise : second.promise;});
+    await model.refresh(); const saving=model.change({enabled:true}); model.change({autoTransfer:true}); model.change({enabled:false});
+    assert.equal(writes.length,1); first.resolve(writes[0]); await tick();
+    assert.deepEqual(writes[1],{enabled:false,autoTransfer:true});
+    assert.deepEqual(model.desired,{enabled:false,autoTransfer:true}); assert.equal(model.ready,false);
+    second.resolve(writes[1]); await saving;
+    assert.equal(model.ready,true); assert.deepEqual(model.confirmed,model.desired);
+});
+
+test("failed save preserves desired values across polling and can be retried", async () => {
+    let fail=true;
+    const model = new CurrencySettings(async () => initial(), async value => {if(fail) throw new Error("offline"); return value;});
+    await model.refresh(); await model.change({enabled:true}); await model.refresh();
+    assert.equal(model.desired.enabled,true); assert.equal(model.confirmed.enabled,false);
+    assert.equal(model.ready,false); assert.equal(model.error,"offline");
+    fail=false; await model.save(); assert.equal(model.ready,true); assert.equal(model.error,null);
+});
+
+test("a timeout after saving is verified with a read rather than repeating the write", async () => {
+    let remote=initial(), writes=0;
+    const model = new CurrencySettings(async () => remote, async value => {remote=value; writes++; throw new Error("timeout");});
+    await model.refresh(); await model.change({autoTransfer:true});
+    assert.equal(writes,1); assert.equal(model.ready,true); assert.equal(model.confirmed.autoTransfer,true);
+});
+
+test("unavailable reconciliation preserves choices and blocks preflight", async () => {
+    let unavailable=false;
+    const model = new CurrencySettings(async () => {if(unavailable) throw new Error("network"); return initial();}, async () => {throw new Error("timeout");});
+    await model.refresh(); unavailable=true; await model.change({enabled:true});
+    assert.equal(model.desired.enabled,true); assert.equal(model.ready,false); assert.equal(model.error,"timeout");
+});
+
+test("a newer choice while verifying a timeout is not overwritten", async () => {
+    const reconciliation=deferred(); let reads=0, writes=0;
+    const model = new CurrencySettings(() => ++reads === 1 ? initial() : reconciliation.promise,
+        async value => {if(++writes === 1) throw new Error("timeout"); return value;});
+    await model.refresh(); const saving=model.change({enabled:true}); await tick(); model.change({autoTransfer:true});
+    reconciliation.resolve({enabled:true,autoTransfer:false}); await saving;
+    assert.equal(model.desired.autoTransfer,true); assert.equal(model.ready,true);
+    assert.equal(writes,2); assert.equal(model.confirmed.autoTransfer,true);
+});
+
+test("an unavailable USDT save does not block USD settings", async () => {
+    const pending=deferred();
+    const usd=new CurrencySettings(async () => initial(), async value => value);
+    const usdt=new CurrencySettings(async () => initial(), () => pending.promise);
+    await Promise.all([usd.refresh(),usdt.refresh()]); const saving=usdt.change({enabled:true});
+    await usd.change({autoTransfer:true}); assert.equal(usd.ready,true); assert.equal(usdt.ready,false);
+    pending.resolve({enabled:true,autoTransfer:false}); await saving;
+    assert.equal(usd.confirmed.enabled,false); assert.equal(usdt.confirmed.autoTransfer,false);
+});
+
+test("currency-scoped reads and writes never depend on a global selected coin", async () => {
+    const calls=[]; const request=createCurrencyRequester(async (url,options) => {calls.push({url,options}); return {};},"csrf-token");
+    await Promise.all([request("USD","/api/status"),request("USDT","/api/status")]);
+    assert.equal(calls[0].url,"/api/status/v4?currency=USD"); assert.equal(calls[1].url,"/api/status/v4?currency=USDT");
+    await request("USDT","/api/strategy/v3/apply",{method:"POST",body:JSON.stringify({draftVersionId:"ust-draft",applyToken:"ust-token"})});
+    assert.deepEqual(JSON.parse(calls[2].options.body),{draftVersionId:"ust-draft",applyToken:"ust-token",currency:"USDT"});
+    assert.equal(calls[2].options.headers["X-Mika-CSRF"],"csrf-token");
+    await assert.rejects(request(undefined,"/api/status"));
+});
+
+test("preflight, start, pause and global stop retain the originating currency and token", async () => {
+    const calls=[]; const request=createCurrencyRequester(async (url,options) => {calls.push([url,JSON.parse(options.body)]);},"csrf");
+    for(const path of ["/api/control/preflight","/api/control/start","/api/runtime/v3/mode","/api/control/stop"]) {
+        await request("USDT",path,{method:"POST",body:JSON.stringify({preflightId:"ust-only",mode:"PAUSED"})});
+    }
+    assert.equal(calls[0][0],"/api/control/v4/preflight"); assert.equal(calls[1][1].preflightId,"ust-only");
+    assert.equal(calls[2][0],"/api/runtime/v4/mode"); assert.equal(calls[2][1].currency,"USDT");
+    assert.equal(calls[3][0],"/api/control/v4/stop");
+});
+
+test("USD log filtering does not match USDT and general messages remain system logs", () => {
+    assert.equal(logCurrency("USDT offer"),"USDT"); assert.equal(logCurrency("[USD] offer"),"USD");
+    assert.equal(logCurrency("fUST market"),"USDT"); assert.equal(logCurrency("worker started"),"system");
+    assert.equal(logCurrency({currency:"USDT",message:"offer"}),"USDT");
+});
+
+function confirmationHarness() {
+    const cancel = {focus() {}}, confirm = {focus() {}, textContent:""};
+    const dialog = {hidden:true, querySelector: () => cancel, querySelectorAll: () => [cancel,confirm]};
+    const nodes = {strategyApplyDialog:dialog, strategyApplyTitle:{}, strategyApplySummary:{}, strategyApplyConfirmButton:confirm};
+    const document = {querySelector: () => ({content:"csrf"}), getElementById: id => nodes[id],
+        body:{style:{}}, activeElement:cancel};
+    const window = {fetch:async () => ({}), addEventListener() {}};
+    vm.runInNewContext(readFileSync(require.resolve("../www/v4-dashboard.js"),"utf8"),
+        {window,document,AbortController,setTimeout,clearTimeout,URL});
+    return {dashboard:window.mikaV4,document,nodes};
+}
+
+test("the shared strategy confirmation binds its currency and cancels the previous owner", async () => {
+    const {dashboard,nodes}=confirmationHarness(); let closed=false;
+    dashboard.dialogOwner={closeDialog() {closed=true;}};
+    const usd=dashboard.confirmStrategy("USD","600 USD");
+    assert.equal(closed,true); assert.equal(dashboard.dialogOwner.currency,"USD");
+    const usdt=dashboard.confirmStrategy("USDT","700 USDT");
+    assert.equal(await usd,false);
+    assert.equal(nodes.strategyApplyTitle.textContent,"USDT · 应用策略确认");
+    assert.equal(nodes.strategyApplySummary.textContent,"700 USDT");
+    dashboard.dialogOwner.confirmStrategyApply();
+    assert.equal(await usdt,true); assert.equal(nodes.strategyApplyDialog.hidden,true);
+    assert.equal(dashboard.dialogOwner,null);
+});
+
+test("Escape cancels strategy confirmation without submitting and restores scrolling", async () => {
+    const {dashboard,document}=confirmationHarness();
+    const pending=dashboard.confirmStrategy("USDT","700 USDT"); let prevented=false;
+    dashboard.dialogOwner.trapDialogKey({key:"Escape",preventDefault() {prevented=true;}});
+    assert.equal(await pending,false); assert.equal(prevented,true);
+    assert.equal(document.body.style.overflow,"");
+});

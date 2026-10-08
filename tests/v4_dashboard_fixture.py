@@ -65,6 +65,9 @@ def main():
             str(ROOT / "www"), str(path), context.status_path, context=context
         )
         service = base_handler.application.v4_service
+        if "--usd-live" in sys.argv:
+            stores["USD"].set_mode("LIVE")
+            context.process_state.process = FakeControlledProcess(os.getpid())
 
         def fixture_launch(selected):
             for currency in selected:

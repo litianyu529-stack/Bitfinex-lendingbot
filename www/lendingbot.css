@@ -655,8 +655,53 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .build-blocker div { line-height: 1.7; }
 .build-blocker small { display: block; margin-top: 20px; color: #efb0a8; }
 
-.v4-currencies { margin-bottom: 24px; padding: 20px; border: 1px solid #d7e3e3; border-radius: 16px; background: white; }
-.v4-overview, .v4-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
-.v4-controls label { display: flex; align-items: center; gap: 8px; }
-.v4-controls select { padding: 8px; border: 1px solid #bdcccc; border-radius: 8px; }
-#v4SettingsMessage { min-height: 1.4em; margin-bottom: 0; }
+.dual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; align-items: start; }
+.currency-overview, .currency-strategy { min-width: 0; scroll-margin-top: 90px; }
+.currency-overview { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.currency-heading { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; background: var(--surface); border-bottom: 1px solid var(--line); }
+.currency-heading h2 { font-size: 24px; color: var(--teal-dark); }
+.currency-settings { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; padding: 16px 20px 8px; }
+.currency-settings label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.currency-settings input { width: 17px; height: 17px; accent-color: var(--teal-dark); }
+.currency-settings [role="status"] { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.currency-settings .save-error { color: var(--danger); }
+.currency-status, .currency-sync { margin: 0 20px 6px; color: var(--muted); font-size: 11px; }
+.currency-overview .control-room { display: flex; flex-direction: column; border: 0; border-radius: 0; }
+.currency-overview .control-rail { order: -1; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; padding: 16px 20px; }
+.currency-overview .rail-state { grid-column: 1 / -1; margin: 0; }
+.currency-overview .rail-state h2 { font-size: 19px; }
+.currency-overview .rail-detail { grid-column: 1 / -1; min-height: 0; margin: 0; }
+.currency-overview .primary-control, .currency-overview .secondary-control { min-height: 40px; margin: 0; }
+.currency-overview .primary-control { grid-column: 1; grid-row: 3; }
+.currency-overview .secondary-control { grid-column: 2; grid-row: 3; }
+.currency-overview .rail-note, .currency-overview .rail-error, .coin-safety { grid-column: 1 / -1; margin: 0; min-height: 0; }
+.currency-overview .rail-kicker, .currency-overview .rail-divider, .currency-overview .rail-footer { display: none; }
+.coin-safety summary { color: #aac0bf; cursor: pointer; font-size: 11px; }
+.currency-overview .rail-facts { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 0 18px; margin-bottom: 0; }
+.currency-overview .metric-strip { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.currency-overview .metric-strip strong { font-size: 21px; }
+.currency-overview .metric-strip article { padding: 16px 12px; border-bottom: 1px solid var(--line); }
+.currency-overview .market-layout { grid-template-columns: 190px minmax(0,1fr); gap: 12px; }
+.currency-overview .rate-stack { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); }
+.currency-overview .credit-overall { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.currency-overview .credit-group-heading { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.currency-strategy .v3-workspace { grid-template-columns: minmax(0,1fr); }
+.currency-strategy .v3-mode-bar { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.currency-strategy .v3-mode-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.currency-strategy .v3-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.currency-strategy .v3-form-actions { position: static; flex-wrap: wrap; }
+.currency-strategy .v3-form-actions > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.currency-strategy .v3-monitor { grid-template-columns: minmax(0,1fr); }
+.currency-strategy .v3-monitor > section { grid-column: auto; }
+.log-currency-filter { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.log-currency-filter select { padding: 7px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+@media (max-width: 1099px) { .dual-grid { grid-template-columns: minmax(0,1fr); } }
+@media (max-width: 560px) {
+    .currency-overview .metric-strip { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .currency-overview .market-layout { grid-template-columns: minmax(0,1fr); }
+    .currency-overview .rate-stack { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .currency-overview .credit-overall { grid-template-columns: minmax(0,1fr); }
+    .currency-strategy .v3-grid { grid-template-columns: minmax(0,1fr); }
+    .header-status { flex-wrap: wrap; gap: 7px; }
+    .header-status > .connection-chip { display: none; }
+}

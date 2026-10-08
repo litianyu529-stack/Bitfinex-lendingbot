@@ -28,34 +28,55 @@
             <a id="logsTab" role="tab" href="#logs" aria-controls="logsPanel">日志</a>
         </nav>
         <div class="header-status">
-            <span class="connection-chip" id="connectionChip"><i aria-hidden="true"></i><span>连接中</span></span>
-            <span class="sync-label">同步 <time id="headerSync">--</time></span>
+            <span class="connection-chip"><i aria-hidden="true"></i><span>V4 双币控制</span></span>
+            <button class="text-button" id="globalStopButton" type="button">停止两币</button>
             <button class="text-button" id="refreshButton" type="button">刷新</button>
         </div>
     </header>
 
     <main class="workspace">
-        <section class="v4-currencies" aria-label="双币种放贷控制">
-            <h2>V4 · USD / USDT</h2>
-            <div class="v4-overview"><p id="v4OverviewUSD">USD · 等待同步</p><p id="v4OverviewUSDT">USDT · 等待同步</p></div>
-            <div class="v4-controls">
-                <label>当前币种 <select id="v4Currency"><option>USD</option><option>USDT</option></select></label>
-                <label><input id="v4Enabled" type="checkbox">启用当前币种</label>
-                <label><input id="v4Transfer" type="checkbox">允许同币种钱包转入 Funding</label>
-                <button id="v4SaveSettings" class="button secondary" type="button">保存币种设置</button>
-                <button id="v4PauseCurrency" class="button secondary" type="button">暂停当前币种</button>
-            </div>
-            <p id="v4SettingsMessage" role="status" aria-live="polite"></p>
-        </section>
         <section id="overviewPanel" class="tab-panel" role="tabpanel" aria-labelledby="overviewTab">
             <div class="page-heading">
                 <div>
                     <p class="eyebrow">LIVE FUNDING</p>
                     <h1>资金状态与机器人控制</h1>
                 </div>
-                <p id="statusHeadline" class="headline-status">等待实盘机器人首次同步。</p>
+                <p class="headline-status">USD 与 USDT 独立记账、独立运行。</p>
             </div>
 
+            <div id="dualOverview" class="dual-grid"></div>
+        </section>
+
+        <section id="strategyPanel" class="tab-panel" role="tabpanel" aria-labelledby="strategyTab" hidden>
+            <div class="page-heading strategy-heading">
+                <div><p class="eyebrow">MARKET-AWARE STRATEGY</p><h1>可调节放贷策略</h1></div>
+                <p>LIVE 期间可编辑并保存草稿；应用后进入 PENDING，由 Worker 安全切换。</p>
+            </div>
+
+            <div id="dualStrategies" class="dual-grid"></div>
+
+        </section>
+
+        <section id="logsPanel" class="tab-panel" role="tabpanel" aria-labelledby="logsTab" hidden>
+            <div class="page-heading logs-heading">
+                <div><p class="eyebrow">ACTIVITY LOG</p><h1>运行日志</h1></div>
+                <label class="search-field"><span class="sr-only">筛选日志</span><input id="logFilter" type="search" placeholder="筛选日志"></label>
+            </div>
+            <label class="log-currency-filter"><span>日志币种</span><select id="logCurrency"><option value="all">全部</option><option>USD</option><option>USDT</option></select></label>
+            <div class="log-surface"><div id="logStream" class="log-stream" aria-live="polite"></div></div>
+        </section>
+    </main>
+
+    <template id="currencyOverviewTemplate">
+        <header class="currency-heading"><div><p class="eyebrow">FUNDING MARKET</p><h2 data-role="currency-title"></h2></div><span class="connection-chip" id="connectionChip"><i></i><span>--</span></span></header>
+        <div class="currency-settings">
+            <label><input data-setting="enabled" type="checkbox" disabled><span data-role="enable-label"></span></label>
+            <label><input data-setting="autoTransfer" type="checkbox" disabled>允许同币种钱包转入 Funding</label>
+            <p data-role="settings-status" role="status" aria-live="polite"></p>
+            <button data-role="settings-retry" class="text-button" type="button" hidden>重试保存</button>
+        </div>
+        <p id="statusHeadline" class="currency-status">--</p>
+        <p class="currency-sync">同步 <time id="headerSync">--</time></p>
             <div class="control-room">
                 <div class="overview-main">
                     <section class="metric-strip" aria-label="资金和收益摘要">
@@ -154,39 +175,20 @@
                     <button id="primaryControlButton" class="primary-control" type="button">启动实盘</button>
                     <p class="rail-note">启动后将依据当前已保存策略创建、撤销或重定价真实 Bitfinex 挂单。</p>
                     <div class="rail-divider"></div>
-                    <h3>安全状态</h3>
+                    <details class="coin-safety"><summary>安全状态与同步</summary>
                     <dl class="rail-facts">
                         <div><dt>API 凭据</dt><dd id="credentialState">待检查</dd></div>
                         <div><dt>账户权限</dt><dd id="permissionState">待预检</dd></div>
                         <div><dt>状态协议</dt><dd id="schemaState">等待同步</dd></div>
                         <div><dt>V4 上线</dt><dd id="releaseBoundary">等待同步</dd></div>
                         <div><dt>上次同步</dt><dd id="railSync">--</dd></div>
-                    </dl>
+                    </dl></details>
                     <button id="preflightButton" class="secondary-control" type="button">运行预检</button>
                     <p id="railError" class="rail-error" role="alert"></p>
                     <div class="rail-footer"><span>本地连接</span><code>127.0.0.1:8000</code></div>
                 </aside>
             </div>
-        </section>
-
-        <section id="strategyPanel" class="tab-panel" role="tabpanel" aria-labelledby="strategyTab" hidden>
-            <div class="page-heading strategy-heading">
-                <div><p class="eyebrow">MARKET-AWARE STRATEGY</p><h1>可调节放贷策略</h1></div>
-                <p>LIVE 期间可编辑并保存草稿；应用后进入 PENDING，由 Worker 安全切换。</p>
-            </div>
-
-            <div id="v3StrategySurface" class="v3-strategy-surface"></div>
-
-        </section>
-
-        <section id="logsPanel" class="tab-panel" role="tabpanel" aria-labelledby="logsTab" hidden>
-            <div class="page-heading logs-heading">
-                <div><p class="eyebrow">ACTIVITY LOG</p><h1>运行日志</h1></div>
-                <label class="search-field"><span class="sr-only">筛选日志</span><input id="logFilter" type="search" placeholder="筛选日志"></label>
-            </div>
-            <div class="log-surface"><div id="logStream" class="log-stream" aria-live="polite"></div></div>
-        </section>
-    </main>
+    </template>
 
     <div id="preflightDialog" class="dialog-backdrop" hidden>
         <section class="dialog preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="preflightTitle" aria-describedby="preflightIntro">
@@ -207,12 +209,20 @@
         </section>
     </div>
 
+    <div id="strategyApplyDialog" class="dialog-backdrop" hidden>
+        <section class="dialog stop-dialog" role="dialog" aria-modal="true" aria-labelledby="strategyApplyTitle">
+            <header><h2 id="strategyApplyTitle">应用策略确认</h2></header>
+            <p id="strategyApplySummary" class="dialog-intro" style="white-space: pre-line"></p>
+            <footer><button class="button secondary" data-close-dialog type="button">取消</button><button id="strategyApplyConfirmButton" class="button danger" type="button">确认应用</button></footer>
+        </section>
+    </div>
+
     <div id="stopDialog" class="dialog-backdrop" hidden>
         <section class="dialog stop-dialog" role="dialog" aria-modal="true" aria-labelledby="stopTitle" aria-describedby="stopDescription">
-            <header><div><p class="eyebrow">STOP PROCESS</p><h2 id="stopTitle">停止机器人进程？</h2></div></header>
-            <p id="stopDescription" class="dialog-intro">停止进程不会撤销 Bitfinex 已有挂单。已有挂单会继续留在账户中，直到成交或手动撤销。</p>
+            <header><div><p class="eyebrow">STOP BOTH CURRENCIES</p><h2 id="stopTitle">停止 USD 和 USDT？</h2></div></header>
+            <p id="stopDescription" class="dialog-intro">此操作会暂停 USD 和 USDT 并停止机器人进程。Bitfinex 已有挂单会继续留在账户中，直到成交或手动撤销。</p>
             <div id="stopError" class="dialog-error" role="alert" hidden></div>
-            <footer><button class="button secondary" data-close-dialog type="button">继续运行</button><button id="confirmStopButton" class="button danger" type="button">停止进程</button></footer>
+            <footer><button class="button secondary" data-close-dialog type="button">继续运行</button><button id="confirmStopButton" class="button danger" type="button">停止两币</button></footer>
         </section>
     </div>
 

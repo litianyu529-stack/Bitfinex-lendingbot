@@ -70,6 +70,8 @@ python lendingbot.py --dashboard
 
 浏览器打开 [http://127.0.0.1:8000/lendingbot.html](http://127.0.0.1:8000/lendingbot.html)。停止 Worker 不会撤销已有挂单。
 
+总览和策略同页展示 USD / USDT，宽屏并排、手机上下排列。每币的启用与同币种钱包转入开关立即保存，失败保留选择并可重试；LIVE 或恢复中需先暂停该币种再修改。预检、启动、暂停按币种执行，公共“停止两币”暂停两币并停止 Worker。日志可筛选全部、USD 或 USDT。
+
 直接启动 LIVE（预检后还需输入一次 `LIVE`）：
 
 ```powershell

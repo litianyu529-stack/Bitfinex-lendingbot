@@ -37,6 +37,8 @@ node --check www/v3-dashboard.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 node --check www/v4-dashboard.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+node --test tests/dashboard-v4.test.js
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 git diff --check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
