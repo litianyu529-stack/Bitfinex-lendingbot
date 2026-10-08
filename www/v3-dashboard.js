@@ -30,9 +30,9 @@
         },
         {
             title: "切片与目标成交层",
-            description: "订单以 150 USD 为最低基数尽可能多地拆分，尾数平均分摊到所有订单；每 60 秒最多新建 60 单，后续循环自动补齐。成交层比例约束机器人可控的未成交挂单。",
+            description: "订单以 150 美元等值 为最低基数尽可能多地拆分，尾数平均分摊到所有订单；每 60 秒最多新建 60 单，后续循环自动补齐。成交层比例约束机器人可控的未成交挂单。",
             fields: [
-                ["max_lend_amount", "最大放贷金额", "number", "USD", { min: 0, step: 0.01, placeholder: "不限制" }],
+                ["max_lend_amount", "最大放贷金额", "number", window.mikaV4.currency, { min: 0, step: 0.01, placeholder: "不限制" }],
                 ["max_lend_percent", "最大放贷比例", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["quick_share", "快速成交层", "number", "%", { min: 0, max: 100, step: 1 }],
                 ["balanced_share", "平衡层", "number", "%", { min: 0, max: 100, step: 1 }],
@@ -41,7 +41,7 @@
         },
         {
             title: "订单类型与费用",
-            description: "V3.5 自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
+            description: "V4 自动识别并安全接管当前币种的外部挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
             fields: [
                 ["enable_limit", "LIMIT", "checkbox", "", {}],
                 ["enable_frr", "FRR", "checkbox", "", {}],
@@ -123,6 +123,7 @@
             control.append(input);
             if (unit) {
                 const suffix = document.createElement("em");
+                suffix.className = "v3-unit";
                 suffix.textContent = unit;
                 control.append(suffix);
             }
@@ -173,7 +174,7 @@
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
-        fixedSafety.textContent = "V3.5 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
+        fixedSafety.textContent = "V4 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 美元等值 · 余额满 1 单位当前币种 自动合并复投。";
         form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");
@@ -206,7 +207,7 @@
     }
 
     async function requestJson(path, options = {}) {
-        const response = await fetch(path, { cache: "no-store", ...options });
+        const response = await window.mikaV4.request(path, { cache: "no-store", ...options });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || data.ok === false) throw new Error(data.error || `请求失败 (${response.status})`);
         return data;
@@ -348,8 +349,8 @@
                 ? "无挑战期限"
                 : `挑战 ${data.challengerPeriod} 天已持续 ${challengerMinutes}/10 分钟`;
             const allocation = data.poolAllocation || {};
-            const minimum = allocation.minimumApplied ? " · 最低150 USD" : "";
-            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 配置 ${allocation.configuredShare ?? "--"}% · 全市场需求 ${scorePercent(allocation.absoluteDemandShare)} · 目标 ${Number(allocation.targetAmount || 0).toFixed(2)} / 当前 ${Number(allocation.currentManagedOffers || 0).toFixed(2)} USD${minimum} · ${challenger}`;
+            const minimum = allocation.minimumApplied ? " · 最低150 美元等值" : "";
+            title.textContent = `${pool}池 · 第一 ${data.selectedPeriod ?? "闲置"}天 · 第二 ${data.runnerUpPeriod ?? "无"}天 · 配置 ${allocation.configuredShare ?? "--"}% · 全市场需求 ${scorePercent(allocation.absoluteDemandShare)} · 目标 ${Number(allocation.targetAmount || 0).toFixed(2)} / 当前 ${Number(allocation.currentManagedOffers || 0).toFixed(2)} ${window.mikaV4.currency}${minimum} · ${challenger}`;
             block.append(title);
             for (const row of data.scores || []) {
                 const item = document.createElement("div");
@@ -372,7 +373,7 @@
         activityContainer.replaceChildren();
         for (const [label, rows] of [["提交", activity?.submitted], ["成交", activity?.traded]]) {
             const line = document.createElement("p");
-            line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} USD`).join("；") || "暂无"}`;
+            line.textContent = `${label}：${(rows || []).map((row) => `${row.period}天 ${row.count}笔/${Number(row.amount || 0).toFixed(2)} ${window.mikaV4.currency}`).join("；") || "暂无"}`;
             activityContainer.append(line);
         }
         for (const row of activity?.traded || []) {
@@ -391,7 +392,7 @@
         byId("v3BestBid").textContent = percentDaily(signals.best_bid);
         byId("v3BestOffer").textContent = percentDaily(signals.best_offer);
         byId("v3Utilization").textContent = signals.utilization == null ? "--" : `${(Number(signals.utilization) * 100).toFixed(1)}%`;
-        byId("v3Principal").textContent = `${Number(data.principal || plan.planned_amount || 0).toLocaleString("zh-CN")} USD`;
+        byId("v3Principal").textContent = `${Number(data.principal || plan.planned_amount || 0).toLocaleString("zh-CN")} ${window.mikaV4.currency}`;
         byId("v3PlanCount").textContent = `${(plan.plan || []).length} / ${plan.target_slice_count || 0}`;
         renderPeriodSelection(data.periodSelection || signals.periodSelection, data.periodActivity);
         const basis = data.accountSnapshot || {};
@@ -432,7 +433,7 @@
             const value = document.createElement("b");
             heading.textContent = `${pool} · ${layer}`;
             detail.textContent = `${type} · ${period}天 · ${row.count}笔`;
-            value.textContent = `${row.amount.toFixed(2)} USD · ${((row.rate / row.count) * 100).toFixed(5)}%`;
+            value.textContent = `${row.amount.toFixed(2)} ${window.mikaV4.currency} · ${((row.rate / row.count) * 100).toFixed(5)}%`;
             item.append(heading, detail, value);
             list.append(item);
         }
@@ -464,7 +465,7 @@
         if (market.best_bid != null) byId("v3BestBid").textContent = percentDaily(market.best_bid);
         if (market.best_offer != null) byId("v3BestOffer").textContent = percentDaily(market.best_offer);
         if (market.utilization != null) byId("v3Utilization").textContent = `${(Number(market.utilization) * 100).toFixed(1)}%`;
-        if (status?.account?.total != null) byId("v3Principal").textContent = `${Number(status.account.total).toLocaleString("zh-CN")} USD`;
+        if (status?.account?.total != null) byId("v3Principal").textContent = `${Number(status.account.total).toLocaleString("zh-CN")} ${window.mikaV4.currency}`;
         const dust = status?.strategyV3?.dustConsolidation || {};
         const takeoverRows = status?.strategyV3?.externalTakeover?.offers || [];
         const activeTakeovers = takeoverRows.filter((row) => !["CLOSED", "ERROR"].includes(row.state));
@@ -512,7 +513,7 @@
             const coverage = document.createElement("small");
             heading.textContent = key === "all" ? "全部" : key;
             utilization.textContent = `利用率 ${Number(row.utilizationPercent).toFixed(1)}%`;
-            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} USD`;
+            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} ${window.mikaV4.currency}`;
             apr.textContent = `净APR ${Number(row.actualNetAprPercent).toFixed(2)}%`;
             coverage.textContent = `本金采样覆盖 ${Number(row.sampleDays || 0).toFixed(2)} 天`;
             item.append(heading, utilization, interest, apr, coverage);
@@ -521,11 +522,13 @@
     }
 
     async function loadAll() {
+        const currency = window.mikaV4.currency;
         let config;
         try {
             config = await requestJson("/api/config");
             if (!state.dirty) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
         } catch (error) {
+            if (currency !== window.mikaV4.currency) return false;
             byId("v3FormMessage").textContent = `配置载入失败：${error.message}`;
             return false;
         }
@@ -535,6 +538,7 @@
                 requestJson("/api/status"),
                 requestJson("/api/stats/v3"),
         ]);
+        if (currency !== window.mikaV4.currency) return false;
         const runtime = runtimeResult.status === "fulfilled" ? runtimeResult.value : {};
         const status = statusResult.status === "fulfilled" ? statusResult.value : {};
         const stats = statsResult.status === "fulfilled" ? statsResult.value : {};
@@ -592,8 +596,8 @@
             }
             const plan = state.preview.plan || {};
             const accepted = window.confirm(
-                `确认应用当前 V3 策略？\n` +
-                `预计新计划 ${(plan.plan || []).length} 笔，金额 ${Number(plan.planned_amount || 0).toFixed(2)} USD。\n` +
+                `确认应用当前 V4 策略？\n` +
+                `预计新计划 ${(plan.plan || []).length} 笔，金额 ${Number(plan.planned_amount || 0).toFixed(2)} ${window.mikaV4.currency}。\n` +
                 `将先撤销 ${(state.preview.incompatibleOffers || []).filter((row) => row.managed).length} 笔不兼容机器人挂单。\n` +
                 `${(state.preview.nonChangeableCredits || []).length} 笔已成交贷款无法改变。`
             );
@@ -643,6 +647,22 @@
         }
     }
 
+    window.addEventListener("mika:before-currency-change", (event) => {
+        if (state.dirty && !window.confirm("当前策略有未保存修改，确认切换币种并放弃这些修改？")) event.preventDefault();
+    });
+    window.addEventListener("mika:currency-change", () => {
+        state.dirty = false; state.preview = null; state.previewPolicy = null;
+        state.draftVersionId = null; state.applyToken = null;
+        byId("v3StrategyForm").querySelectorAll(".v3-unit").forEach((node) => {
+            if (["USD", "USDT"].includes(node.textContent)) node.textContent = window.mikaV4.currency;
+        });
+        byId("v3PlanList").textContent = "等待当前币种预览";
+        for (const id of ["v3Principal", "v3Utilization", "v3PlanCount", "v3AccountSource", "v3ActiveVersion", "v3DraftVersion", "v3PendingVersion"]) byId(id).textContent = "--";
+        byId("v3Stats").replaceChildren();
+        byId("v3PeriodSelection").replaceChildren();
+        byId("v3PeriodActivity").replaceChildren();
+        loadAll().then((loaded) => { if (loaded) preview(); });
+    });
     renderShell();
     byId("v3StrategyForm").addEventListener("input", () => { state.dirty = true; updateDerived(); });
     byId("v3StrategyForm").addEventListener("change", () => { state.dirty = true; updateDerived(); });

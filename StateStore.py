@@ -1,12 +1,14 @@
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
+from Currency import normalize_currency, require_currency
 
 from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
 from Recovery import (
@@ -78,13 +80,49 @@ def slice_pool_layer(slice_key):
 
 
 class LendingStateStore:
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, currency="USD", config_path=None):
+        self.config_path = config_path
         self.path = os.path.abspath(path)
+        self.currency = require_currency(currency)
         self.clock = clock
         os.makedirs(os.path.dirname(self.path) or os.getcwd(), exist_ok=True)
         self._lock = threading.RLock()
+        self._check_existing_currency()
         self._backup_before_schema_migration()
         self._initialize()
+
+    def _check_existing_currency(self):
+        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
+            return
+        connection = sqlite3.connect(self.path)
+        try:
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "schema_meta" in tables:
+                row = connection.execute("SELECT value FROM schema_meta WHERE key='currency'").fetchone()
+                if row is not None and row[0] != self.currency:
+                    raise StateStoreError("state database belongs to another currency")
+                version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+                if version is not None and int(version[0]) > 17:
+                    raise StateStoreError("state database schema is newer than this application")
+            for table in ("offers", "credits", "order_intents", "funding_trades", "ledger_entries"):
+                if table not in tables:
+                    continue
+                columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if "currency" in columns:
+                    currencies = connection.execute(f"SELECT DISTINCT currency FROM {table}").fetchall()
+                    if any(normalize_currency(row[0]) != self.currency for row in currencies):
+                        raise StateStoreError("state database contains another currency")
+            # Unlabelled databases were USD-only, including their public market history.
+            if tables and self.currency != "USD" and "schema_meta" in tables:
+                row = connection.execute("SELECT value FROM schema_meta WHERE key='currency'").fetchone()
+                if row is None:
+                    raise StateStoreError("unlabelled legacy databases belong to USD")
+        finally:
+            connection.close()
+
+    def _validate_currency_rows(self, rows):
+        if any(normalize_currency(row.get("currency", self.currency)) != self.currency for row in rows):
+            raise StateStoreError("cannot write another currency into this state database")
 
     def _now_ms(self):
         return int(self.clock() * 1000)
@@ -100,7 +138,7 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 16:
+        if version >= 17:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -110,6 +148,8 @@ class LendingStateStore:
         while os.path.exists(backup_path):
             backup_path = os.path.join(backup_dir, f"schema-v{version}-{stamp}-{suffix}.sqlite3")
             suffix += 1
+        if self.config_path and os.path.isfile(self.config_path):
+            shutil.copy2(self.config_path, backup_path + ".cfg")
         source = sqlite3.connect(self.path)
         target = sqlite3.connect(backup_path)
         try:
@@ -524,15 +564,20 @@ class LendingStateStore:
             self._migrate_v15_exact_reprice_replacements(connection)
             self._migrate_v16_fixed_landing_rate(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '16')
-                   ON CONFLICT(key) DO UPDATE SET value='16'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '17')
+                   ON CONFLICT(key) DO UPDATE SET value='17'"""
+            )
+            connection.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('currency', ?)", (self.currency,))
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('release_4.0.0_started_at_ms', ?)",
+                (str(self._now_ms()),),
             )
             self._initialize_v35_release_boundary(connection, self._now_ms())
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
                     currency, status, updated_at_ms
-                ) VALUES('USD', 'PENDING', ?)""",
-                (self._now_ms(),),
+                ) VALUES(?, 'PENDING', ?)""",
+                (self.currency, self._now_ms()),
             )
             connection.execute(
                 """INSERT OR IGNORE INTO consolidation_state(singleton, state, updated_at_ms)
@@ -678,8 +723,7 @@ class LendingStateStore:
             existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
             if "pricing_curve_version" not in existing:
                 connection.execute(
-                    f"ALTER TABLE {table} ADD COLUMN pricing_curve_version "
-                    "TEXT NOT NULL DEFAULT 'LEGACY'"
+                    f"ALTER TABLE {table} ADD COLUMN pricing_curve_version TEXT NOT NULL DEFAULT 'LEGACY'"
                 )
 
     @staticmethod
@@ -841,6 +885,39 @@ class LendingStateStore:
         with self.read_connection() as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
         return dict(row)
+
+    def pause_currency(self, reason="dashboard_pause"):
+        """Revoke LIVE recovery without deleting evidence of an uncertain write."""
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
+            connection.execute(
+                "UPDATE runtime_state SET mode='PAUSED', previous_mode='PAUSED', updated_at_ms=? WHERE singleton=1",
+                (self._now_ms(),),
+            )
+            connection.execute(
+                "UPDATE recovery_state SET target_mode='PAUSED', origin_mode='PAUSED', resume_pending_cycle=0 "
+                "WHERE singleton=1"
+            )
+            if not row["safe_reason"]:
+                connection.execute("UPDATE recovery_state SET active=0 WHERE singleton=1")
+            connection.execute(
+                "INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms) VALUES(?,'PAUSED',?,?)",
+                (row["mode"], reason, self._now_ms()),
+            )
+        return self.runtime()
+
+    def authorize_live_after_preflight(self):
+        """Keep uncertainty while setting an explicitly confirmed resume destination."""
+        row = self.runtime()
+        if row["safe_manual"]:
+            raise StateStoreError("manual unresolved writes require resolution before LIVE")
+        if row["safe_reason"] or self.recovery_status()["active"]:
+            with self.transaction(immediate=True) as connection:
+                connection.execute("UPDATE runtime_state SET previous_mode='LIVE' WHERE singleton=1")
+                connection.execute("UPDATE recovery_state SET origin_mode='LIVE', target_mode='LIVE' WHERE singleton=1")
+        else:
+            self.set_mode("LIVE", "v4_preflight_confirmed")
+        return self.runtime()
 
     @staticmethod
     def _recovery_payload(row):
@@ -1217,6 +1294,7 @@ class LendingStateStore:
         return self.runtime()
 
     def save_strategy(self, policy_payload, status="PENDING"):
+        self._validate_currency_rows([policy_payload])
         status = str(status).upper()
         if status not in {"DRAFT", "PENDING", "ACTIVE", "ARCHIVED"}:
             raise StateStoreError("invalid strategy status")
@@ -1876,11 +1954,13 @@ class LendingStateStore:
             ):
                 start = None
             amount = abs(D(trade["amount"]))
-            result.append({
-                **dict(trade),
-                "amount": amount,
-                "wait_seconds": None if start is None or amount <= 0 else D(filled_at - start) / D("1000"),
-            })
+            result.append(
+                {
+                    **dict(trade),
+                    "amount": amount,
+                    "wait_seconds": None if start is None or amount <= 0 else D(filled_at - start) / D("1000"),
+                }
+            )
         return result
 
     @staticmethod
@@ -1890,7 +1970,8 @@ class LendingStateStore:
         valid_amount = sum((row["amount"] for row in valid), D("0"))
         average = (
             sum((row["amount"] * row["wait_seconds"] for row in valid), D("0")) / valid_amount
-            if valid_amount > 0 else None
+            if valid_amount > 0
+            else None
         )
         return {
             "averageWaitSeconds": None if average is None else _decimal_text(average),
@@ -1928,17 +2009,18 @@ class LendingStateStore:
             amount = sum((row["amount"] for row in rows), D("0"))
             summary = self._funding_wait_summary(rows)
             seconds = summary.pop("averageWaitSeconds")
-            traded.append({
-                "period": period,
-                "count": len(rows),
-                "amount": amount,
-                "weightedDailyRate": (
-                    sum((row["amount"] * D(row["rate"]) for row in rows), D("0")) / amount
-                    if amount else D("0")
-                ),
-                "weightedWaitMinutes": None if seconds is None else D(seconds) / D("60"),
-                **summary,
-            })
+            traded.append(
+                {
+                    "period": period,
+                    "count": len(rows),
+                    "amount": amount,
+                    "weightedDailyRate": (
+                        sum((row["amount"] * D(row["rate"]) for row in rows), D("0")) / amount if amount else D("0")
+                    ),
+                    "weightedWaitMinutes": None if seconds is None else D(seconds) / D("60"),
+                    **summary,
+                }
+            )
         return {
             "fromMs": int(since_ms),
             "toMs": None if until_ms is None else end,
@@ -1968,7 +2050,24 @@ class LendingStateStore:
             "after": self.period_activity(activated, currency, now + 1),
         }
 
+    def release_comparison_v4(self, now_ms=None):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key='release_4.0.0_started_at_ms'").fetchone()
+        activated = int(row[0])
+        elapsed = max(0, now - activated)
+        return {
+            "version": "4.0.0",
+            "label": "V4",
+            "activatedAtMs": activated,
+            "boundarySource": "FIRST_V4_START",
+            "comparisonDurationMs": elapsed,
+            "before": self.period_activity(activated - elapsed, self.currency, activated),
+            "after": self.period_activity(activated, self.currency, now + 1),
+        }
+
     def reserve_intent(self, order, wallet_available):
+        self._validate_currency_rows([order])
         fingerprint = order.get("fingerprint") or order_intent_fingerprint(
             order.get("currency", "USD"),
             order["amount"],
@@ -2015,9 +2114,7 @@ class LendingStateStore:
                     order.get("plan_hash"),
                     str(order.get("strategy_variant") or "baseline"),
                     str(order.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE),
-                    None
-                    if order.get("fixed_landing_rate") is None
-                    else _decimal_text(order["fixed_landing_rate"]),
+                    None if order.get("fixed_landing_rate") is None else _decimal_text(order["fixed_landing_rate"]),
                     now,
                     now,
                 ),
@@ -2886,6 +2983,7 @@ class LendingStateStore:
         return None if result is None else dict(result)
 
     def reconcile_offers(self, offers, seen_at_ms=None):
+        self._validate_currency_rows(offers)
         seen_at = int(seen_at_ms if seen_at_ms is not None else self._now_ms())
         ids = []
         with self.transaction(immediate=True) as connection:
@@ -2973,6 +3071,7 @@ class LendingStateStore:
             return [dict(row) for row in connection.execute(query).fetchall()]
 
     def adopt_external_offers(self, offers, strategy_version):
+        self._validate_currency_rows(offers)
         """Persist explicit preflight-approved ownership without touching the exchange."""
         adopted = []
         now = self._now_ms()
@@ -3153,6 +3252,7 @@ class LendingStateStore:
         return None if row is None else row["last_reprice"]
 
     def reconcile_credits(self, credits, seen_at_ms=None):
+        self._validate_currency_rows(credits)
         seen_at = int(seen_at_ms if seen_at_ms is not None else self._now_ms())
         ids = []
         with self.transaction(immediate=True) as connection:
@@ -3411,6 +3511,7 @@ class LendingStateStore:
         return len(active)
 
     def upsert_offer_history(self, offers):
+        self._validate_currency_rows(offers)
         with self.transaction(immediate=True) as connection:
             for offer in offers or []:
                 managed = (
@@ -3442,6 +3543,7 @@ class LendingStateStore:
                 )
 
     def upsert_credit_history(self, credits):
+        self._validate_currency_rows(credits)
         with self.transaction(immediate=True) as connection:
             for credit in credits or []:
                 managed = False
@@ -3611,6 +3713,7 @@ class LendingStateStore:
             )
 
     def upsert_income_ledgers(self, rows, category=28):
+        self._validate_currency_rows(rows)
         """Store authoritative interest ledger rows, keyed by Bitfinex ledger ID."""
         with self.transaction(immediate=True) as connection:
             for row in rows or []:
@@ -3737,7 +3840,7 @@ class LendingStateStore:
             reprices = connection.execute(
                 "SELECT COUNT(*) AS count FROM reprice_events WHERE created_at_ms >= ?", (start,)
             ).fetchone()["count"]
-            waits = self._funding_wait_records(connection, "USD", start, now + 1)
+            waits = self._funding_wait_records(connection, self.currency, start, now + 1)
             closures = connection.execute(
                 "SELECT * FROM credit_closures WHERE closed_at_ms >= ? ORDER BY closed_at_ms",
                 (start,),
@@ -3762,7 +3865,7 @@ class LendingStateStore:
             "closedCreditCount": len(closures),
             "returnsByPoolAndType": {key: _decimal_text(value) for key, value in sorted(attributed.items())},
         }
-        ledger_interest = self.realized_income("USD", None if window_days is None else start, now)
+        ledger_interest = self.realized_income(self.currency, None if window_days is None else start, now)
         if not rows:
             return {
                 "windowDays": window_days,
@@ -3789,7 +3892,7 @@ class LendingStateStore:
             idle_time += max(D("0"), total - utilized) * duration_days
         # APR is estimated only for the period where principal samples exist.
         # The displayed realized income can cover a wider ledger interval.
-        apr_interest = self.realized_income("USD", max(start, int(rows[0]["mts"])), now)
+        apr_interest = self.realized_income(self.currency, max(start, int(rows[0]["mts"])), now)
         sample_from = int(rows[0]["mts"])
         sample_to = int(rows[-1]["mts"])
         sample_days = D(max(0, sample_to - sample_from)) / D("86400000")

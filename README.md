@@ -1,11 +1,13 @@
-# Bitfinex-lendingbot 0.3.5.2 / V3.5
+# Bitfinex-lendingbot 4.0.0 / V4
 
 [![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
 [![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 
-面向单台 Windows 电脑、单一 Bitfinex 账户的 USD Funding 自动放贷工具。项目只保留 V3 策略；Dashboard 默认 `PAUSED`，只有完成真实账户只读预检并人工确认后才会启动 LIVE Worker。
+面向单台 Windows 电脑、单一 Bitfinex 账户的 USD / USDT Funding 自动放贷工具。V4 允许两种币同时运行，各自独立配置、记账和恢复；Dashboard 默认 `PAUSED`，完成所选币种的真实账户只读预检并人工确认后才会启动 LIVE。
+
+V4 的启用步骤、配置兼容、状态迁移与回滚见 [V4 发布说明](docs/v4-release.md)。旧版说明保留为历史资料，以 V4 说明为准。
 
 > [!WARNING]
 > 本项目会在 Bitfinex 账户中执行真实资金操作，不承诺收益。首次使用请保持 Dashboard 为 `PAUSED`，核对 API 权限、资金上限和最低净 APR，并从小额资金开始。
@@ -13,14 +15,14 @@
 ## 功能概览
 
 - 本地 Dashboard 管理策略、运行状态与人工确认，不向公网开放控制端口。
-- V3 短/中/长期限分层策略，提供资金上限、比例约束和最低净 APR 硬边界。
+- V4 延续短/中/长期限分层策略，USD、USDT 各有资金上限、比例约束和最低净 APR 硬边界。
 - 对超时、断线和不确定交易结果执行停写、对账与安全恢复，避免盲目重复下单。
 - 使用 SQLite 保存归属、审计和恢复状态，并提供历史数据回填与离线策略评估。
 - Windows GitHub Actions 持续验证 Python、前端语法、安全流程和测试覆盖率。
 
 ## 安全边界
 
-- 仅支持 `USD`，期限限定为 Bitfinex Funding 的 2–120 天。
+- 支持 `USD`、`USDT`；交易所 USDT 钱包代码为 `UST`、放贷市场为 `fUST`。期限限定为 2–120 天。不会自动兑换资金。
 - API 必须允许 wallets 读取、funding 读取/写入；withdraw 与 ui_withdraw 写权限必须关闭。
 - 机器人只撤改 SQLite 中能够证明归属的挂单。V3.5 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
 - 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；超过 `max(150 USD, 2%)` 容差时分阶段再平衡。
@@ -28,7 +30,7 @@
 - 除人工暂停/停止外，网络、认证、配置、市场数据、账户数据、程序异常和 Worker 重启故障都会统一进入 PAUSED 的只读恢复循环，并在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
-- SQLite 使用显式 Schema 16。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
+- SQLite 使用显式 Schema 17，USD 与 USDT 使用不同数据库。升级前备份数据库和配置，迁移在事务中完成；人工 PAUSED 和未决写入证据会保留。
 
 详细流程见 [安全恢复手册](docs/safety-recovery.md) 和 [架构说明](docs/architecture.md)。
 
@@ -56,7 +58,7 @@ $env:BITFINEX_API_KEY = "your-key"
 $env:BITFINEX_API_SECRET = "your-secret"
 ```
 
-在 `default.cfg` 中设置三个期限池的最低净 APR；它们没有默认值，缺失时 LIVE 会被阻止。`max_lend_amount`、`max_lend_percent`、最低净 APR、最低订单金额和权限要求始终是硬边界。
+在对应 `STRATEGY_V4_USD` / `STRATEGY_V4_USDT` 节中设置三个期限池的最低净 APR；它们没有默认值，缺失时 LIVE 会被阻止。USDT 默认禁用，启用前还必须设置正数的 `max_lend_amount`。金额均为该币种原生单位，不合并两币资金上限。USD 旧配置 `STRATEGY_V3` 仍可读取。
 
 ## 运行
 
@@ -73,6 +75,8 @@ python lendingbot.py --dashboard
 ```powershell
 python lendingbot.py --live
 ```
+
+仅启动 USDT 可使用 `python lendingbot.py --live --currencies USDT`；同时启动使用 `--currencies USD,USDT`。每个所选币种均需启用并通过预检。
 
 单周期验证：
 

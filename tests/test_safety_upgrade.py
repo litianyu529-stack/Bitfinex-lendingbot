@@ -206,7 +206,7 @@ def test_schema_v16_is_explicit(tmp_path):
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
         chain_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
-    assert version == "16"
+    assert version == "17"
     assert {
         "write_phase",
         "resolution",
@@ -336,7 +336,7 @@ def test_schema_v16_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "16"
+    assert version == "17"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 

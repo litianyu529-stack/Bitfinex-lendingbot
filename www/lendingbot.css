@@ -654,3 +654,9 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .build-blocker h1 { margin: 8px 0 18px; font-size: 28px; }
 .build-blocker div { line-height: 1.7; }
 .build-blocker small { display: block; margin-top: 20px; color: #efb0a8; }
+
+.v4-currencies { margin-bottom: 24px; padding: 20px; border: 1px solid #d7e3e3; border-radius: 16px; background: white; }
+.v4-overview, .v4-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+.v4-controls label { display: flex; align-items: center; gap: 8px; }
+.v4-controls select { padding: 8px; border: 1px solid #bdcccc; border-radius: 8px; }
+#v4SettingsMessage { min-height: 1.4em; margin-bottom: 0; }

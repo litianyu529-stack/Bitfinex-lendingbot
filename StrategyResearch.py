@@ -20,7 +20,7 @@ from StrategyV3 import (
     replay_strategy_v3,
     validate_policy_v3,
 )
-from bitfinex import BitfinexApiError
+from bitfinex import BitfinexApiError, currency_to_symbol
 
 
 D = Decimal
@@ -77,6 +77,7 @@ def backfill_public_market_data(
     minimum_interval_seconds=4.1,
     rate_limiter=None,
     retry_sleeper=time.sleep,
+    currency="USD",
 ):
     """Page public fUSD trades/stats without any authenticated or write call."""
     days = int(days)
@@ -96,7 +97,9 @@ def backfill_public_market_data(
     trade_pages = 0
     while trade_cursor < now:
         raw = _public_read(
-            lambda: client.funding_trades("fUSD", start=trade_cursor, end=now, limit=limit, sort=1),
+            lambda: client.funding_trades(
+                currency_to_symbol(currency), start=trade_cursor, end=now, limit=limit, sort=1
+            ),
             limiter,
             retry_sleeper,
         )
@@ -122,7 +125,9 @@ def backfill_public_market_data(
     stats_pages = 0
     while stats_cursor >= start:
         raw = _public_read(
-            lambda: client.funding_stats("fUSD", start=start, end=stats_cursor, limit=stats_limit),
+            lambda: client.funding_stats(
+                currency_to_symbol(currency), start=start, end=stats_cursor, limit=stats_limit
+            ),
             limiter,
             retry_sleeper,
         )
@@ -150,7 +155,7 @@ def backfill_public_market_data(
         and stats_coverage["earliestMs"] <= start + tolerance
     )
     return {
-        "symbol": "fUSD",
+        "symbol": currency_to_symbol(currency),
         "requestedDays": days,
         "startMs": start,
         "endMs": now,
@@ -365,7 +370,7 @@ def evaluate_strategies(store, active_policy, principal, days=90, now_ms=None):
     result = {
         "schemaVersion": 1,
         "generatedAtMs": now,
-        "symbol": "fUSD",
+        "symbol": currency_to_symbol(active_policy.currency),
         "principal": principal,
         "methodology": {
             "split": "chronological 60-day train / 15-day validation / 15-day test",

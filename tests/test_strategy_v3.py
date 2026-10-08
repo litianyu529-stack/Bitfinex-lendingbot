@@ -327,6 +327,41 @@ def test_fragmented_pool_deficits_use_one_order_within_allocation_tolerance():
     assert result["current_offer_amounts"][pool] + row["amount"] <= result["target_offer_amounts"][pool] + D("150")
 
 
+def test_wallet_cash_posts_at_or_above_floor_when_all_pool_targets_are_full():
+    selections = {
+        "short": selection_row((2, 7), 2, ("0.98", "0.01"), qualified=False),
+        "medium": selection_row((14, 30), 30, ("0.001", "0.001"), qualified=False),
+        "long": selection_row((120,), 120, ("0.008",), qualified=False),
+    }
+    for row in selections.values():
+        for score in row["scores"]:
+            score["rateDataAvailable"] = True
+    amount = D("506.23807920")
+    result = build_strategy_plan_v3(
+        D("13831.37192502"), amount, {},
+        limit_policy(short_floor_apr=D("0.0623")),
+        signals(
+            periodSelection={"byPool": selections},
+            anchor_rate=D("0.00013"), best_bid=D("0.00013"),
+            best_offer=D("0.00013"),
+            windows={"1h": {"median": D("0.00013")}, "24h": {"q75": D("0.00014")}},
+        ),
+        "wallet-cash",
+        existing_exposure={"total": D("13325.13384582")},
+        offer_exposure_by_pool={
+            "short": D("219.44404505"),
+            "medium": D("199.41069647"),
+            "long": D("183.62811429"),
+        },
+    )
+    assert result["wallet_deployment_pool"] == "short"
+    assert result["planned_amount"] == amount
+    assert result["idle_amount"] == 0
+    assert len(result["plan"]) == 3
+    assert all(row["pool"] == "short" and row["amount"] >= D("150") for row in result["plan"])
+    assert all(row["net_apr"] >= D("0.0623") for row in result["plan"])
+
+
 @pytest.mark.parametrize("cap", [None, D("13600")])
 def test_166_wallet_fragmentation_regression(monkeypatch, cap):
     monkeypatch.setattr("StrategyV3._pool_targets_v33", lambda *_args: (

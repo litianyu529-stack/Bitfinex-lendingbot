@@ -35,6 +35,18 @@
     </header>
 
     <main class="workspace">
+        <section class="v4-currencies" aria-label="双币种放贷控制">
+            <h2>V4 · USD / USDT</h2>
+            <div class="v4-overview"><p id="v4OverviewUSD">USD · 等待同步</p><p id="v4OverviewUSDT">USDT · 等待同步</p></div>
+            <div class="v4-controls">
+                <label>当前币种 <select id="v4Currency"><option>USD</option><option>USDT</option></select></label>
+                <label><input id="v4Enabled" type="checkbox">启用当前币种</label>
+                <label><input id="v4Transfer" type="checkbox">允许同币种钱包转入 Funding</label>
+                <button id="v4SaveSettings" class="button secondary" type="button">保存币种设置</button>
+                <button id="v4PauseCurrency" class="button secondary" type="button">暂停当前币种</button>
+            </div>
+            <p id="v4SettingsMessage" role="status" aria-live="polite"></p>
+        </section>
         <section id="overviewPanel" class="tab-panel" role="tabpanel" aria-labelledby="overviewTab">
             <div class="page-heading">
                 <div>
@@ -47,12 +59,12 @@
             <div class="control-room">
                 <div class="overview-main">
                     <section class="metric-strip" aria-label="资金和收益摘要">
-                        <article><span>总资金</span><strong id="totalCoins">--</strong><small id="totalCurrency">USD/UST</small></article>
+                        <article><span>总资金</span><strong id="totalCoins">--</strong><small id="totalCurrency">USD</small></article>
                         <article><span>已放贷</span><strong id="totalLent">--</strong><small>正在计息</small></article>
                         <article><span>挂单</span><strong id="totalOffers">--</strong><small id="offerCount">0 笔</small></article>
                         <article><span>可用余额</span><strong id="totalAvailable">--</strong><small>Funding 钱包</small></article>
-                        <article><span>今日收益</span><strong id="earningsToday">--</strong><small>USD · 真实入账</small></article>
-                        <article><span>30 日收益</span><strong id="earningsThirtyDays">--</strong><small>USD · 真实入账</small></article>
+                        <article><span>今日收益</span><strong id="earningsToday">--</strong><small data-currency-unit>USD · 真实入账</small></article>
+                        <article><span>30 日收益</span><strong id="earningsThirtyDays">--</strong><small data-currency-unit>USD · 真实入账</small></article>
                         <article><span>累计收益</span><strong id="earningsLifetime">--</strong><small id="incomeHistoryState">同步中</small></article>
                         <article><span>估算年化</span><strong id="earningsApy">--</strong><small>基于近 30 日</small></article>
                     </section>
@@ -62,7 +74,7 @@
                     <section class="market-surface" aria-labelledby="capitalTitle">
                         <div class="surface-heading">
                             <div><p class="eyebrow">CAPITAL ALLOCATION</p><h2 id="capitalTitle">资金分布</h2></div>
-                            <span id="statusSchemaBadge" class="schema-badge">实盘状态 v3</span>
+                            <span id="statusSchemaBadge" class="schema-badge">实盘状态 V4</span>
                         </div>
                         <div class="market-layout">
                             <div class="chart-block">
@@ -147,7 +159,7 @@
                         <div><dt>API 凭据</dt><dd id="credentialState">待检查</dd></div>
                         <div><dt>账户权限</dt><dd id="permissionState">待预检</dd></div>
                         <div><dt>状态协议</dt><dd id="schemaState">等待同步</dd></div>
-                        <div><dt>V3.5 上线</dt><dd id="releaseBoundary">等待同步</dd></div>
+                        <div><dt>V4 上线</dt><dd id="releaseBoundary">等待同步</dd></div>
                         <div><dt>上次同步</dt><dd id="railSync">--</dd></div>
                     </dl>
                     <button id="preflightButton" class="secondary-control" type="button">运行预检</button>
@@ -205,6 +217,7 @@
     </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="v4-dashboard.js?v=__MIKA_DASHBOARD_BUILD_ID__"></script>
     <script src="lendingbot.js?v=__MIKA_DASHBOARD_BUILD_ID__"></script>
     <script src="v3-dashboard.js?v=__MIKA_DASHBOARD_BUILD_ID__"></script>
 </body>

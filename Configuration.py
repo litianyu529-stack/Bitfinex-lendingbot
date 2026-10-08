@@ -7,13 +7,14 @@ import json
 import os
 import shutil
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from types import SimpleNamespace
 
 from bitfinex import Bitfinex
 from FileUtils import atomic_write_text
 from StateStore import LendingStateStore
+from Currency import SUPPORTED_CURRENCIES, require_currency
 from StrategyV3 import (
     StrategyPolicyV3,
     json_decimal,
@@ -49,6 +50,10 @@ class Settings:
     once: bool
     strategy_v3: StrategyPolicyV3
     state_db_file: str
+    policies: dict = field(default_factory=dict)
+    state_databases: dict = field(default_factory=dict)
+    enabled_currencies: tuple = ("USD",)
+    config_path: str | None = None
 
 
 def _settings_args():
@@ -146,14 +151,11 @@ V3_LIST_FIELDS = {
 V3_PERIOD_FIELDS = {"short_periods", "medium_periods", "long_periods"}
 V3_FIXED_FIELDS = {"max_pool_shift", "adopt_external_offers"}
 V3_CONFIG_FIELDS = tuple(
-    name
-    for name in StrategyPolicyV3.__dataclass_fields__
-    if name not in {"version", "currency", *V3_FIXED_FIELDS}
+    name for name in StrategyPolicyV3.__dataclass_fields__ if name not in {"version", "currency", *V3_FIXED_FIELDS}
 )
 
 
-def strategy_v3_from_config(config):
-    section = "STRATEGY_V3"
+def strategy_v3_from_config(config, section="STRATEGY_V3", base=None):
     values = {}
     if config.has_section(section):
         for field_name in V3_CONFIG_FIELDS:
@@ -185,7 +187,7 @@ def strategy_v3_from_config(config):
             else:
                 values[field_name] = Decimal(str(raw))
     try:
-        return validate_policy_v3(policy_v3_with_overrides(StrategyPolicyV3(), values))
+        return validate_policy_v3(policy_v3_with_overrides(base or StrategyPolicyV3(), values))
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -301,9 +303,13 @@ def ensure_active_strategy_v3(store, settings):
 
 
 def mirror_active_strategy_v3(config_path, policy):
+    config, _ = read_config(config_path)
+    section = f"STRATEGY_V4_{policy.currency}"
+    if policy.version == 3 and not config.has_section(section):
+        section = "STRATEGY_V3"
     update_config_file_preserving_comments(
         config_path,
-        {"STRATEGY_V3": strategy_v3_config_values(policy)},
+        {section: strategy_v3_config_values(policy)},
     )
 
 
@@ -354,7 +360,7 @@ def normalize_current_active_strategy(config_path):
         pre_version = hashlib.sha256(pre_serialized.encode("utf-8")).hexdigest()[:16]
         if pre_migration_active["version_id"] != pre_version:
             backup = backup_strategy_state(config_path, settings.state_db_file)
-    store = LendingStateStore(settings.state_db_file)
+    store = LendingStateStore(settings.state_db_file, config_path=config_path)
     active, policy = ensure_active_strategy_v3(store, settings)
     canonical = json_decimal(policy.__dict__)
     serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -377,6 +383,35 @@ def build_settings(args, config, config_created=False):
     api_secret = args.apisecret or os.environ.get("BITFINEX_API_SECRET") or get_option(config, "BITFINEX", "secret", "")
     currencies = split_csv(get_option(config, "BITFINEX", "currencies", "USD"))
 
+    legacy = strategy_v3_from_config(config)
+    policies = {}
+    databases = {}
+    enabled = []
+    usd_database = get_option(config, "BOT", "statedbfile", DEFAULT_V3_STATE_DB)
+    for currency in SUPPORTED_CURRENCIES:
+        section = f"STRATEGY_V4_{currency}"
+        base = (
+            replace(legacy, version=4, currency=currency)
+            if currency == "USD"
+            else StrategyPolicyV3(version=4, currency=currency)
+        )
+        policies[currency] = (
+            strategy_v3_from_config(config, section, base)
+            if config.has_section(section)
+            else legacy
+            if currency == "USD"
+            else base
+        )
+        databases[currency] = get_option(
+            config,
+            section,
+            "statedbfile",
+            usd_database
+            if currency == "USD"
+            else os.path.join(os.path.dirname(usd_database), "lendingbot-v4-usdt.sqlite3"),
+        )
+        if get_boolean(config, section, "enabled", currency == "USD" and currency in currencies):
+            enabled.append(currency)
     return Settings(
         api_key=api_key,
         api_secret=api_secret,
@@ -391,8 +426,12 @@ def build_settings(args, config, config_created=False):
         web_server=(args.startwebserver or config.getboolean("BOT", "startwebserver", fallback=False))
         and not args.no_server,
         once=args.once,
-        strategy_v3=strategy_v3_from_config(config),
-        state_db_file=get_option(config, "BOT", "statedbfile", DEFAULT_V3_STATE_DB),
+        strategy_v3=policies["USD"],
+        state_db_file=databases["USD"],
+        policies=policies,
+        state_databases=databases,
+        enabled_currencies=tuple(enabled),
+        config_path=getattr(args, "config", None),
     )
 
 
@@ -401,14 +440,32 @@ def validate_settings(settings):
         raise ConfigError("sleeptimeactive must be 1-3600")
     if settings.sleep_inactive < 1 or settings.sleep_inactive > 3600:
         raise ConfigError("sleeptimeinactive must be 1-3600")
-    if settings.currencies != ["USD"]:
-        raise ConfigError("strategy v3 supports exactly currencies = USD")
-    if set(settings.transferable_currencies) - {"USD"}:
-        raise ConfigError("transferablecurrencies can only contain USD")
+    if not settings.currencies or set(settings.currencies) - set(SUPPORTED_CURRENCIES):
+        raise ConfigError("currencies can only contain USD and USDT")
+    if len(set(settings.currencies)) != len(settings.currencies):
+        raise ConfigError("currencies must not contain duplicates")
+    if set(settings.transferable_currencies) - set(SUPPORTED_CURRENCIES):
+        raise ConfigError("transferablecurrencies can only contain USD and USDT")
+    paths = [os.path.normcase(os.path.realpath(path)) for path in settings.state_databases.values()]
+    if len(paths) != len(set(paths)):
+        raise ConfigError("USD and USDT must use different state database paths")
     try:
         validate_policy_v3(settings.strategy_v3)
+        for policy in settings.policies.values():
+            validate_policy_v3(policy)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+
+
+def settings_for_currency(settings, currency):
+    currency = require_currency(currency)
+    return replace(
+        settings,
+        strategy_v3=settings.policies[currency],
+        state_db_file=settings.state_databases[currency],
+        currencies=[currency],
+        transferable_currencies=[currency] if currency in settings.transferable_currencies else [],
+    )
 
 
 def decimal_percent_to_config(value):
@@ -434,7 +491,7 @@ def config_api_payload(config_path):
     settings = build_settings(_settings_args(), config)
     validate_settings(settings)
     client = Bitfinex(settings.api_key, settings.api_secret)
-    store = LendingStateStore(settings.state_db_file)
+    store = LendingStateStore(settings.state_db_file, config_path=config_path)
     active, active_policy = ensure_active_strategy_v3(store, settings)
     return {
         "configPath": os.path.abspath(config_path),

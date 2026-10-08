@@ -174,7 +174,7 @@ def build_strategy_settings(extra_bot=None):
 
 class BitfinexBotTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(APP_VERSION, "0.3.5.2")
+        self.assertEqual(APP_VERSION, "4.0.0")
 
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
@@ -721,6 +721,8 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(len(popen_calls), 1)
             self.assertEqual(sum(result is not None for result in results), 1)
             self.assertIn("--live", popen_calls[0][0][0])
+            command = popen_calls[0][0][0]
+            self.assertEqual(command[command.index("--currencies") + 1], "USD")
             self.assertTrue(store.recovery_status()["active"])
             lendingbot.stop_controlled_bot(config_path, context=context)
             lendingbot.cleanup_controlled_bot_handle(context)

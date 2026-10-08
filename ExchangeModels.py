@@ -1,12 +1,13 @@
 from decimal import Decimal
 
+from Currency import normalize_currency
+
 
 D = Decimal
 
 
 def _currency(value):
-    symbol = str(value or "USD").upper()
-    return symbol[1:] if symbol.startswith("F") else symbol
+    return normalize_currency(value or "USD")
 
 
 def parse_book(rows):
@@ -30,7 +31,7 @@ def parse_book(rows):
 
 def parse_wallet_rows(rows, currency="USD"):
     result = []
-    wanted = str(currency).upper()
+    wanted = normalize_currency(currency)
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 3:
             continue
@@ -58,7 +59,7 @@ def parse_wallet_rows(rows, currency="USD"):
 
 def parse_offer_rows(rows, currency="USD"):
     result = []
-    wanted = str(currency).upper()
+    wanted = normalize_currency(currency)
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 16:
             continue
@@ -90,7 +91,7 @@ def parse_offer_rows(rows, currency="USD"):
 
 def _parse_active_funding_rows(rows, currency="USD", funding_state="credit"):
     result = []
-    wanted = str(currency).upper()
+    wanted = normalize_currency(currency)
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 13:
             continue
@@ -131,7 +132,7 @@ def parse_loan_rows(rows, currency="USD"):
 
 def parse_funding_trade_history(rows, currency="USD"):
     result = []
-    wanted = str(currency).upper()
+    wanted = normalize_currency(currency)
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 7:
             continue

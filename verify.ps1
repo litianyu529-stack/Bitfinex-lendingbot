@@ -10,6 +10,9 @@ python -m compileall -q -f .
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m pytest -q `
+    --cov=Currency `
+    --cov=RuntimeV4 `
+    --cov=V4Service `
     --cov=RuntimeV3 `
     --cov=StateStore `
     --cov=StrategyV3 `
@@ -31,6 +34,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 node --check www/lendingbot.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 node --check www/v3-dashboard.js
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+node --check www/v4-dashboard.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 git diff --check

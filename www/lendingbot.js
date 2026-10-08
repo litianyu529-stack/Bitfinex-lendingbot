@@ -80,12 +80,12 @@ function apiError(response, data) {
 }
 
 async function getJson(url) {
-    const response = await fetch(url, { cache: "no-store" });
+    const response = await window.mikaV4.request(url, { cache: "no-store" });
     return apiError(response, await response.json());
 }
 
 async function postJson(url, payload = {}) {
-    const response = await fetch(url, {
+    const response = await window.mikaV4.request(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Mika-CSRF": dashboardCsrf },
         body: JSON.stringify(payload),
@@ -341,7 +341,7 @@ function repriceLabel(offer) {
         : "";
     const describe = (message) => pricing ? `${message} · ${pricing}` : message;
     if (state.repriceBlockedReason === "BELOW_REPOST_MINIMUM") {
-        return describe(`${age} · 剩余金额低于 150 USD，无法安全撤单重挂`);
+        return describe(`${age} · 剩余金额低于 150 ${window.mikaV4.currency}，无法安全撤单重挂`);
     }
     if (floorState === "REPRICE_PENDING") return describe(`${age} · 正在重挂到策略底线`);
     if (floorState === "REPRICE_REQUIRED") return describe(`${age} · 已到第 ${totalStages} 阶段 · 等待重挂到底线`);
@@ -464,7 +464,7 @@ function renderCreditGroup(definition, summary, credits) {
     const titleText = document.createElement("strong");
     const titleMeta = document.createElement("small");
     titleText.textContent = `${definition.label}贷出`;
-    titleMeta.textContent = `${definition.range} · ${summary.orderCount || 0} 笔 · ${formatAmount(summary.principal)} USD`;
+    titleMeta.textContent = `${definition.range} · ${summary.orderCount || 0} 笔 · ${formatAmount(summary.principal)} ${window.mikaV4.currency}`;
     title.append(titleText, titleMeta);
     heading.append(title);
     appendCreditGroupStat(heading, "加权平均日利率", formatPercent(summary.averageDailyRatePercent, 5));
@@ -558,7 +558,7 @@ function renderCredits(valid, stale, total) {
         ? formatPercent(overall.utilizationPercent, 1)
         : "--";
     $("creditIdleAmount").textContent = valid && snapshotAvailable
-        ? `未计息资金 ${formatAmount(Math.max(0, total - principal))} USD`
+        ? `未计息资金 ${formatAmount(Math.max(0, total - principal))} ${window.mikaV4.currency}`
         : "未计息资金 --";
     $("creditAverageRate").textContent = valid && snapshotAvailable
         ? formatPercent(overall.averageDailyRatePercent, 5)
@@ -573,7 +573,7 @@ function renderCredits(valid, stale, total) {
         ? `平均已贷 ${formatDays(overall.averageElapsedDays)}`
         : "平均已贷 --";
     $("creditDailyIncome").textContent = valid && snapshotAvailable
-        ? `${formatAmount(overall.estimatedNetIncomePerDay, 4)} USD`
+        ? `${formatAmount(overall.estimatedNetIncomePerDay, 4)} ${window.mikaV4.currency}`
         : "--";
     $("currentLendingRate").textContent = valid && snapshotAvailable
         ? formatPercent(overall.averageDailyRatePercent, 5)
@@ -612,17 +612,17 @@ function renderStatus() {
     const statistics = valid ? status.statistics || {} : {};
     const realized = valid ? status.realizedIncome || {} : {};
     const incomeSync = valid ? status.incomeHistorySync || {} : {};
-    const currency = status.strategyV3?.currency || status.outputCurrency?.currency || "USD";
+    const currency = status.strategyV3?.currency || status.outputCurrency?.currency || window.mikaV4.currency;
 
     $("totalCoins").textContent = accountValid ? formatAmount(total) : "--";
     $("totalLent").textContent = accountValid ? formatAmount(lent) : "--";
     $("totalOffers").textContent = accountValid ? formatAmount(offers) : "--";
     $("totalAvailable").textContent = accountValid ? formatAmount(available) : "--";
     $("totalCoins").title = accountValid
-        ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} USD；组成项对账 ${account.reconciliationStatus || "--"}`
+        ? `Funding 钱包余额 ${formatAmount(account.walletBalance)} ${window.mikaV4.currency}；组成项对账 ${account.reconciliationStatus || "--"}`
         : "";
     $("totalLent").title = accountValid
-        ? `Funding Credits ${formatAmount(account.creditPrincipal)} USD + Funding Loans ${formatAmount(account.loanPrincipal)} USD`
+        ? `Funding Credits ${formatAmount(account.creditPrincipal)} ${window.mikaV4.currency} + Funding Loans ${formatAmount(account.loanPrincipal)} ${window.mikaV4.currency}`
         : "";
     $("earningsToday").textContent = realized.today != null
         ? formatAmount(realized.today)
@@ -638,13 +638,13 @@ function renderStatus() {
         : "尚无记录";
     const incomeState = $("incomeHistoryState");
     if (incomeSync.status === "COMPLETE") {
-        incomeState.textContent = "USD · 全部历史真实入账";
+        incomeState.textContent = `${window.mikaV4.currency} · 全部历史真实入账`;
         incomeState.title = earliestIncomeDate === "尚无记录" ? "未发现利息入账" : `已覆盖至 ${earliestIncomeDate}`;
     } else if (incomeSync.status === "ERROR") {
-        incomeState.textContent = "USD · 同步警告 · 已保留结果";
+        incomeState.textContent = `${window.mikaV4.currency} · 同步警告 · 已保留结果`;
         incomeState.title = incomeSync.error || "历史收益将在后台自动重试";
     } else {
-        incomeState.textContent = `USD · 同步中 · 已覆盖至 ${earliestIncomeDate}`;
+        incomeState.textContent = `${window.mikaV4.currency} · 同步中 · 已覆盖至 ${earliestIncomeDate}`;
         incomeState.title = "正在后台向更早历史回填，不影响实盘交易";
     }
     incomeState.classList.toggle("income-warning", incomeSync.status === "ERROR");
@@ -684,9 +684,9 @@ function renderStatus() {
     $("railSync").textContent = status.last_update || "--";
 
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.5 · ${mode}`);
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V4 · ${mode}`);
     badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active || writeBlocked);
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.5 · 已过期" : `V3.5 · ${mode}`);
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V4 · 已过期" : `V4 · ${mode}`);
     const releaseComparison = status.releaseComparison || {};
     $("releaseBoundary").textContent = releaseComparison.activatedAtMs
         ? formatDateTime(releaseComparison.activatedAtMs)
@@ -694,8 +694,8 @@ function renderStatus() {
     $("releaseBoundary").title = releaseComparison.activatedAtMs
         ? `${releaseComparison.boundarySource === "LIVE_SESSION_BEFORE_EXACT_TERM_EXPLORATION"
             ? "按首笔新定价订单所在的 LIVE 会话确定"
-            : "按首次 V3.5 启动确定"}；订单与成交统计以此时间分为更新前后，并使用等长时间窗口对比。`
-        : "首次使用 V3.5 状态库时自动写入，不会随重启改变。";
+            : "按首次 V4 启动确定"}；订单与成交统计以此时间分为更新前后，并使用等长时间窗口对比。`
+        : "首次使用 V4 状态库时自动写入，不会随重启改变。";
 
     const market = valid && status.market?.anchor_rate != null ? safeNumber(status.market.anchor_rate) * 100 : null;
     const plan = Array.isArray(status.strategyV3?.plan) ? status.strategyV3.plan : [];
@@ -868,20 +868,20 @@ function renderPreflight(data) {
     $("warningSection").hidden = !warnings.childElementCount;
 
     const summary = data.summary || {};
-    if (summary.strategyVersion !== 3) {
+    if (![3, 4].includes(summary.strategyVersion)) {
         throw new Error("后端返回了非 V3 预检，已阻断启动");
     }
     const items = [
-        ["币种", "USD"],
+        ["币种", summary.currency || window.mikaV4.currency],
         ["策略来源", `SQLite ACTIVE · ${summary.activeStrategyVersion || "--"}`],
-        ["真实账户本金", `${formatAmount(summary.account?.total)} USD`],
-        ["真实可用余额", `${formatAmount(summary.account?.wallet)} USD`],
+        ["真实账户本金", `${formatAmount(summary.account?.total)} ${window.mikaV4.currency}`],
+        ["真实可用余额", `${formatAmount(summary.account?.wallet)} ${window.mikaV4.currency}`],
         ["允许订单类型", (summary.enabledOrderTypes || []).join(" / ") || "--"],
         ["目标期限资金池", Object.entries(summary.fundingPools || {}).map(([name, row]) => `${name} ${row.share}%`).join(" / ") || "--"],
         ["当前机器人挂单期限", allocationPercentages(summary.offerPoolAllocation)],
         ["目标成交层", Object.entries(summary.executionLayers || {}).map(([name, value]) => `${name} ${value}%`).join(" / ") || "--"],
         ["当前机器人挂单成交层", allocationPercentages(summary.offerLayerAllocation)],
-        ["资金上限", `${formatAmount(summary.fundingLimit?.effectiveCap)} USD · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
+        ["资金上限", `${formatAmount(summary.fundingLimit?.effectiveCap)} ${window.mikaV4.currency} · ${summary.fundingLimit?.maxPercent ?? "--"}%`],
         ["切片", `${summary.actualSlices ?? 0} / ${summary.targetSlices ?? 0} 笔`],
         ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
         ["启动后先撤销", `${(summary.pendingCancellations || []).length} 笔不兼容机器人挂单`],
@@ -890,14 +890,14 @@ function renderPreflight(data) {
         ["无法撤销的贷款", `${(summary.nonChangeableCredits || []).length} 笔`],
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
-    const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3.5 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} ${window.mikaV4.currency}`);
+    items.push(["实际 V4 计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
-        (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
+        (row) => `#${row.id} · ${formatAmount(row.amount)} ${window.mikaV4.currency} · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );
     if (adoptionRows.length) items.push(["待接管外部挂单明细", adoptionRows.join("；")]);
     const ratioRows = (summary.ratioRebalanceCancellations || []).map(
-        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} USD · ${row.period}天`
+        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} ${window.mikaV4.currency} · ${row.period}天`
     );
     if (ratioRows.length) items.push(["比例再平衡撤单明细", ratioRows.join("；")]);
     if (data.preflightId) {
@@ -1022,3 +1022,9 @@ window.mikaBuildReady.then((compatible) => {
     window.setInterval(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false)), 30000);
     window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
 });
+
+window.addEventListener("mika:currency-change", () => {
+    state.preflight = null; state.status = {}; state.config = null; state.control = null;
+    renderStatus(); renderControl(); refreshAll(true);
+});
+window.addEventListener("mika:currency-settings-change", () => refreshAll(true));

@@ -9,9 +9,10 @@ from decimal import Decimal
 from urllib import error, parse, request
 
 from DomainTypes import WriteOutcome, WriteResult
+from Currency import funding_symbol, normalize_currency, wallet_currency
 
 
-APP_VERSION = "0.3.5.2"
+APP_VERSION = "4.0.0"
 
 
 class BitfinexApiError(Exception):
@@ -352,7 +353,7 @@ class Bitfinex:
     def ledgers(self, currency=None, start=None, end=None, limit=None, wallet=None, category=None):
         path = "v2/auth/r/ledgers"
         if currency:
-            path += f"/{currency.strip().upper()}"
+            path += f"/{wallet_currency(currency)}"
         path += "/hist"
         payload = {}
         for key, value in (
@@ -411,8 +412,8 @@ class Bitfinex:
             {
                 "from": from_wallet,
                 "to": to_wallet,
-                "currency": currency,
-                "currency_to": currency,
+                "currency": wallet_currency(currency),
+                "currency_to": wallet_currency(currency),
                 "amount": str(amount),
             },
         )
@@ -423,8 +424,8 @@ class Bitfinex:
             {
                 "from": from_wallet,
                 "to": to_wallet,
-                "currency": currency,
-                "currency_to": currency,
+                "currency": wallet_currency(currency),
+                "currency_to": wallet_currency(currency),
                 "amount": str(amount),
             },
         )
@@ -453,17 +454,11 @@ class Bitfinex:
 
 
 def currency_to_symbol(currency):
-    currency = currency.strip().upper()
-    if currency.startswith("F"):
-        return currency
-    return f"f{currency}"
+    return funding_symbol(currency)
 
 
 def symbol_to_currency(symbol):
-    symbol = symbol.strip().upper()
-    if symbol.startswith("F"):
-        return symbol[1:]
-    return symbol
+    return normalize_currency(symbol)
 
 
 def decimal_from_api(value):

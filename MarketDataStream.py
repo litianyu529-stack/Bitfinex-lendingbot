@@ -6,6 +6,8 @@ import time
 from collections import deque
 from decimal import Decimal
 
+from Currency import normalize_currency
+
 from ExchangeModels import (
     parse_credit_rows,
     parse_funding_trade_history,
@@ -47,6 +49,9 @@ class BitfinexMarketDataHub:
         fallback_seconds=300,
         rest_stale_seconds=60,
         max_trades=20_000,
+        enable_public=True,
+        enable_auth=True,
+        auth_symbols=None,
     ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
@@ -55,6 +60,9 @@ class BitfinexMarketDataHub:
         self.fallback_ms = int(fallback_seconds) * 1000
         self.rest_stale_ms = int(rest_stale_seconds) * 1000
         self.max_trades = int(max_trades)
+        self.enable_public = enable_public
+        self.enable_auth = enable_auth
+        self.auth_symbols = tuple(auth_symbols or (symbol,))
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._threads = []
@@ -88,8 +96,8 @@ class BitfinexMarketDataHub:
         if self._threads:
             return
         self._stop.clear()
-        targets = [("bitfinex-public-ws", self._run_public)]
-        if self.api_key and self.api_secret:
+        targets = [("bitfinex-public-ws", self._run_public)] if self.enable_public else []
+        if self.enable_auth and self.api_key and self.api_secret:
             targets.append(("bitfinex-auth-ws", self._run_auth))
         for name, target in targets:
             thread = threading.Thread(name=name, target=target, daemon=True)
@@ -183,7 +191,7 @@ class BitfinexMarketDataHub:
             "authNonce": nonce,
             "authPayload": payload,
             "calc": 1,
-            "filter": [f"funding-{self.symbol}", "wallet"],
+            "filter": [*(f"funding-{symbol}" for symbol in self.auth_symbols), "wallet"],
         }
         with websocket_connect(
             AUTH_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20
@@ -424,7 +432,7 @@ class BitfinexMarketDataHub:
             auth_age = None if self._auth_last_message_ms is None else max(0, now - self._auth_last_message_ms)
             rest_age = None if self._rest_last_sync_ms is None else max(0, now - self._rest_last_sync_ms)
             public_ready = self._public_connected and self._book_snapshot_ready
-            wallet_currency = self.symbol[1:] if str(self.symbol).upper().startswith("F") else self.symbol
+            wallet_currency = normalize_currency(self.symbol)
             funding_wallets = [
                 row
                 for row in self._wallets.values()
@@ -478,9 +486,29 @@ class BitfinexMarketDataHub:
                 "lastError": self._last_error,
                 "book": [dict(row) for row in self._book.values()],
                 "trades": [dict(row) for row in self._trades],
-                "wallets": [dict(row) for row in self._wallets.values()],
-                "offers": [dict(row) for row in self._offers.values()],
-                "credits": [dict(row) for row in self._credits.values()],
-                "loans": [dict(row) for row in self._loans.values()],
-                "fundingTrades": [dict(row) for row in self._funding_trades],
+                "wallets": [
+                    dict(row)
+                    for row in self._wallets.values()
+                    if row is not None and normalize_currency(row.get("currency")) == wallet_currency
+                ],
+                "offers": [
+                    dict(row)
+                    for row in self._offers.values()
+                    if row is not None and normalize_currency(row.get("currency")) == wallet_currency
+                ],
+                "credits": [
+                    dict(row)
+                    for row in self._credits.values()
+                    if row is not None and normalize_currency(row.get("currency")) == wallet_currency
+                ],
+                "loans": [
+                    dict(row)
+                    for row in self._loans.values()
+                    if row is not None and normalize_currency(row.get("currency")) == wallet_currency
+                ],
+                "fundingTrades": [
+                    dict(row)
+                    for row in self._funding_trades
+                    if row is not None and normalize_currency(row.get("currency")) == wallet_currency
+                ],
             }
