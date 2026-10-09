@@ -294,6 +294,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             "/api/runtime/v4",
             "/api/stats/v4",
             "/api/control/v4/status",
+            "/api/research/v4/status",
         }:
             return False
         from Currency import require_currency
@@ -308,6 +309,8 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             currency = require_currency(currency)
             if path == "/api/config/v4":
                 result = service.config(currency)
+            elif path == "/api/research/v4/status":
+                result = service.research.status(currency)
             elif path == "/api/status/v4":
                 result = service.status(currency)
             else:
@@ -334,6 +337,11 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             "/api/strategy/v4/draft",
             "/api/strategy/v4/apply",
             "/api/strategy/v4/discard",
+            "/api/research/v4/evaluate",
+            "/api/research/v4/shadow/start",
+            "/api/research/v4/shadow/stop",
+            "/api/research/v4/cancel",
+            "/api/research/v4/resume",
         }
         if path not in routes:
             return False
@@ -346,7 +354,19 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": True, "bot": service.stop()})
             return True
         currency = require_currency(payload.get("currency"))
-        if path == "/api/config/v4":
+        if path.startswith("/api/research/v4/"):
+            if path.endswith(("/cancel", "/stop")):
+                result = service.research.stop(currency)
+            else:
+                kind = (
+                    service.research.status(currency).get("kind", "evaluate")
+                    if path.endswith("/resume")
+                    else "shadow"
+                    if path.endswith("/start")
+                    else "evaluate"
+                )
+                result = service.research.start(currency, kind, resume=path.endswith("/resume"))
+        elif path == "/api/config/v4":
             result = service.settings(payload)
         elif path == "/api/control/v4/preflight":
             result = service.preflight(payload.get("currencies") or [currency])

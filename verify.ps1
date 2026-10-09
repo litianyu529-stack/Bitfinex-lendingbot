@@ -16,6 +16,10 @@ python -m pytest -q `
     --cov=RuntimeV3 `
     --cov=StateStore `
     --cov=StrategyV3 `
+    --cov=StrategyV4 `
+    --cov=AdaptiveRuntime `
+    --cov=ResearchV4 `
+    --cov=ReplayV4 `
     --cov=WriteRecovery `
     --cov=Recovery `
     --cov-branch `
@@ -26,6 +30,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # V3.5 pure strategy core includes branch data from the run above and must stay
 # above the release threshold independently of the integration-heavy runtime.
 python -m coverage report --include=StrategyV3.py --fail-under=90
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+python -m coverage report --include=StrategyV4.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m coverage report --include=Recovery.py --fail-under=90

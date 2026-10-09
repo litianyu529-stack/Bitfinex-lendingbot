@@ -694,6 +694,9 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .currency-strategy .v3-monitor { grid-template-columns: minmax(0,1fr); }
 .currency-strategy .v3-monitor > section { grid-column: auto; }
 .log-currency-filter { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.v3-field select { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--ink); }
+.v3-field[hidden], .v3-check[hidden] { display: none; }
+.currency-strategy #v4AdaptiveDetails, .currency-strategy [data-ref="v4AdaptiveDetails"] { overflow-wrap: anywhere; }
 .log-currency-filter select { padding: 7px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 @media (max-width: 1099px) { .dual-grid { grid-template-columns: minmax(0,1fr); } }
 @media (max-width: 560px) {

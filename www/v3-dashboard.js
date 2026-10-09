@@ -14,6 +14,17 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
 
     const groups = [
         {
+            title: "策略引擎与长期保护",
+            description: "自适应 V1 按120天资金时间净收益动态分配；研究合格后才允许人工实盘启动。",
+            fields: [
+                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "现有策略"], ["adaptive_net_yield_v1", "自适应净收益 V1"]] }],
+                ["model_id", "冻结模型 ID", "text", "", { placeholder: "研究评估后选择模型" }],
+                ["long_from_days", "长期起始天数", "number", "天", { min: 8, max: 120 }],
+                ["long_max_share", "长期贷款与挂单上限", "number", "%", { min: 1, max: 100 }],
+                ["maximum_period", "最长放贷期限", "number", "天", { min: 8, max: 120 }],
+            ],
+        },
+        {
             title: "目标期限资金池",
             description: "配置比例是短、中、长的正常目标；全市场需求和成交概率决定池内期限与低需求池的最低150美元保留额。已成交 Credits 不参与新挂单配比。",
             fields: [
@@ -97,11 +108,14 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     function createField([name, label, type, unit, options]) {
         const wrapper = document.createElement("label");
         wrapper.className = type === "checkbox" ? "v3-check" : "v3-field";
-        const input = document.createElement("input");
+        const input = document.createElement(type === "select" ? "select" : "input");
         input.name = name;
-        input.type = type;
+        if (type !== "select") input.type = type;
+        for (const [value, text] of options.choices || []) {
+            const option = document.createElement("option"); option.value = value; option.textContent = text; input.append(option);
+        }
         for (const [key, value] of Object.entries(options || {})) {
-            if (["floor"].includes(key)) continue;
+            if (["floor", "choices"].includes(key)) continue;
             if (typeof value === "boolean") {
                 if (value) input.setAttribute(key, "");
             } else input.setAttribute(key, value);
@@ -166,6 +180,14 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                         <div><dt>计划订单</dt><dd id="v3PlanCount">--</dd></div>
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
+                    <section><h2>${currency} 策略研究</h2><p id="v4ResearchState">尚未研究</p>
+                        <button id="v4Template" class="button secondary" type="button">载入自适应草稿模板</button>
+                        <button id="v4Evaluate" class="button secondary" type="button">评估 ${currency}</button>
+                        <button id="v4Shadow" class="button secondary" type="button">影子观察 ${currency}</button>
+                        <button id="v4ResearchStop" class="button secondary" type="button">取消研究 / 停止观察</button>
+                        <button id="v4ResearchResume" class="button secondary" type="button">恢复研究</button>
+                        <div id="v4AdaptiveDetails"></div>
+                    </section>
                     <section><h2>实际统计</h2><div id="v3Stats" class="v3-stats"></div></section>
                     <section><h2>期限自主选择</h2><div id="v3PeriodSelection" class="v3-period-selection"><p>等待市场评分</p></div></section>
                     <section><h2>近24小时期限分布</h2><div id="v3PeriodActivity" class="v3-period-activity"><p>等待运行数据</p></div></section>
@@ -238,7 +260,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                 value = periodFields.has(name) ? value.join(",") : value.join(" / ");
             }
             if (element.type === "checkbox") element.checked = Boolean(value);
-            else element.value = value ?? "";
+            else element.value = value ?? ({strategy_engine: "legacy_v3", long_from_days: 31, long_max_share: 95, maximum_period: 120}[name] ?? "");
         }
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         state.dirty = false;
@@ -246,7 +268,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function collectPolicy() {
-        const policy = {};
+        const policy = {...state.policy};
         for (const name of allFields) {
             const element = input(name);
             if (element.type === "checkbox") policy[name] = element.checked;
@@ -263,6 +285,11 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function validateForm() {
+        if (input("strategy_engine").value === "adaptive_net_yield_v1") {
+            if (numberValue("short_floor_apr") <= 0 || numberValue("long_floor_apr") < numberValue("short_floor_apr")) throw new Error("请设置短期底线和不低于短期的长期底线");
+            if (!(8 <= numberValue("long_from_days") && numberValue("long_from_days") <= numberValue("maximum_period") && numberValue("maximum_period") <= 120)) throw new Error("长期边界和最长期限必须在8～120天内");
+            return;
+        }
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
         if (poolTotal !== 100) throw new Error(`期限资金池比例当前为 ${poolTotal}%，必须等于100%`);
@@ -311,7 +338,19 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function updateDerived() {
-        const fee = numberValue("normal_fee_rate") / 100;
+        const adaptive = input("strategy_engine").value === "adaptive_net_yield_v1";
+        const fee = Math.max(adaptive ? 15 : 0, numberValue("normal_fee_rate")) / 100;
+        const legacyFields = new Set(["short_share", "medium_share", "long_share", "short_periods", "medium_periods", "long_periods", "quick_share", "balanced_share", "high_share", "balanced_start_premium_percent", "high_start_premium_percent", "balanced_landing_stage", "high_landing_stage", "enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "enable_hidden", "variable_max_share", "hidden_max_share", "hidden_fee_rate"]);
+        for (const name of allFields) input(name).closest("label").hidden = adaptive && (legacyFields.has(name) || name.endsWith("_reprice_stages_minutes"));
+        for (const name of ["model_id", "long_from_days", "long_max_share", "maximum_period"]) input(name).closest("label").hidden = !adaptive;
+        if (adaptive) {
+            input("medium_floor_apr").value = input("short_floor_apr").value;
+            input("enable_limit").checked = true;
+            for (const name of ["enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "enable_hidden"]) input(name).checked = false;
+        }
+        input("medium_floor_apr").readOnly = adaptive;
+        surface.querySelector(".v3-fixed-safety").hidden = adaptive;
+        for (const description of surface.querySelectorAll(".v3-section-heading > p")) description.hidden = adaptive;
         for (const pool of ["short", "medium", "long"]) {
             const apr = numberValue(`${pool}_floor_apr`);
             const hint = surface.querySelector(`[data-daily-floor="${pool}"]`);
@@ -320,7 +359,26 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
-        byId("v3AllocationHint").textContent = `资金池 ${poolTotal}% · 成交层 ${layerTotal}%`;
+        byId("v3AllocationHint").textContent = adaptive ? "动态分配 · 最多8单 · 调整需两次确认 · 普通费用保守按至少15%计算" : `资金池 ${poolTotal}% · 成交层 ${layerTotal}%`;
+    }
+
+    function renderAdaptive(plan) {
+        const box = byId("v4AdaptiveDetails"); box.replaceChildren();
+        if (plan?.engine !== "adaptive_net_yield_v1") return;
+        const description = document.createElement("p");
+        description.textContent = `模型 ${plan.modelId || "未选择"} · ${plan.confidence === "LOW" ? "低置信度" : plan.confidence || "未校准"} · ${plan.eligibleForLiveCandidate ? "研究合格候选" : "研究中"}。${(plan.blockReasons || []).join("；")}`;
+        box.append(description);
+        for (const row of (plan.candidates || []).slice(0, 8)) {
+            const line = document.createElement("p");
+            line.textContent = `${row.period}天 · 报价净年化 ${(Number(row.netApr) * 100).toFixed(2)}% · 保守资金时间年化 ${(Number(row.conservativeNetApr) * 100).toFixed(2)}% · 预期净利息 ${Number(row.expectedNetInterest).toFixed(2)} ${currency} / ${Number(row.amount).toFixed(2)} ${currency} · 成交概率 ${(Number(row.expectedFillProbability) * 100).toFixed(1)}% · 等待 ${row.expectedWaitMinutes == null ? "未知" : Number(row.expectedWaitMinutes).toFixed(1) + "分钟"} · 持有 ${row.expectedHoldingHours == null ? "未知" : Number(row.expectedHoldingHours).toFixed(1) + "小时"}`;
+            box.append(line);
+        }
+        for (const row of plan.decisions || []) {
+            const line = document.createElement("p");
+            const labels = {KEEP: "保持", CANCEL: "调整", WAIT: "等待", QUEUE_VALUE: "重新排队收益不足", MINIMUM_AGE: "未达最短保留时间", VALUE_GAIN: "收益优势成立", HARD_FLOOR: "安全底线调整", EXTERNAL_OFFER: "外部挂单", EVALUATION_INTERVAL: "等待下一评估周期"};
+            line.textContent = `${row.offerId || ""} ${labels[row.action] || row.action} · ${labels[row.reason] || row.reason} · 优势 ${row.aprGain == null ? "—" : (Number(row.aprGain) * 100).toFixed(2) + "个百分点"} · 累计等待 ${row.cumulativeWaitMinutes == null ? "未知" : Number(row.cumulativeWaitMinutes).toFixed(1) + "分钟"}`;
+            box.append(line);
+        }
     }
 
     function percentDaily(value) {
@@ -389,6 +447,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         state.preview = data;
         const signals = data.signals || {};
         const plan = data.plan || {};
+        renderAdaptive(plan);
         byId("v3Regime").textContent = signals.regime || "--";
         byId("v3Frr").textContent = percentDaily(signals.frr_daily_rate);
         byId("v3BestBid").textContent = percentDaily(signals.best_bid);
@@ -412,6 +471,8 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                 OFFER_RATIOS_SATISFIED: "当前挂单比例已在允许范围内",
                 MARKET_BELOW_FLOOR: "当前市场利率低于收益下限",
                 FUNDING_CAP_REACHED: "已达到最大放贷资金上限",
+                MODEL_UNAVAILABLE: "模型缺失、损坏或币种不匹配；保持研究状态",
+                WAIT_FOR_VALUE: "当前报价收益优势不足，保留资金等待",
             };
             empty.textContent = reasons[plan.emptyReason || plan.empty_reason] || (data.warnings || []).join("；") || "当前没有新挂单计划";
             list.append(empty);
@@ -444,6 +505,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     function renderRuntime(data, status) {
         const runtime = data.runtime || {};
         state.runtime = runtime;
+        if (!state.dirty && !state.saving) renderAdaptive(status?.strategyV3);
         byId("v3Mode").textContent = data.displayMode || runtime.mode || "PAUSED";
         for (const [id, version] of [
             ["v3ActiveVersion", data.activeStrategy?.version_id],
@@ -532,6 +594,10 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         let config;
         try {
             config = await requestJson("/api/config");
+            state.template = config.adaptiveTemplate;
+            state.candidate = config.candidateModel;
+            const research = config.research || {};
+            byId("v4ResearchState").textContent = `${research.state || "IDLE"} · ${research.phase || ""} · ${research.report?.reason || research.error || "软件验证与收益研究分别验收"}`;
             if (sequence !== state.loadSequence) return false;
             if (!state.dirty && revision === state.editRevision) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
         } catch (error) {
@@ -678,6 +744,16 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     byId("v3PauseButton").addEventListener("click", () => setMode("PAUSED"));
     byId("v3ReplayButton").addEventListener("click", () => setMode("REPLAY"));
     byId("v3LiveButton").addEventListener("click", () => context.overview.runPreflight());
+    byId("v4Template").addEventListener("click", () => {
+        if (!state.template) return;
+        fillPolicy({...state.policy, ...state.template, model_id: state.candidate?.id || ""}); edited();
+    });
+    for (const [id, path] of [["v4Evaluate", "evaluate"], ["v4Shadow", "shadow/start"], ["v4ResearchStop", "cancel"], ["v4ResearchResume", "resume"]]) {
+        byId(id).addEventListener("click", async () => {
+            try { const data = await postJson(`/api/research/v4/${path}`, {currency}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
+            catch (error) { byId("v4ResearchState").textContent = error.message; }
+        });
+    }
     renderControls();
     loadAll().then((loaded) => { if (loaded && !state.dirty && !state.saving) preview(); });
     window.setInterval(loadAll, 15000);

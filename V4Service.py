@@ -68,6 +68,14 @@ class V4DashboardService:
         self.status_path = status_path
         self.context = context
         self.tokens = {}
+        from ResearchV4 import ResearchJobs
+
+        def store_factory(currency):
+            import lendingbot as app
+
+            return app.v3_store_for_config(self.config_path, currency)[0]
+
+        self.research = ResearchJobs(store_factory, context.now)
 
     def _client(self, settings):
         factory = self.context.client_factory or Bitfinex
@@ -80,6 +88,10 @@ class V4DashboardService:
         settings = load_profiles(self.config_path)
         store, selected = app.v3_store_for_config(self.config_path, currency)
         active, policy = ensure_active_strategy_v3(store, selected)
+        from StrategyV4 import adaptive_template
+        from ResearchV4 import ModelRepository
+
+        candidate = ModelRepository(store.path, currency).candidate(int(self.context.now() * 1000))
         return {
             "credentialsConfigured": self._client(settings).has_credentials(),
             "currency": currency,
@@ -94,6 +106,11 @@ class V4DashboardService:
             else None,
             "activeStrategy": active,
             "supportedCurrencies": list(SUPPORTED_CURRENCIES),
+            "adaptiveTemplate": strategy_v3_api_values(adaptive_template(policy)),
+            "candidateModel": None
+            if candidate is None
+            else {key: candidate[key] for key in ("id", "confidence", "coverage", "eligibleForLiveCandidate")},
+            "research": self.research.status(currency),
         }
 
     def runtime(self):
@@ -227,6 +244,7 @@ class V4DashboardService:
                 "activeStrategyVersion",
                 "policyHash",
                 "planHash",
+                "modelHash",
                 "accountDigest",
                 "externalAdoptionDigest",
                 "pendingCancellations",
@@ -465,7 +483,17 @@ def run_worker(args, settings, context, log):
             log.persistStatus()
             if args.once:
                 break
-            time.sleep(min(settings.sleep_active, 30))
+            time.sleep(
+                min(
+                    settings.sleep_active,
+                    10
+                    if any(
+                        runtime.policy.strategy_engine == "adaptive_net_yield_v1"
+                        for runtime in coordinator.runtimes.values()
+                    )
+                    else 30,
+                )
+            )
     except KeyboardInterrupt:
         pass
     finally:

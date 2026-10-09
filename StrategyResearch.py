@@ -89,11 +89,8 @@ def backfill_public_market_data(
     stats_limit = min(250, limit)
     limiter = rate_limiter or PublicRateLimiter(minimum_interval_seconds)
 
-    existing_trades = store.market_trades(start, now)
-    existing_trade_coverage = _coverage(existing_trades)
     trade_cursor = start
-    if existing_trade_coverage["earliestMs"] is not None and existing_trade_coverage["earliestMs"] <= start + DAY_MS:
-        trade_cursor = int(existing_trade_coverage["latestMs"]) + 1
+    gaps, boundaries, seen = [], [], set()
     trade_pages = 0
     while trade_cursor < now:
         raw = _public_read(
@@ -104,24 +101,26 @@ def backfill_public_market_data(
             retry_sleeper,
         )
         parsed = parse_funding_trades(raw)
+        fresh = [row for row in parsed if str(row["id"]) not in seen]
+        seen.update(str(row["id"]) for row in parsed)
         store.upsert_market_trades(parsed)
         trade_pages += 1
         if len(raw or []) < limit:
             break
         if not parsed:
             raise RuntimeError("funding trade page contained no usable cursor")
-        next_cursor = max(int(row["mts"]) for row in parsed) + 1
+        next_cursor = max(int(row["mts"]) for row in parsed)
+        boundaries.append({"fromMs": trade_cursor, "throughMs": next_cursor, "uniqueIds": len(fresh)})
         if next_cursor <= trade_cursor:
-            raise RuntimeError("funding trade pagination cursor did not advance")
+            gaps.append(
+                {"atMs": trade_cursor, "reason": "timestamp page boundary saturated; ID pagination unavailable"}
+            )
+            break
         trade_cursor = next_cursor
 
     # Funding stats are returned newest-first by the public history endpoint, so
     # page backwards by end timestamp.  Upserts make restart/repetition idempotent.
-    existing_stats = store.funding_stats(start, now)
-    existing_stats_coverage = _coverage(existing_stats)
     stats_cursor = now
-    if existing_stats_coverage["latestMs"] is not None and existing_stats_coverage["latestMs"] >= now - 15 * 60 * 1000:
-        stats_cursor = int(existing_stats_coverage["earliestMs"]) - 1
     stats_pages = 0
     while stats_cursor >= start:
         raw = _public_read(
@@ -149,12 +148,13 @@ def backfill_public_market_data(
     stats_coverage = _coverage(stats)
     tolerance = DAY_MS
     complete = bool(
-        trade_coverage["earliestMs"] is not None
+        not gaps
+        and trade_coverage["earliestMs"] is not None
         and trade_coverage["earliestMs"] <= start + tolerance
         and stats_coverage["earliestMs"] is not None
         and stats_coverage["earliestMs"] <= start + tolerance
     )
-    return {
+    coverage = {
         "symbol": currency_to_symbol(currency),
         "requestedDays": days,
         "startMs": start,
@@ -164,11 +164,19 @@ def backfill_public_market_data(
         "trades": trade_coverage,
         "stats": stats_coverage,
         "complete": complete,
+        "gaps": gaps,
+        "tradePageBoundaries": boundaries,
         "bookHistory": {
             "backfillable": False,
             "note": "Historical order-book snapshots are unavailable; minute snapshots begin at deployment.",
         },
     }
+    from pathlib import Path
+
+    directory = Path(store.path).resolve().parent / "research" / currency
+    directory.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(str(directory / "public-coverage.json"), json.dumps(coverage, sort_keys=True))
+    return coverage
 
 
 def _policy_id(policy):
@@ -260,8 +268,9 @@ def _window_metrics(policy, trades, stats, principal, start_ms, end_ms):
         "netAprPercent": D(result["actualNetAprPercent"]),
         "utilizationPercent": D(result["estimatedUtilizationPercent"]),
         "fillCount": len(fills),
-        "averageWaitMinutes": D("0") if fills else elapsed_days * D("1440"),
-        "cancellationRatePercent": D("0"),
+        "averageWaitMinutes": None,
+        "cancellationRatePercent": None,
+        "timingEvidence": "旧聚合回放不具有逐订单等待与撤单证据；请使用V4事件回放",
         "longOccupancyPercent": D("0") if not fills else D(len(long_fills)) * D("100") / D(len(fills)),
         "sampleCount": int(result["sampleCount"]),
     }

@@ -122,6 +122,7 @@ V3_PERCENT_FIELDS = {
     "outlier_min_volume_share",
 }
 V3_BOOL_FIELDS = {
+    "fee_verified",
     "enable_limit",
     "enable_frr",
     "enable_frr_delta_fixed",
@@ -130,6 +131,7 @@ V3_BOOL_FIELDS = {
     "adopt_external_offers",
 }
 V3_INT_FIELDS = {
+    "long_from_days", "maximum_period",
     "minimum_offer_minutes",
     "reprice_cooldown_minutes",
     "max_reprices_per_hour",
@@ -184,6 +186,8 @@ def strategy_v3_from_config(config, section="STRATEGY_V3", base=None):
                 values[field_name] = raw
             elif field_name in V3_LIST_FIELDS:
                 values[field_name] = tuple(int(item.strip()) for item in str(raw).split(",") if item.strip())
+            elif field_name in {"strategy_engine", "model_id"}:
+                values[field_name] = str(raw)
             else:
                 values[field_name] = Decimal(str(raw))
     try:
@@ -270,6 +274,8 @@ def strategy_v3_from_api_payload(payload, base=None):
         elif field_name in V3_LIST_FIELDS:
             raw = value if isinstance(value, (list, tuple)) else str(value).split(",")
             values[field_name] = tuple(int(item) for item in raw if str(item).strip())
+        elif field_name in {"strategy_engine", "model_id"}:
+            values[field_name] = str(value or "")
         else:
             values[field_name] = Decimal(str(value))
     try:

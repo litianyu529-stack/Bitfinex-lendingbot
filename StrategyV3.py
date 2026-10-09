@@ -168,6 +168,12 @@ def rate_below_floor(rate, floor):
 class StrategyPolicyV3:
     version: int = 3
     currency: str = "USD"
+    strategy_engine: str = "legacy_v3"
+    long_from_days: int = 31
+    long_max_share: D = D("95")
+    maximum_period: int = 120
+    model_id: str = ""
+    fee_verified: bool = False
     short_share: D = D("50")
     medium_share: D = D("35")
     long_share: D = D("15")
@@ -236,6 +242,12 @@ class StrategyPolicyV3:
 
 
 V3_FIELD_CONVERTERS = {
+    "strategy_engine": str,
+    "long_from_days": int,
+    "long_max_share": _d,
+    "maximum_period": int,
+    "model_id": str,
+    "fee_verified": _bool,
     "version": int,
     "currency": str,
     "short_share": _d,
@@ -301,6 +313,8 @@ def policy_v3_with_overrides(base, values):
 
 
 def validate_policy_v3(policy, require_live_floors=False):
+    from StrategyV4 import validate_adaptive
+    validate_adaptive(policy)
     if policy.version not in {3, 4}:
         raise ValueError("strategy version must be 3 or 4")
     require_currency(policy.currency)

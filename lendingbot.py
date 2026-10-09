@@ -116,6 +116,10 @@ WORKER_BUILD_FILES = (
     "StateStore.py",
     "StrategyV3.py",
     "StrategyResearch.py",
+    "StrategyV4.py",
+    "ResearchV4.py",
+    "ReplayV4.py",
+    "AdaptiveRuntime.py",
     "WriteRecovery.py",
     "Recovery.py",
     "Currency.py",
@@ -543,7 +547,12 @@ def _strategy_v3_preview(
     account, planned_snapshot, adoption_candidates = proposed_external_adoption(account_snapshot, policy)
     book, trades, stats, signals, warnings = load_v3_market_context(client, policy, now)
     warnings = [*basis["warnings"], *warnings]
+    if policy.strategy_engine == "adaptive_net_yield_v1":
+        from AdaptiveRuntime import context
+
+        signals["adaptiveContext"] = context(store, policy, book, trades, now)
     result = LendingRuntimeV3._build_plan(account, policy, signals, proposed_version)
+    signals.pop("adaptiveContext", None)
     if not policy_v3_to_json(policy)["floorsConfigured"]:
         warnings.append("三个最低净年化尚未全部填写；允许预览，但 LIVE 将被阻止。")
     proposed_record = {"version_id": proposed_version, "policy": json_decimal(policy.__dict__)}
@@ -585,7 +594,9 @@ def _strategy_v3_preview(
         "ratioRebalanceCancellations": json_decimal(
             LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
         ),
-        "replay": replay_strategy_v3(policy, trades, stats, account["total"], book, now),
+        "replay": {"state": "RESEARCH_REQUIRED", "note": "收益资格通过异步研究评估；即时预览不证明收益"}
+        if policy.strategy_engine == "adaptive_net_yield_v1"
+        else replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
         "buildId": dashboard_build_id(),
@@ -605,6 +616,7 @@ def _strategy_v3_preview(
             "policyHash": _canonical_sha256(policy.__dict__),
             "accountDigest": account_digest,
             "planHash": result["plan_hash"],
+            "modelHash": result.get("modelId"),
         }
         with strategy_token_lock:
             strategy_preview_tokens[token] = context
@@ -665,6 +677,21 @@ def v3_credit_violations(credit, policy):
 
 
 def v3_offer_violations(offer, policy):
+    if policy.strategy_engine == "adaptive_net_yield_v1":
+        from StrategyV4 import gross_floor
+
+        period = int(offer.get("period") or 0)
+        effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
+        return [
+            reason
+            for reason, invalid in (
+                ("disabled_type", v3_offer_display_type(offer) != "LIMIT"),
+                ("hidden_disabled", bool(int(offer.get("flags") or 0))),
+                ("period_not_allowed", not 2 <= period <= policy.maximum_period),
+                ("below_new_floor", effective < gross_floor(policy, period)),
+            )
+            if invalid
+        ]
     pool = offer.get("pool") or pool_for_period(int(offer.get("period") or 0))
     display_type = v3_offer_display_type(offer)
     hidden = bool(int(offer.get("flags") or 0) & 64) or bool(offer.get("hidden"))
@@ -816,6 +843,10 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     if draft_version != draft["version_id"] or context["draftVersionId"] != draft["version_id"]:
         raise ApiRequestError("待应用草稿与已确认版本不一致", "PREVIEW_STALE", 409)
     draft_policy = strategy_v3_from_record(draft)
+    if any(r.get("policy", {}).get("strategy_engine") == "adaptive_net_yield_v1" for r in (draft, active)) and (
+        store.runtime()["mode"] == "LIVE" or store.recovery_status()["active"]
+    ):
+        raise ApiRequestError("先暂停该币种并完成恢复，再应用自适应策略", "CURRENCY_PAUSE_REQUIRED", 409)
     refreshed = strategy_v3_preview(
         config_path,
         {"strategyV3": strategy_v3_api_values(draft_policy)},
@@ -825,7 +856,11 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
         currency=currency,
         v4=context.get("v4", False),
     )
-    if refreshed["accountDigest"] != context["accountDigest"] or refreshed["plan"]["plan_hash"] != context["planHash"]:
+    if (
+        refreshed["accountDigest"] != context["accountDigest"]
+        or refreshed["plan"]["plan_hash"] != context["planHash"]
+        or refreshed["plan"].get("modelId") != context.get("modelHash")
+    ):
         raise ApiRequestError(
             "账户或计划已变化，请检查新预览后再次确认",
             "PREVIEW_STALE",
@@ -1354,7 +1389,20 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
     for message in market_warnings:
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
+    if policy.strategy_engine == "adaptive_net_yield_v1":
+        from AdaptiveRuntime import context as adaptive_context, eligible
+
+        signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now)
+        model = signals["adaptiveContext"]["model"]
+        qualified = eligible(store, model)
+        add_check(
+            "adaptive_model",
+            "自适应模型研究资格",
+            qualified,
+            "冻结模型已通过收益研究" if qualified else "模型缺失、损坏或研究数据不足；禁止实盘启动",
+        )
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
+    signals.pop("adaptiveContext", None)
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
@@ -1465,6 +1513,8 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         "targetSlices": result["target_slice_count"],
         "actualSlices": len(result["plan"]),
         "planHash": result["plan_hash"],
+        "modelHash": result.get("modelId"),
+        "strategyEngine": policy.strategy_engine,
         "strategyPlan": json_decimal(result["plan"]),
         "pendingCancellations": incompatible_managed,
         "externalIncompatibilities": incompatible_external,

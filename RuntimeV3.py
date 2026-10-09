@@ -980,6 +980,12 @@ class LendingRuntimeV3:
             "loanPrincipal": loan_total,
             "componentTotal": component_total,
             "total": total,
+            "openOfferCount": len(offers),
+            "managedOffers": [row for row in offers if row.get("managed")],
+            "exposureByPeriod": {
+                p: sum((D(r["amount"]) for r in [*offers, *lending_rows] if int(r.get("period") or 0) == p), D(0))
+                for p in {int(r.get("period") or 0) for r in [*offers, *lending_rows]}
+            },
             "reconciliationDifference": reconciliation_difference,
             "reconciliationStatus": reconciliation_status,
             "exposure": exposure,
@@ -996,6 +1002,10 @@ class LendingRuntimeV3:
 
     @staticmethod
     def _build_plan(account, policy, signals, strategy_version):
+        if policy.strategy_engine == "adaptive_net_yield_v1":
+            from AdaptiveRuntime import plan
+
+            return plan(account, policy, signals, strategy_version)
         return build_strategy_plan_v3(
             account["total"],
             account["wallet"],
@@ -1264,7 +1274,9 @@ class LendingRuntimeV3:
         realized_income = self.store.realized_income_summary(self.currency)
         income_sync = self.store.income_history_sync_payload(self.currency)
         now = int(snapshot.get("now") or self.clock() * 1000)
-        repricing = self._repricing_status(signals, now)
+        repricing = (
+            [] if self.policy.strategy_engine == "adaptive_net_yield_v1" else self._repricing_status(signals, now)
+        )
         repricing_by_offer = {int(row["offerId"]): row for row in repricing}
         open_offers = json_decimal(snapshot["offers"])
         active_lending = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []), self.currency)
@@ -2328,6 +2340,9 @@ class LendingRuntimeV3:
         }
 
     def cycle(self, now_ms=None):
+        active = self.store.strategy("ACTIVE")
+        if active is not None:
+            self.policy = policy_v3_with_overrides(StrategyPolicyV3(), active["policy"])
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         self.store.touch_heartbeat(now)
         if not self._bootstrapped:
@@ -2375,7 +2390,11 @@ class LendingRuntimeV3:
         self._record_variable_floor_violations(now)
         runtime = self.store.runtime()
         resume_barrier = self.store.consume_resume_barrier()
-        if runtime["mode"] == "LIVE" and not resume_barrier:
+        if self.policy.strategy_engine == "adaptive_net_yield_v1":
+            from AdaptiveRuntime import cycle
+
+            result = cycle(self, snapshot, account, signals, now, resume_barrier)
+        elif runtime["mode"] == "LIVE" and not resume_barrier:
             validate_policy_v3(self.policy, require_live_floors=True)
             pending_status = self._advance_pending_strategy(snapshot, account, signals, now)
             if pending_status and pending_status.get("pending"):
