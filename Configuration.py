@@ -336,6 +336,20 @@ def backup_strategy_state(config_path, state_db_file):
     return {"config": config_backup, "database": database_backup}
 
 
+def _normalization_payload(policy, record):
+    payload = json_decimal(policy.__dict__)
+    # Optional adaptive defaults are supplied when reading legacy records.
+    # Their absence alone must not activate a new strategy during startup.
+    if policy.strategy_engine == "legacy_v3":
+        for key in (
+            "strategy_engine", "long_from_days", "long_max_share",
+            "maximum_period", "model_id", "fee_verified",
+        ):
+            if key not in record["policy"]:
+                payload.pop(key, None)
+    return payload
+
+
 def normalize_current_active_strategy(config_path):
     config, _ = read_config(config_path)
     settings = build_settings(_settings_args(), config)
@@ -361,14 +375,15 @@ def normalize_current_active_strategy(config_path):
     if pre_migration_active is not None:
         pre_policy = strategy_v3_from_record(pre_migration_active)
         pre_serialized = json.dumps(
-            json_decimal(pre_policy.__dict__), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            _normalization_payload(pre_policy, pre_migration_active),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         pre_version = hashlib.sha256(pre_serialized.encode("utf-8")).hexdigest()[:16]
         if pre_migration_active["version_id"] != pre_version:
             backup = backup_strategy_state(config_path, settings.state_db_file)
     store = LendingStateStore(settings.state_db_file, config_path=config_path)
     active, policy = ensure_active_strategy_v3(store, settings)
-    canonical = json_decimal(policy.__dict__)
+    canonical = _normalization_payload(policy, active)
     serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     canonical_version = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
     if active["version_id"] == canonical_version:
