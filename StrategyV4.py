@@ -14,6 +14,9 @@ from StrategyV3 import SATOSHI, ceil_rate_tick, json_decimal, pool_for_period
 D = Decimal
 ENGINE = "adaptive_net_yield_v1"
 VERSION = "ADAPTIVE_NET_YIELD_V1"
+MULTI_ENGINE = "adaptive_net_yield_v2"
+MULTI_VERSION = "ADAPTIVE_NET_YIELD_V2"
+ENGINES = (ENGINE, MULTI_ENGINE)
 DAY = 86_400_000
 HORIZON = 120
 WAIT_BINS = (0, 5, 15, 30, 60, 120, 360, 720, 1440)
@@ -52,23 +55,41 @@ def adaptive_template(policy):
 
 
 def validate_adaptive(policy):
-    if policy.strategy_engine not in ("legacy_v3", ENGINE):
+    if policy.strategy_engine not in ("legacy_v3", *ENGINES):
         raise ValueError("unknown strategy engine")
     if not 8 <= policy.long_from_days <= policy.maximum_period <= 120:
         raise ValueError("long term boundary/max term must satisfy 8 <= long <= max <= 120")
     if not 0 < policy.long_max_share <= 100:
         raise ValueError("long maximum share must be positive and <= 100")
-    if policy.strategy_engine == ENGINE:
+    if policy.strategy_engine in ENGINES:
         if policy.version != 4:
             raise ValueError("adaptive engine requires V4")
         if any(v is None or v <= 0 for v in (policy.short_floor_apr, policy.medium_floor_apr, policy.long_floor_apr)):
             raise ValueError("adaptive floors must be positive")
         if policy.medium_floor_apr != policy.short_floor_apr or policy.long_floor_apr < policy.short_floor_apr:
             raise ValueError("adaptive medium floor equals base floor; long floor cannot be lower")
-        if not policy.enable_limit or any(
-            (policy.enable_frr, policy.enable_frr_delta_fixed, policy.enable_frr_delta_variable, policy.enable_hidden)
+        if policy.strategy_engine == ENGINE and (
+            not policy.enable_limit
+            or any(
+                (
+                    policy.enable_frr,
+                    policy.enable_frr_delta_fixed,
+                    policy.enable_frr_delta_variable,
+                    policy.enable_hidden,
+                )
+            )
         ):
             raise ValueError("adaptive V1 supports visible LIMIT only")
+        if policy.strategy_engine == MULTI_ENGINE:
+            if policy.enable_hidden or not any(
+                (
+                    policy.enable_limit,
+                    policy.enable_frr,
+                    policy.enable_frr_delta_fixed,
+                    policy.enable_frr_delta_variable,
+                )
+            ):
+                raise ValueError("V4.1 requires a visible funding type; Hidden is not supported")
     return policy
 
 
@@ -192,7 +213,7 @@ def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage
 
 
 def validate_model(model, currency, now_ms, allow_empty=False):
-    if model.get("algorithm") != VERSION or model.get("currency") != currency:
+    if model.get("algorithm") not in (VERSION, MULTI_VERSION) or model.get("currency") != currency:
         raise ValueError("model algorithm/currency mismatch")
     body = {k: v for k, v in model.items() if k != "id"}
     if model.get("id") != digest(body):
@@ -203,6 +224,10 @@ def validate_model(model, currency, now_ms, allow_empty=False):
         raise ValueError("model expired")
     if any(r["mts"] > model["trainedUntilMs"] for r in model["days"]):
         raise ValueError("future market path")
+    if model.get("algorithm") == MULTI_VERSION:
+        from StrategyV41 import validate_frr_paths
+
+        validate_frr_paths(model)
     return model
 
 
@@ -253,7 +278,7 @@ def rolling_paths(model_id, currency, days, net_fee, base_floor):
 
 
 def value_candidate(
-    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False
+    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False, quote=None
 ):
     compatible = [r for r in trades if int(r["period"]) <= period and now_ms - DAY <= int(r["mts"]) <= now_ms]
     reference = weighted_rate(compatible)
@@ -275,6 +300,7 @@ def value_candidate(
     hs = hazards(model, period, key, prior)
     days = tuple(float(r["rate"]) for r in model["days"] if r["mts"] <= now_ms)
     returns, waits, holds, probabilities = [], [], [], []
+    path_waits, path_holds = [], []
     probability = 1 - math.prod(1 - h for h in hs)
     seed = int(digest({"currency": policy.currency, "model": model["id"]})[:12], 16)
     net_fee = 1 - float(fee(policy))
@@ -291,6 +317,7 @@ def value_candidate(
                 wait = (lo + hi) / 2 + cancel_minutes
                 break
         elapsed, earned = 0.0, 0.0
+        hold = None
         if wait is not None:
             hold = holding_hours(model, period, rng.random(), stress)
             elapsed = wait / 1440
@@ -309,6 +336,8 @@ def value_candidate(
             accrued = curves[path][whole] + (elapsed - whole) * (curves[path][whole + 1] - curves[path][whole])
             earned += float(amount) * (curves[path][-1] - accrued)
         returns.append(earned)
+        path_waits.append(wait)
+        path_holds.append(hold)
         probabilities.append(probability)
     scale = 365 / (float(amount) * HORIZON)
     return {
@@ -324,12 +353,16 @@ def value_candidate(
         "expectedWaitMinutes": sum(waits) / len(waits) if waits else None,
         "expectedHoldingHours": sum(holds) / len(holds) if holds else None,
         "pathInterests": returns,
+        "pathWaitMinutes": path_waits,
+        "pathHoldingHours": path_holds,
         "queueVolumeEstimate": queue,
         "confidence": model["confidence"],
     }
 
 
-def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
+def build_plan(
+    account, policy, model, book, trades, now_ms, strategy_version, *, valuator=value_candidate, quotes=None
+):
     validate_adaptive(policy)
     total, available = D(account["total"]), D(account["wallet"])
     exposure = D(account.get("existingExposure", {}).get("total", sum(account["exposure"].values())))
@@ -338,8 +371,8 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
     )
     budget = min(available, max(D(0), cap - exposure))
     result = {
-        "engine": ENGINE,
-        "algorithm": VERSION,
+        "engine": policy.strategy_engine,
+        "algorithm": MULTI_VERSION if policy.strategy_engine == MULTI_ENGINE else VERSION,
         "plan": [],
         "candidates": [],
         "planned_amount": D(0),
@@ -354,7 +387,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
         "rebalance_cancellations": [],
         "empty_reason": None,
         "modelId": policy.model_id,
-        "allocationModel": VERSION,
+        "allocationModel": MULTI_VERSION if policy.strategy_engine == MULTI_ENGINE else VERSION,
         "allocationBasis": "120天本金时间净收益第10百分位",
         "pool_allocation": {},
         "target_offer_amounts": {},
@@ -368,6 +401,8 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
         if model is None:
             raise ValueError("model missing")
         validate_model(model, policy.currency, now_ms)
+        if model["algorithm"] != result["algorithm"]:
+            raise ValueError("模型版本与策略引擎不匹配，请重新研究")
         if policy.model_id != model["id"]:
             raise ValueError("policy model differs from artifact")
         result.update(
@@ -402,9 +437,17 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
         )
         # Only quotes supported by observed trades or the book are proposed.
         for rate in sorted({ceil_rate_tick(r) for r in rates if r >= gross_floor(policy, term)}):
-            value = value_candidate(policy, model, term, rate, minimum, live_trades, book, now_ms)
-            if value["expectedFillProbability"] >= 0.01:
-                candidates.append(value)
+            descriptors = (
+                quotes(term, rate)
+                if quotes
+                else [{"rate": rate, "offer_type": "LIMIT", "display_type": "LIMIT", "submitted_rate": rate}]
+            )
+            for quote in descriptors:
+                value = valuator(policy, model, term, quote["rate"], minimum, live_trades, book, now_ms, quote=quote)
+                value.update(quote)
+                if value["expectedFillProbability"] >= 0.01:
+                    candidates.append(value)
+    candidates = list({(r["period"], r["rate"], r["offer_type"], r["submitted_rate"]): r for r in candidates}.values())
     short = max(
         (r["conservativeNetApr"] for r in candidates if r["period"] <= 7), default=float(policy.short_floor_apr)
     )
@@ -447,9 +490,14 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
                 continue
             eligible = [r for r in demands if r["period"] <= candidate["period"] and r["rate"] >= candidate["rate"]]
             capacity = sum((r["amount"] for r in eligible), D(0))
+            if policy.strategy_engine == MULTI_ENGINE and candidate["offer_type"] == "FRRDELTAVAR":
+                used_variable = D(account.get("existingExposure", {}).get("variable", 0)) + sum(
+                    (amount for key, amount in allocated.items() if key[2] == "FRRDELTAVAR"), D(0)
+                )
+                capacity = min(capacity, max(D(0), total * policy.variable_max_share / 100 - used_variable))
             if candidate["period"] >= policy.long_from_days:
                 capacity = min(capacity, max(D(0), long_limit - long_used))
-            key = (candidate["period"], candidate["rate"])
+            key = (candidate["period"], candidate["rate"], candidate["offer_type"], candidate["submitted_rate"])
             if capacity >= minimum and (key in allocated or len(allocated) < free_slots):
                 choices.append((candidate, eligible, capacity))
         if not choices:
@@ -458,7 +506,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
         amount = min(minimum, budget, capacity)
         if 0 < budget - amount < minimum and capacity >= budget:
             amount = budget
-        key = (chosen["period"], chosen["rate"])
+        key = (chosen["period"], chosen["rate"], chosen["offer_type"], chosen["submitted_rate"])
         allocated[key] = allocated.get(key, D(0)) + amount
         remaining = amount
         for row in eligible:
@@ -472,31 +520,46 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version):
         book = [*book, {"period": chosen["period"], "rate": chosen["rate"], "amount": amount}]
         for candidate in candidates:
             candidate.update(
-                value_candidate(
-                    policy, model, candidate["period"], candidate["rate"], minimum, live_trades, book, now_ms
+                valuator(
+                    policy,
+                    model,
+                    candidate["period"],
+                    candidate["rate"],
+                    minimum,
+                    live_trades,
+                    book,
+                    now_ms,
+                    quote=candidate,
                 )
             )
         candidates.sort(key=lambda r: (-r["conservativeNetApr"], r["period"], r["rate"]))
-    for index, ((period, rate), amount) in enumerate(allocated.items()):
+    for index, ((period, rate, offer_type, submitted_rate), amount) in enumerate(allocated.items()):
+        descriptor = next(
+            r
+            for r in candidates
+            if (r["period"], r["rate"], r["offer_type"], r["submitted_rate"])
+            == (period, rate, offer_type, submitted_rate)
+        )
         result["plan"].append(
             {
                 "period": period,
                 "amount": amount.quantize(SATOSHI),
-                "submitted_rate": rate,
+                "submitted_rate": submitted_rate,
                 "effective_rate": rate,
-                "offer_type": "LIMIT",
-                "display_type": "LIMIT",
+                "offer_type": offer_type,
+                "display_type": descriptor["display_type"],
                 "flags": 0,
                 "hidden": False,
                 "pool": pool_for_period(period),
                 "layer": "balanced",
                 "slice_index": index,
-                "strategy_variant": ENGINE,
-                "pricing_curve_version": VERSION,
+                "strategy_variant": policy.strategy_engine,
+                "pricing_curve_version": result["algorithm"],
                 "fixed_landing_rate": None,
             }
         )
     result["planned_amount"] = sum((r["amount"] for r in result["plan"]), D(0))
+    result["variable_amount"] = sum((r["amount"] for r in result["plan"] if r["offer_type"] == "FRRDELTAVAR"), D(0))
     result["target_slice_count"] = len(result["plan"])
     result["idle_amount"] = available - result["planned_amount"]
     result["empty_reason"] = None if result["plan"] else "WAIT_FOR_VALUE"

@@ -4,16 +4,29 @@ from decimal import Decimal as D
 
 from ResearchV4 import ModelRepository
 from StrategyV3 import json_decimal
-from StrategyV4 import ENGINE, adjustment, build_plan, digest
+from StrategyV4 import adjustment, build_plan, digest
 
 
-def context(store, policy, book, trades, now_ms):
+def context(store, policy, book, trades, now_ms, stats=()):
     repo = ModelRepository(store.path, policy.currency)
     try:
         model = repo.load(policy.model_id, now_ms)
+        expected = (
+            "ADAPTIVE_NET_YIELD_V2" if policy.strategy_engine == "adaptive_net_yield_v2" else "ADAPTIVE_NET_YIELD_V1"
+        )
+        if model["algorithm"] != expected:
+            model = None
     except ValueError:
         model = None
-    return {"model": model, "book": book, "trades": trades, "now_ms": now_ms}
+    valid = [r for r in stats if 0 <= now_ms - int(r["mts"]) <= policy.rest_stale_seconds * 1000]
+    latest = max(valid, key=lambda r: int(r["mts"]), default=None)
+    return {
+        "model": model,
+        "book": book,
+        "trades": trades,
+        "now_ms": now_ms,
+        "frr": D(str(latest["frr_daily_rate"])) if latest else None,
+    }
 
 
 def eligible(store, model):
@@ -23,7 +36,7 @@ def eligible(store, model):
         return False
     try:
         repo = ModelRepository(store.path, store.currency)
-        report = json.loads((repo.directory / "evaluation.json").read_text(encoding="utf-8"))
+        report = json.loads((repo.directory / repo.report_name(model["algorithm"])).read_text(encoding="utf-8"))
         trained = {k: v for k, v in model.items() if k not in {"id", "validationReportHash"}}
         trained["eligibleForLiveCandidate"] = False
         return (
@@ -37,6 +50,19 @@ def eligible(store, model):
 
 def plan(account, policy, signals, version):
     ctx = signals.get("adaptiveContext", {})
+    if policy.strategy_engine == "adaptive_net_yield_v2":
+        from StrategyV41 import build_plan as multi_plan
+
+        return multi_plan(
+            account,
+            policy,
+            ctx.get("model"),
+            ctx.get("book", []),
+            ctx.get("trades", []),
+            ctx.get("now_ms", 0),
+            version,
+            ctx.get("frr"),
+        )
     return build_plan(
         account, policy, ctx.get("model"), ctx.get("book", []), ctx.get("trades", []), ctx.get("now_ms", 0), version
     )
@@ -50,8 +76,8 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
     policy, store = runtime.policy, runtime.store
     active = store.strategy("ACTIVE")
     version = active["version_id"] if active else "4"
-    ctx = context(store, policy, snapshot["book"], snapshot["trades"], now)
-    result = build_plan(account, policy, ctx["model"], snapshot["book"], snapshot["trades"], now, version)
+    ctx = context(store, policy, snapshot["book"], snapshot["trades"], now, getattr(runtime, "_stats", ()))
+    result = plan(account, policy, {"adaptiveContext": ctx}, version)
     result.update(submitted=[], canceledForReprice=[], decisions=[])
     if store.runtime()["mode"] != "LIVE" or resume_barrier:
         result["recoveryResumeBarrier"] = bool(resume_barrier)
@@ -59,6 +85,9 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
     if not eligible(store, ctx["model"]):
         result["blockReasons"] = ["模型尚未通过收益研究验收；保持研究状态"]
         store.enter_protected_pause("ADAPTIVE_MODEL_NOT_QUALIFIED")
+        return result
+    if result.get("blockReasons"):
+        store.enter_protected_pause("ADAPTIVE_DATA_UNAVAILABLE")
         return result
     pending = store.pending_reprices(version)
     active_ids = {int(r.get("offer_id") or r.get("id")) for r in snapshot["offers"]}
@@ -101,9 +130,23 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
         )
         for offer in snapshot["offers"]:
             oid = int(offer.get("offer_id") or offer.get("id"))
-            decision = adjustment(
-                policy, ctx["model"], offer, result["candidates"], snapshot["trades"], snapshot["book"], now
-            )
+            if policy.strategy_engine == "adaptive_net_yield_v2":
+                from StrategyV41 import adjustment as multi_adjustment
+
+                decision = multi_adjustment(
+                    policy,
+                    ctx["model"],
+                    offer,
+                    result["candidates"],
+                    snapshot["trades"],
+                    snapshot["book"],
+                    now,
+                    ctx["frr"],
+                )
+            else:
+                decision = adjustment(
+                    policy, ctx["model"], offer, result["candidates"], snapshot["trades"], snapshot["book"], now
+                )
             if offer.get("managed") and (
                 cap_excess > 0 or (long_excess > 0 and int(offer["period"]) >= policy.long_from_days)
             ):
@@ -141,7 +184,9 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
             # cause an untracked repeat cancel or immediate replacement.
             journal(decision)
             target = decision.get("targetRate", offer.get("rate_real") or offer["rate"])
-            store.mark_reprice_pending(chain["chain_key"], ENGINE, target, now_ms=now, source_offer_id=oid)
+            store.mark_reprice_pending(
+                chain["chain_key"], policy.strategy_engine, target, now_ms=now, source_offer_id=oid
+            )
             store.record_reprice(
                 oid,
                 decision["reason"],

@@ -15,9 +15,9 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     const groups = [
         {
             title: "策略引擎与长期保护",
-            description: "V4.0 策略按120天资金时间净收益动态分配；研究合格后才允许人工实盘启动。",
+            description: "V4.0 比较 LIMIT；V4.1 同时比较 LIMIT 与 FRR 系列。均按120天资金时间净收益动态分配，研究合格后才允许人工实盘启动。",
             fields: [
-                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"]] }],
+                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"], ["adaptive_net_yield_v2", "V4.1 策略"]] }],
                 ["model_id", "冻结模型 ID", "text", "", { placeholder: "研究评估后选择模型" }],
                 ["long_from_days", "长期起始天数", "number", "天", { min: 8, max: 120 }],
                 ["long_max_share", "长期贷款与挂单上限", "number", "%", { min: 1, max: 100 }],
@@ -181,7 +181,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
                     <section><h2>${currency} 策略研究</h2><p id="v4ResearchState">尚未研究</p>
-                        <button id="v4Template" class="button secondary" type="button">载入 V4.0 策略草稿模板</button>
+                        <button id="v4Template" class="button secondary" type="button">载入所选 V4 策略草稿模板</button>
                         <button id="v4Evaluate" class="button secondary" type="button">评估 ${currency}</button>
                         <button id="v4Shadow" class="button secondary" type="button">影子观察 ${currency}</button>
                         <button id="v4ResearchStop" class="button secondary" type="button">取消研究 / 停止观察</button>
@@ -207,6 +207,11 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
             const title = document.createElement(group.details ? "span" : "h2");
             title.textContent = group.title;
             heading.append(title);
+            if (group.fields.some(field => field[0] === "enable_limit")) {
+                const note = document.createElement("p");
+                note.className = "v4-order-note";
+                section.append(note);
+            }
             if (group.description) {
                 const description = document.createElement("p");
                 description.textContent = group.description;
@@ -285,9 +290,12 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function validateForm() {
-        if (input("strategy_engine").value === "adaptive_net_yield_v1") {
+        const maxPercent = input("max_lend_percent");
+        if (maxPercent.value === "" || !Number.isFinite(Number(maxPercent.value)) || numberValue("max_lend_percent") < 0 || numberValue("max_lend_percent") > 100) throw new Error("最大放贷比例必须填写0～100之间的数字");
+        if (input("strategy_engine").value.startsWith("adaptive_net_yield_")) {
             if (numberValue("short_floor_apr") <= 0 || numberValue("long_floor_apr") < numberValue("short_floor_apr")) throw new Error("请设置短期底线和不低于短期的长期底线");
             if (!(8 <= numberValue("long_from_days") && numberValue("long_from_days") <= numberValue("maximum_period") && numberValue("maximum_period") <= 120)) throw new Error("长期边界和最长期限必须在8～120天内");
+            if (!["enable_limit", "enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable"].some(name => input(name).checked)) throw new Error("至少启用一种Funding订单类型");
             return;
         }
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
@@ -338,17 +346,26 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function updateDerived() {
-        const adaptive = input("strategy_engine").value === "adaptive_net_yield_v1";
+        const adaptive = input("strategy_engine").value.startsWith("adaptive_net_yield_");
+        const multi = input("strategy_engine").value === "adaptive_net_yield_v2";
         const fee = Math.max(adaptive ? 15 : 0, numberValue("normal_fee_rate")) / 100;
         const legacyFields = new Set(["short_share", "medium_share", "long_share", "short_periods", "medium_periods", "long_periods", "quick_share", "balanced_share", "high_share", "balanced_start_premium_percent", "high_start_premium_percent", "balanced_landing_stage", "high_landing_stage", "enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "enable_hidden", "variable_max_share", "hidden_max_share", "hidden_fee_rate"]);
+        if (multi) for (const name of ["enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "variable_max_share"]) legacyFields.delete(name);
         for (const name of allFields) input(name).closest("label").hidden = adaptive && (legacyFields.has(name) || name.endsWith("_reprice_stages_minutes"));
         for (const name of ["model_id", "long_from_days", "long_max_share", "maximum_period"]) input(name).closest("label").hidden = !adaptive;
         if (adaptive) {
             input("medium_floor_apr").value = input("short_floor_apr").value;
-            input("enable_limit").checked = true;
-            for (const name of ["enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "enable_hidden"]) input(name).checked = false;
+            if (!multi) {
+                input("enable_limit").checked = true;
+                for (const name of ["enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable"]) input(name).checked = false;
+            }
+            input("enable_hidden").checked = false;
         }
         input("medium_floor_apr").readOnly = adaptive;
+        const typeNote = surface.querySelector(".v4-order-note");
+        typeNote.hidden = !adaptive;
+        typeNote.textContent = multi ? "V4.1 比较 LIMIT 与勾选的 FRR 系列；Hidden 暂未支持。FRR 挂单成交前会变价，浮动贷款成交后仍会变价，可能低于底线；Variable 上限包含贷款与挂单。" : "V4.0 第一版仅支持可见 LIMIT；需要 FRR 系列时请选择 V4.1，并重新研究和预览。";
+        byId("v4Template").textContent = `载入 ${multi ? "V4.1" : "V4.0"} 策略草稿模板`;
         surface.querySelector(".v3-fixed-safety").hidden = adaptive;
         for (const description of surface.querySelectorAll(".v3-section-heading > p")) description.hidden = adaptive;
         for (const pool of ["short", "medium", "long"]) {
@@ -364,13 +381,13 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
 
     function renderAdaptive(plan) {
         const box = byId("v4AdaptiveDetails"); box.replaceChildren();
-        if (plan?.engine !== "adaptive_net_yield_v1") return;
+        if (!plan?.engine?.startsWith("adaptive_net_yield_")) return;
         const description = document.createElement("p");
         description.textContent = `模型 ${plan.modelId || "未选择"} · ${plan.confidence === "LOW" ? "低置信度" : plan.confidence || "未校准"} · ${plan.eligibleForLiveCandidate ? "研究合格候选" : "研究中"}。${(plan.blockReasons || []).join("；")}`;
         box.append(description);
         for (const row of (plan.candidates || []).slice(0, 8)) {
             const line = document.createElement("p");
-            line.textContent = `${row.period}天 · 报价净年化 ${(Number(row.netApr) * 100).toFixed(2)}% · 保守资金时间年化 ${(Number(row.conservativeNetApr) * 100).toFixed(2)}% · 预期净利息 ${Number(row.expectedNetInterest).toFixed(2)} ${currency} / ${Number(row.amount).toFixed(2)} ${currency} · 成交概率 ${(Number(row.expectedFillProbability) * 100).toFixed(1)}% · 等待 ${row.expectedWaitMinutes == null ? "未知" : Number(row.expectedWaitMinutes).toFixed(1) + "分钟"} · 持有 ${row.expectedHoldingHours == null ? "未知" : Number(row.expectedHoldingHours).toFixed(1) + "小时"}`;
+            line.textContent = `${row.display_type || "LIMIT"} · ${row.period}天 · 报价净年化 ${(Number(row.netApr) * 100).toFixed(2)}% · 保守资金时间年化 ${(Number(row.conservativeNetApr) * 100).toFixed(2)}% · 预期净利息 ${Number(row.expectedNetInterest).toFixed(2)} ${currency} / ${Number(row.amount).toFixed(2)} ${currency} · 成交概率 ${(Number(row.expectedFillProbability) * 100).toFixed(1)}% · 等待 ${row.expectedWaitMinutes == null ? "未知" : Number(row.expectedWaitMinutes).toFixed(1) + "分钟"} · 持有 ${row.expectedHoldingHours == null ? "未知" : Number(row.expectedHoldingHours).toFixed(1) + "小时"} · ${row.confidence === "LOW" ? "低置信度" : "已校准"}${row.rateRiskNote ? " · " + row.rateRiskNote : ""}`;
             box.append(line);
         }
         for (const row of plan.decisions || []) {
@@ -596,9 +613,12 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
             config = await requestJson("/api/config");
             state.template = config.adaptiveTemplate;
             state.candidate = config.candidateModel;
+            state.templates = config.adaptiveTemplates;
+            state.candidates = config.candidateModels;
             const research = config.research || {};
             byId("v4ResearchState").textContent = `${research.state || "IDLE"} · ${research.phase || ""} · ${research.report?.reason || research.error || "软件验证与收益研究分别验收"}`;
             if (sequence !== state.loadSequence) return false;
+            if (!state.policy) for (const element of byId("v3StrategyForm").elements) element.disabled = false;
             if (!state.dirty && revision === state.editRevision) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
         } catch (error) {
             if (sequence !== state.loadSequence) return false;
@@ -731,6 +751,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     renderShell();
+    for (const element of byId("v3StrategyForm").elements) element.disabled = true;
     function edited() {
         state.dirty = true; state.editRevision += 1; state.previewPolicy = null; updateDerived();
         byId("v3FormMessage").textContent = `${currency} 有未保存编辑；请重新计算并保存草稿。`;
@@ -746,11 +767,12 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     byId("v3LiveButton").addEventListener("click", () => context.overview.runPreflight());
     byId("v4Template").addEventListener("click", () => {
         if (!state.template) return;
-        fillPolicy({...state.policy, ...state.template, model_id: state.candidate?.id || ""}); edited();
+        const engine = input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1";
+        fillPolicy({...state.policy, ...(state.templates?.[engine] || state.template), model_id: (state.candidates?.[engine] || (engine === "adaptive_net_yield_v1" ? state.candidate : null))?.id || ""}); edited();
     });
     for (const [id, path] of [["v4Evaluate", "evaluate"], ["v4Shadow", "shadow/start"], ["v4ResearchStop", "cancel"], ["v4ResearchResume", "resume"]]) {
         byId(id).addEventListener("click", async () => {
-            try { const data = await postJson(`/api/research/v4/${path}`, {currency}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
+            try { const data = await postJson(`/api/research/v4/${path}`, {currency, engine: input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1"}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
             catch (error) { byId("v4ResearchState").textContent = error.message; }
         });
     }

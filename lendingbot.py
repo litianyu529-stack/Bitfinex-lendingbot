@@ -117,6 +117,7 @@ WORKER_BUILD_FILES = (
     "StrategyV3.py",
     "StrategyResearch.py",
     "StrategyV4.py",
+    "StrategyV41.py",
     "ResearchV4.py",
     "ReplayV4.py",
     "AdaptiveRuntime.py",
@@ -547,18 +548,19 @@ def _strategy_v3_preview(
     account, planned_snapshot, adoption_candidates = proposed_external_adoption(account_snapshot, policy)
     book, trades, stats, signals, warnings = load_v3_market_context(client, policy, now)
     warnings = [*basis["warnings"], *warnings]
-    if policy.strategy_engine == "adaptive_net_yield_v1":
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
         from AdaptiveRuntime import context
 
-        signals["adaptiveContext"] = context(store, policy, book, trades, now)
+        signals["adaptiveContext"] = context(store, policy, book, trades, now, stats)
     result = LendingRuntimeV3._build_plan(account, policy, signals, proposed_version)
+    current_frr = signals.get("adaptiveContext", {}).get("frr")
     signals.pop("adaptiveContext", None)
     if not policy_v3_to_json(policy)["floorsConfigured"]:
         warnings.append("三个最低净年化尚未全部填写；允许预览，但 LIVE 将被阻止。")
     proposed_record = {"version_id": proposed_version, "policy": json_decimal(policy.__dict__)}
     incompatible = []
     for offer in planned_snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy)
+        violations = v3_offer_violations(offer, policy, current_frr)
         if violations:
             incompatible.append({**json_decimal(offer), "violations": violations})
     non_changeable_credits = []
@@ -595,7 +597,7 @@ def _strategy_v3_preview(
             LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
         ),
         "replay": {"state": "RESEARCH_REQUIRED", "note": "收益资格通过异步研究评估；即时预览不证明收益"}
-        if policy.strategy_engine == "adaptive_net_yield_v1"
+        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
         else replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
@@ -676,19 +678,30 @@ def v3_credit_violations(credit, policy):
     return violations
 
 
-def v3_offer_violations(offer, policy):
-    if policy.strategy_engine == "adaptive_net_yield_v1":
+def v3_offer_violations(offer, policy, current_frr=None):
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
         from StrategyV4 import gross_floor
 
         period = int(offer.get("period") or 0)
         effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
+        kind = v3_offer_display_type(offer)
+        if policy.strategy_engine == "adaptive_net_yield_v2" and kind in (
+            "FRR",
+            "FRR_DELTA_FIXED",
+            "FRR_DELTA_VARIABLE",
+        ):
+            if current_frr is not None:
+                effective = current_frr + Decimal(str(offer.get("rate") or 0))
+            elif not offer.get("rate_real"):
+                effective = None
         return [
             reason
             for reason, invalid in (
-                ("disabled_type", v3_offer_display_type(offer) != "LIMIT"),
+                ("disabled_type", not LendingRuntimeV3._display_type_enabled(policy, v3_offer_display_type(offer))),
                 ("hidden_disabled", bool(int(offer.get("flags") or 0))),
                 ("period_not_allowed", not 2 <= period <= policy.maximum_period),
-                ("below_new_floor", effective < gross_floor(policy, period)),
+                ("below_new_floor", effective is not None and effective < gross_floor(policy, period)),
+                ("rate_unavailable", effective is None),
             )
             if invalid
         ]
@@ -843,9 +856,10 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     if draft_version != draft["version_id"] or context["draftVersionId"] != draft["version_id"]:
         raise ApiRequestError("待应用草稿与已确认版本不一致", "PREVIEW_STALE", 409)
     draft_policy = strategy_v3_from_record(draft)
-    if any(r.get("policy", {}).get("strategy_engine") == "adaptive_net_yield_v1" for r in (draft, active)) and (
-        store.runtime()["mode"] == "LIVE" or store.recovery_status()["active"]
-    ):
+    if any(
+        r.get("policy", {}).get("strategy_engine") in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+        for r in (draft, active)
+    ) and (store.runtime()["mode"] == "LIVE" or store.recovery_status()["active"]):
         raise ApiRequestError("先暂停该币种并完成恢复，再应用自适应策略", "CURRENCY_PAUSE_REQUIRED", 409)
     refreshed = strategy_v3_preview(
         config_path,
@@ -1389,10 +1403,10 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
     for message in market_warnings:
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
-    if policy.strategy_engine == "adaptive_net_yield_v1":
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
         from AdaptiveRuntime import context as adaptive_context, eligible
 
-        signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now)
+        signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now, stats)
         model = signals["adaptiveContext"]["model"]
         qualified = eligible(store, model)
         add_check(
@@ -1402,11 +1416,20 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
             "冻结模型已通过收益研究" if qualified else "模型缺失、损坏或研究数据不足；禁止实盘启动",
         )
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
+    current_frr = signals.get("adaptiveContext", {}).get("frr")
+    if policy.strategy_engine == "adaptive_net_yield_v2":
+        reasons = result.get("blockReasons", [])
+        add_check(
+            "adaptive_market_data",
+            "V4.1 FRR与模型数据",
+            not reasons,
+            "FRR与模型数据可用于规划" if not reasons else "；".join(reasons),
+        )
     signals.pop("adaptiveContext", None)
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy)
+        violations = v3_offer_violations(offer, policy, current_frr)
         if not violations:
             continue
         item = {**json_decimal(offer), "display_type": v3_offer_display_type(offer), "violations": violations}

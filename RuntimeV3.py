@@ -1002,7 +1002,7 @@ class LendingRuntimeV3:
 
     @staticmethod
     def _build_plan(account, policy, signals, strategy_version):
-        if policy.strategy_engine == "adaptive_net_yield_v1":
+        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
             from AdaptiveRuntime import plan
 
             return plan(account, policy, signals, strategy_version)
@@ -1275,7 +1275,9 @@ class LendingRuntimeV3:
         income_sync = self.store.income_history_sync_payload(self.currency)
         now = int(snapshot.get("now") or self.clock() * 1000)
         repricing = (
-            [] if self.policy.strategy_engine == "adaptive_net_yield_v1" else self._repricing_status(signals, now)
+            []
+            if self.policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+            else self._repricing_status(signals, now)
         )
         repricing_by_offer = {int(row["offerId"]): row for row in repricing}
         open_offers = json_decimal(snapshot["offers"])
@@ -2390,7 +2392,7 @@ class LendingRuntimeV3:
         self._record_variable_floor_violations(now)
         runtime = self.store.runtime()
         resume_barrier = self.store.consume_resume_barrier()
-        if self.policy.strategy_engine == "adaptive_net_yield_v1":
+        if self.policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
             from AdaptiveRuntime import cycle
 
             result = cycle(self, snapshot, account, signals, now, resume_barrier)

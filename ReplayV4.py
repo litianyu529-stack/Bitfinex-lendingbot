@@ -13,6 +13,8 @@ from StrategyV3 import ceil_rate_tick, competitive_rate_for_period, gross_daily_
 from StrategyV4 import (
     DAY,
     ENGINE,
+    ENGINES,
+    MULTI_ENGINE,
     adaptive_template,
     adjustment,
     build_plan,
@@ -46,10 +48,10 @@ def replay(
     history = deque(r for r in history if start_ms - 7 * DAY <= int(r["mts"]) < start_ms)
     book_iter, trade_iter = iter(books), iter(trades)
     next_book, next_trade = next(book_iter, None), next(trade_iter, None)
-    book, book_at, current_frr = [], 0, None
+    book, book_at, current_frr, frr_at = [], 0, None, 0
     cursor, next_decision = start_ms, start_ms
     interest, capital_time, idle_time = D(0), D(0), D(0)
-    coverage_ms, total_ms = 0, end_ms - start_ms
+    coverage_ms, frr_coverage_ms, total_ms = 0, 0, end_ms - start_ms
     actions = 0
 
     def account():
@@ -60,7 +62,17 @@ def replay(
             "total": D(str(principal)),
             "wallet": wallet,
             "exposure": exposure,
-            "existingExposure": {"total": sum(exposure.values()), "variable": D(0), "hidden": D(0)},
+            "existingExposure": {
+                "total": sum(exposure.values()),
+                "variable": sum(
+                    (r["amount"] for r in orders + credits if r.get("offer_type") in ("FRR", "FRRDELTAVAR")), D(0)
+                ),
+                "hidden": D(0),
+            },
+            "exposureByPeriod": {
+                period: sum((r["amount"] for r in orders + credits if r["period"] == period), D(0))
+                for period in {r["period"] for r in orders + credits}
+            },
             "openOfferCount": len(orders),
         }
 
@@ -72,9 +84,25 @@ def replay(
             frr = next_book.get("frr")
             if frr is not None:
                 current_frr = D(str(frr))
-                for row in orders + credits:
-                    if row.get("offer_type") == "FRR":
-                        row["rate"] = D(str(frr))
+                frr_at = next_book.get("frr_mts", book_at)
+                for row in orders:
+                    if row.get("offer_type") in ("FRR", "FRRDELTAVAR", "FRRDELTAFIX"):
+                        updated_rate = max(D(0), current_frr + row.get("submitted_rate", D(0)))
+                        if updated_rate != row["rate"]:
+                            supply = sum(
+                                (
+                                    abs(D(str(r["amount"])))
+                                    for r in book
+                                    if D(str(r["amount"])) > 0 and D(str(r["rate"])) <= updated_rate
+                                ),
+                                D(0),
+                            )
+                            # Auto-floating quotes do not receive a fabricated queue advantage.
+                            row["queue"] = max(row["queue"], supply * (2 if stress else 1))
+                        row["rate"] = updated_rate
+                for row in credits:
+                    if row.get("offer_type") in ("FRR", "FRRDELTAVAR"):
+                        row["rate"] = max(D(0), current_frr + row.get("submitted_rate", D(0)))
             next_book = next(book_iter, None)
             continue
         for credit in list(credits):
@@ -90,7 +118,12 @@ def replay(
         if cursor >= next_decision:
             if book and cursor - book_at <= 60000:
                 state = account()
-                if policy.strategy_engine == ENGINE:
+                if policy.strategy_engine == MULTI_ENGINE:
+                    from StrategyV41 import build_plan as multi_plan
+
+                    fresh_frr = current_frr if cursor - frr_at <= policy.rest_stale_seconds * 1000 else None
+                    plan = multi_plan(state, policy, model, book, list(history), cursor, "replay", fresh_frr)
+                elif policy.strategy_engine == ENGINE:
                     plan = build_plan(state, policy, model, book, list(history), cursor, "replay")
                 else:
                     stats = [] if current_frr is None else [{"mts": cursor, "frr_daily_rate": current_frr}]
@@ -107,17 +140,39 @@ def replay(
                 for order in orders:
                     if order.get("cancel_at"):
                         continue
-                    if policy.strategy_engine == ENGINE:
-                        decision = adjustment(
+                    if policy.strategy_engine in ENGINES:
+                        if policy.strategy_engine == MULTI_ENGINE:
+                            from StrategyV41 import adjustment as decide
+
+                            extra = {
+                                "current_frr": current_frr
+                                if cursor - frr_at <= policy.rest_stale_seconds * 1000
+                                else None
+                            }
+                        else:
+                            decide, extra = adjustment, {}
+                        decision = decide(
                             policy,
                             model,
-                            {**order, "rate": order["rate"], "managed": True, "mts_created": order["created_ms"]},
+                            {
+                                **order,
+                                "rate": order["submitted_rate"],
+                                "rate_real": order["rate"],
+                                "managed": True,
+                                "mts_created": order["created_ms"],
+                            },
                             plan["candidates"],
                             list(history),
                             book,
                             cursor,
+                            **extra,
                         )
-                        key = (decision.get("targetPeriod"), decision.get("targetRate"), decision["reason"])
+                        key = (
+                            decision.get("targetPeriod"),
+                            decision.get("targetRate"),
+                            decision.get("targetType"),
+                            decision["reason"],
+                        )
                         count = order.get("confirmations", 0) + 1 if key == order.get("confirmation_key") else 1
                         order.update(confirmations=count, confirmation_key=key)
                         recent_adjustments = sum(r["atMs"] > cursor - 3600000 for r in cancellations)
@@ -171,7 +226,7 @@ def replay(
                     if change:
                         order.update(cancel_at=cursor + 60000, last_adjustment=cursor, replacement=decision)
                         cancellations.append({"atMs": cursor, "remainingAmount": order["amount"], **decision})
-                if policy.strategy_engine != ENGINE:
+                if policy.strategy_engine not in ENGINES:
                     # Repricing keeps term and chain timing, with a one-minute
                     # cancel-confirmation barrier during which fills remain possible.
                     for old in continuations:
@@ -201,6 +256,10 @@ def replay(
                             "period": proposed["period"],
                             "queue": queue * (2 if stress else 1),
                             "offer_type": proposed["offer_type"],
+                            "display_type": proposed.get("display_type", proposed["offer_type"]),
+                            "submitted_rate": proposed.get(
+                                "submitted_rate", D(0) if proposed["offer_type"] == "FRR" else rate
+                            ),
                             "flags": proposed.get("flags", 0),
                             "layer": proposed.get("layer", "balanced"),
                             "pricing_curve_version": proposed.get("pricing_curve_version", "EXACT_TERM_EXPLORATION_V1"),
@@ -237,6 +296,7 @@ def replay(
                         "rate": order["rate"],
                         "period": order["period"],
                         "offer_type": order["offer_type"],
+                        "submitted_rate": order["submitted_rate"],
                         "return_ms": cursor + int(duration * 3600000),
                     }
                 )
@@ -264,6 +324,8 @@ def replay(
         targets.extend(r["return_ms"] for r in credits)
         targets.extend(r["cancel_at"] for r in orders if r.get("cancel_at"))
         target = min(t for t in targets if t > cursor)
+        if current_frr is not None and cursor - frr_at <= policy.rest_stale_seconds * 1000:
+            frr_coverage_ms += min(target - cursor, max(0, frr_at + policy.rest_stale_seconds * 1000 - cursor))
         duration = D(target - cursor) / DAY
         lent = sum((r["amount"] for r in credits), D(0))
         earned = sum((r["amount"] * r["rate"] * duration * (1 - fee(policy)) for r in credits), D(0))
@@ -292,6 +354,7 @@ def replay(
         "submissionCount": actions,
         "openCreditAmount": sum((r["amount"] for r in credits), D(0)),
         "bookCoverageFraction": coverage_ms / total_ms if total_ms else 0,
+        "frrCoverageFraction": frr_coverage_ms / total_ms if total_ms else 0,
         "fills": fills,
         "returns": returns,
         "assumptions": ["公共成交是成交容量上限，不是自己的成交证明", "未知真实队列以可见竞争供给估计"],
@@ -310,7 +373,8 @@ def streams(path, start, end):
         with connect_readonly(path) as c:
             for row in c.execute(
                 "SELECT b.*, (SELECT s.frr_daily_rate FROM funding_stats s WHERE s.mts<=b.mts "
-                "ORDER BY s.mts DESC LIMIT 1) AS frr FROM book_snapshots b "
+                "ORDER BY s.mts DESC LIMIT 1) AS frr, (SELECT s.mts FROM funding_stats s WHERE s.mts<=b.mts "
+                "ORDER BY s.mts DESC LIMIT 1) AS frr_mts FROM book_snapshots b "
                 "WHERE b.mts>=? AND b.mts<? ORDER BY b.mts",
                 (start, end),
             ):
@@ -319,19 +383,25 @@ def streams(path, start, end):
                     "mts": row["mts"],
                     "book": raw if not raw or isinstance(raw[0], dict) else parse_book(raw),
                     "frr": row["frr"],
+                    "frr_mts": row["frr_mts"],
                 }
 
     return trades(), books()
 
 
-def evaluate(store, now_ms, cancelled=lambda: False):
+def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
     import json
     from pathlib import Path
     from FileUtils import atomic_write_text
 
-    template = adaptive_template(strategy_v3_from_record(store.strategy("ACTIVE")))
+    if engine == MULTI_ENGINE:
+        from StrategyV41 import template as make_template
+    else:
+        make_template = adaptive_template
+    template = make_template(strategy_v3_from_record(store.strategy("ACTIVE")))
     current = strategy_v3_from_record(store.strategy("ACTIVE"))
-    final_model = build_from_store(store, now_ms, cancelled)
+    training_options = {"engine": engine} if engine == MULTI_ENGINE else {}
+    final_model = build_from_store(store, now_ms, cancelled, **training_options)
     train_end, validation_end = now_ms - 30 * DAY, now_ms - 15 * DAY
     report = {
         "currency": store.currency,
@@ -352,12 +422,21 @@ def evaluate(store, now_ms, cancelled=lambda: False):
     ):
         report["reason"] = "逐笔成交、历史盘口或自己的订单证据不足；K线和影子成交不能替代"
         return report, final_model
-    model = build_from_store(store, train_end, cancelled, lookback_days=60)
+    model = build_from_store(store, train_end, cancelled, lookback_days=60, **training_options)
+    if engine == MULTI_ENGINE and (
+        len(model.get("frrDays", [])) < 20
+        or any(
+            model.get("typeObservationCounts", {}).get(kind, 0) < 20
+            for kind in ("LIMIT", "FRR", "FRR_DELTA_FIXED", "FRR_DELTA_VARIABLE")
+        )
+    ):
+        report["reason"] = "V4.1缺少至少20天FRR历史或各订单类型20条自身资金链；保持研究状态"
+        return report, model
     if model["ownObservationCount"] < 20:
         report["reason"] = "训练窗口自身资金链不足20条；测试集不能用于拟合或调参"
         return report, model
     original_model = model
-    if current.strategy_engine == ENGINE:
+    if current.strategy_engine in ENGINES:
         from ResearchV4 import ModelRepository
 
         try:
@@ -389,12 +468,22 @@ def evaluate(store, now_ms, cancelled=lambda: False):
         "near_limit": near,
         "adaptive": policy,
     }
+    if engine == MULTI_ENGINE:
+        from StrategyV41 import FIELDS
+
+        for kind, field in FIELDS.items():
+            variants["type_" + kind.lower()] = replace(policy, **{name: name == field for name in FIELDS.values()})
     with connect_readonly(store.path) as c:
         sample = c.execute(
             "SELECT total_principal FROM account_samples WHERE mts<=? ORDER BY mts DESC LIMIT 1", (train_end,)
         ).fetchone()
     principal = D(sample[0]) if sample else D(1000)
-    checkpoint = Path(store.path).resolve().parent / "research" / store.currency / "replay-checkpoint.json"
+    checkpoint = (
+        Path(store.path).resolve().parent
+        / "research"
+        / store.currency
+        / ("replay-checkpoint-v2.json" if engine == MULTI_ENGINE else "replay-checkpoint.json")
+    )
     binding = digest(
         {
             "now": now_ms,
@@ -435,6 +524,8 @@ def evaluate(store, now_ms, cancelled=lambda: False):
         for split in ("validation", "test"):
             new, old = metrics[split]["adaptive"], metrics[split][baseline]
             gains.append(new["netInterest"] > old["netInterest"] and new["bookCoverageFraction"] >= 0.95)
+            if engine == MULTI_ENGINE:
+                gains[-1] = gains[-1] and new["frrCoverageFraction"] >= 0.95
         ci = moving_block_interval(
             metrics["test"]["adaptive"]["dailyNetInterest"], metrics["test"][baseline]["dailyNetInterest"]
         )

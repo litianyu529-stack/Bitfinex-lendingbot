@@ -17,6 +17,7 @@ python -m pytest -q `
     --cov=StateStore `
     --cov=StrategyV3 `
     --cov=StrategyV4 `
+    --cov=StrategyV41 `
     --cov=AdaptiveRuntime `
     --cov=ResearchV4 `
     --cov=ReplayV4 `
@@ -33,6 +34,9 @@ python -m coverage report --include=StrategyV3.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m coverage report --include=StrategyV4.py --fail-under=90
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+python -m coverage report --include=StrategyV41.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m coverage report --include=Recovery.py --fail-under=90

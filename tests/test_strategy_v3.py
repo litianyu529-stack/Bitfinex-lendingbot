@@ -1019,6 +1019,12 @@ def test_v4_chain_stage_count_uses_ten_stage_default_for_old_raw_policy(tmp_path
         ) == 10
 
 
+@pytest.mark.parametrize("value", [None, "", "bad", "NaN", "Infinity"])
+def test_invalid_required_cap_returns_readable_configuration_error(value):
+    with pytest.raises(lendingbot.ConfigError, match="最大放贷比例必须填写有效数字"):
+        lendingbot.strategy_v3_from_api_payload({"max_lend_percent": value}, base=limit_policy())
+
+
 def test_legacy_order_sizing_fields_are_ignored_and_not_serialized():
     parsed = lendingbot.strategy_v3_from_api_payload(
         {

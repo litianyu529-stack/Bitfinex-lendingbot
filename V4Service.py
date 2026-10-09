@@ -91,7 +91,12 @@ class V4DashboardService:
         from StrategyV4 import adaptive_template
         from ResearchV4 import ModelRepository
 
-        candidate = ModelRepository(store.path, currency).candidate(int(self.context.now() * 1000))
+        from StrategyV4 import ENGINE, MULTI_ENGINE
+        from StrategyV41 import template as multi_template
+
+        repo = ModelRepository(store.path, currency)
+        models = {engine: repo.candidate(int(self.context.now() * 1000), engine) for engine in (ENGINE, MULTI_ENGINE)}
+        candidate = models[ENGINE]
         return {
             "credentialsConfigured": self._client(settings).has_credentials(),
             "currency": currency,
@@ -107,6 +112,16 @@ class V4DashboardService:
             "activeStrategy": active,
             "supportedCurrencies": list(SUPPORTED_CURRENCIES),
             "adaptiveTemplate": strategy_v3_api_values(adaptive_template(policy)),
+            "adaptiveTemplates": {
+                ENGINE: strategy_v3_api_values(adaptive_template(policy)),
+                MULTI_ENGINE: strategy_v3_api_values(multi_template(policy)),
+            },
+            "candidateModels": {
+                engine: None
+                if model is None
+                else {key: model[key] for key in ("id", "confidence", "coverage", "eligibleForLiveCandidate")}
+                for engine, model in models.items()
+            },
             "candidateModel": None
             if candidate is None
             else {key: candidate[key] for key in ("id", "confidence", "coverage", "eligibleForLiveCandidate")},
@@ -488,7 +503,7 @@ def run_worker(args, settings, context, log):
                     settings.sleep_active,
                     10
                     if any(
-                        runtime.policy.strategy_engine == "adaptive_net_yield_v1"
+                        runtime.policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
                         for runtime in coordinator.runtimes.values()
                     )
                     else 30,

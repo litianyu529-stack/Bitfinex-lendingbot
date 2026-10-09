@@ -131,7 +131,8 @@ V3_BOOL_FIELDS = {
     "adopt_external_offers",
 }
 V3_INT_FIELDS = {
-    "long_from_days", "maximum_period",
+    "long_from_days",
+    "maximum_period",
     "minimum_offer_minutes",
     "reprice_cooldown_minutes",
     "max_reprices_per_hour",
@@ -246,6 +247,22 @@ def strategy_v3_api_values(policy):
     return payload
 
 
+def _strategy_numeric_value(value, field_name):
+    label = {
+        "max_lend_percent": "最大放贷比例",
+        "max_lend_amount": "最大放贷金额",
+        "normal_fee_rate": "普通手续费",
+        "hidden_fee_rate": "Hidden手续费",
+    }.get(field_name, field_name)
+    try:
+        parsed = Decimal(str(value))
+        if not parsed.is_finite():
+            raise ValueError("non-finite number")
+        return parsed
+    except (ValueError, ArithmeticError) as exc:
+        raise ConfigError(f"{label}必须填写有效数字") from exc
+
+
 def strategy_v3_from_api_payload(payload, base=None):
     values = {}
     payload = payload or {}
@@ -262,7 +279,7 @@ def strategy_v3_from_api_payload(payload, base=None):
         } and value in (None, ""):
             values[field_name] = None
         elif field_name in V3_PERCENT_FIELDS:
-            values[field_name] = Decimal(str(value)) / Decimal("100")
+            values[field_name] = _strategy_numeric_value(value, field_name) / Decimal("100")
         elif field_name in V3_BOOL_FIELDS:
             values[field_name] = (
                 value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -277,7 +294,7 @@ def strategy_v3_from_api_payload(payload, base=None):
         elif field_name in {"strategy_engine", "model_id"}:
             values[field_name] = str(value or "")
         else:
-            values[field_name] = Decimal(str(value))
+            values[field_name] = _strategy_numeric_value(value, field_name)
     try:
         return validate_policy_v3(policy_v3_with_overrides(base or StrategyPolicyV3(), values))
     except (ValueError, ArithmeticError) as exc:
@@ -342,8 +359,12 @@ def _normalization_payload(policy, record):
     # Their absence alone must not activate a new strategy during startup.
     if policy.strategy_engine == "legacy_v3":
         for key in (
-            "strategy_engine", "long_from_days", "long_max_share",
-            "maximum_period", "model_id", "fee_verified",
+            "strategy_engine",
+            "long_from_days",
+            "long_max_share",
+            "maximum_period",
+            "model_id",
+            "fee_verified",
         ):
             if key not in record["policy"]:
                 payload.pop(key, None)
@@ -376,7 +397,9 @@ def normalize_current_active_strategy(config_path):
         pre_policy = strategy_v3_from_record(pre_migration_active)
         pre_serialized = json.dumps(
             _normalization_payload(pre_policy, pre_migration_active),
-            ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
         pre_version = hashlib.sha256(pre_serialized.encode("utf-8")).hexdigest()[:16]
         if pre_migration_active["version_id"] != pre_version:

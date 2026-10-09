@@ -365,7 +365,12 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                     if path.endswith("/start")
                     else "evaluate"
                 )
-                result = service.research.start(currency, kind, resume=path.endswith("/resume"))
+                result = service.research.start(
+                    currency,
+                    kind,
+                    resume=path.endswith("/resume"),
+                    engine=payload.get("engine", "adaptive_net_yield_v1"),
+                )
         elif path == "/api/config/v4":
             result = service.settings(payload)
         elif path == "/api/control/v4/preflight":

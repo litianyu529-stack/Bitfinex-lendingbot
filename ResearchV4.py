@@ -12,7 +12,17 @@ from pathlib import Path
 
 from FileUtils import atomic_write_text
 from StrategyV3 import json_decimal, pool_for_period
-from StrategyV4 import DAY, adaptive_template, condition, fit_model, validate_model, weighted_rate
+from StrategyV4 import (
+    DAY,
+    ENGINE,
+    MULTI_ENGINE,
+    MULTI_VERSION,
+    adaptive_template,
+    condition,
+    fit_model,
+    validate_model,
+    weighted_rate,
+)
 
 
 class ModelRepository:
@@ -22,13 +32,23 @@ class ModelRepository:
         self.currency = require_currency(currency)
         self.directory = Path(db_path).resolve().parent / "research" / currency
 
+    @staticmethod
+    def report_name(algorithm):
+        return "evaluation-v2.json" if algorithm == MULTI_VERSION else "evaluation.json"
+
     def save(self, model):
         validate_model(model, self.currency, model["trainedUntilMs"], allow_empty=True)
         self.directory.mkdir(parents=True, exist_ok=True)
+        if model["algorithm"] == MULTI_VERSION and not (self.directory / "candidate-v1.json").exists():
+            previous = self.candidate(model["trainedUntilMs"], ENGINE)
+            if previous:
+                atomic_write_text(str(self.directory / "candidate-v1.json"), json.dumps({"modelId": previous["id"]}))
         atomic_write_text(
             str(self.directory / (model["id"] + ".json")), json.dumps(json_decimal(model), sort_keys=True)
         )
         atomic_write_text(str(self.directory / "candidate.json"), json.dumps({"modelId": model["id"]}))
+        pointer = "candidate-v2.json" if model["algorithm"] == MULTI_VERSION else "candidate-v1.json"
+        atomic_write_text(str(self.directory / pointer), json.dumps({"modelId": model["id"]}))
         return model["id"]
 
     def load(self, model_id, now_ms):
@@ -40,10 +60,23 @@ class ModelRepository:
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("model unavailable or corrupted") from exc
 
-    def candidate(self, now_ms):
+    def candidate(self, now_ms, engine=None):
         try:
-            pointer = json.loads((self.directory / "candidate.json").read_text(encoding="utf-8"))
-            return self.load(pointer["modelId"], now_ms)
+            name = (
+                "candidate-v2.json"
+                if engine == MULTI_ENGINE
+                else "candidate-v1.json"
+                if engine == ENGINE
+                else "candidate.json"
+            )
+            path = self.directory / name
+            if engine == ENGINE and not path.exists():
+                path = self.directory / "candidate.json"
+            pointer = json.loads(path.read_text(encoding="utf-8"))
+            model = self.load(pointer["modelId"], now_ms)
+            if engine and (model["algorithm"] == MULTI_VERSION) != (engine == MULTI_ENGINE):
+                return None
+            return model
         except (OSError, ValueError, KeyError):
             return None
 
@@ -184,6 +217,7 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
                     "amount": abs(float(row["amount"])),
                     "fills": grouped.get(oid, []),
                     "condition": observed_condition,
+                    "displayType": row.get("display_type") or "LIMIT",
                 }
             )
         holdings = [
@@ -209,6 +243,13 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
                 holdings.append(
                     {"currency": currency, "period": row["period"], "opened_ms": row["mts_opening"], "closed_ms": None}
                 )
+        known_types = {
+            row["credit_id"]: row["display_type"]
+            for row in c.execute("SELECT credit_id,display_type FROM credits WHERE last_seen_ms<=?", (now_ms,))
+            if row["display_type"]
+        }
+        for row in holdings:
+            row["displayType"] = known_types.get(row.get("id"), "UNKNOWN")
         books = c.execute(
             "SELECT min(mts),max(mts),count(*) FROM book_snapshots WHERE mts>=? AND mts<=?",
             (now_ms - lookback_days * DAY, now_ms),
@@ -238,8 +279,20 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
         return daily, observations, holdings, coverage
 
 
-def build_from_store(store, now_ms, cancelled=lambda: False, lookback_days=90):
+def build_from_store(store, now_ms, cancelled=lambda: False, lookback_days=90, engine=ENGINE):
     data = training_data(store.path, store.currency, now_ms, cancelled, lookback_days)
+    if engine == MULTI_ENGINE:
+        from StrategyV41 import fit_model as multi_fit
+
+        with connect_readonly(store.path) as c:
+            frr = [
+                dict(r)
+                for r in c.execute(
+                    "SELECT mts,frr_daily_rate FROM funding_stats WHERE mts>=? AND mts<=? ORDER BY mts",
+                    (now_ms - lookback_days * DAY, now_ms),
+                )
+            ]
+        return multi_fit(store.currency, *data[:3], now_ms=now_ms, coverage=data[3], frr=frr)
     return fit_model(store.currency, *data[:3], now_ms=now_ms, coverage=data[3])
 
 
@@ -293,7 +346,9 @@ class ResearchJobs:
         except (OSError, ValueError):
             return {"currency": currency, "state": "IDLE"}
 
-    def start(self, currency, kind="evaluate", resume=False):
+    def start(self, currency, kind="evaluate", resume=False, engine=ENGINE):
+        if engine not in (ENGINE, MULTI_ENGINE):
+            raise ValueError("请选择 V4.0 或 V4.1 研究引擎")
         if kind not in ("evaluate", "shadow"):
             raise ValueError("unknown research task")
         store = self.store_factory(currency)
@@ -310,6 +365,7 @@ class ResearchJobs:
                 "state": "RUNNING",
                 "startedAtMs": previous.get("startedAtMs", int(self.clock() * 1000)),
                 "phase": "TRAINING",
+                "engine": previous.get("engine", engine),
             }
         thread = threading.Thread(target=self._run, args=(store, kind, stop), daemon=True)
         thread.start()
@@ -337,19 +393,22 @@ class ResearchJobs:
         repo = ModelRepository(store.path, store.currency)
         try:
             now = self.tasks[store.currency]["startedAtMs"] if kind == "evaluate" else int(self.clock() * 1000)
+            engine = self.tasks[store.currency].get("engine", ENGINE)
             if kind == "evaluate":
                 from ReplayV4 import evaluate
 
                 self._publish(store, {"phase": "REPLAY"})
-                report, model = evaluate(store, now, stop.is_set)
+                report, model = evaluate(store, now, stop.is_set, engine=engine)
                 repo.save(model)
-                atomic_write_text(str(repo.directory / "evaluation.json"), json.dumps(json_decimal(report)))
+                atomic_write_text(
+                    str(repo.directory / repo.report_name(model["algorithm"])), json.dumps(json_decimal(report))
+                )
                 self._publish(store, {"state": "COMPLETED", "phase": "DONE", "modelId": model["id"], "report": report})
             else:
                 while not stop.is_set():
-                    candidate = repo.candidate(int(self.clock() * 1000))
+                    candidate = repo.candidate(int(self.clock() * 1000), engine)
                     if candidate is None or candidate["trainedUntilMs"] // DAY < int(self.clock() * 1000) // DAY:
-                        candidate = build_from_store(store, int(self.clock() * 1000), stop.is_set)
+                        candidate = build_from_store(store, int(self.clock() * 1000), stop.is_set, engine=engine)
                         repo.save(candidate)
                     self._shadow(store, candidate, repo)
                     self._publish(
@@ -375,7 +434,12 @@ class ResearchJobs:
             if sample is None or book is None or now - book["mts"] > 60000 or now - sample["mts"] > 60000:
                 repo.journal({"atMs": now, "mode": "SHADOW", "reason": "ACCOUNT_OR_MARKET_STALE"})
                 return
-            policy = adaptive_template(strategy_v3_from_record(store.strategy("ACTIVE")))
+            if model["algorithm"] == MULTI_VERSION:
+                from StrategyV41 import template
+
+                policy = template(strategy_v3_from_record(store.strategy("ACTIVE")))
+            else:
+                policy = adaptive_template(strategy_v3_from_record(store.strategy("ACTIVE")))
             policy = replace(policy, model_id=model["id"])
             offers = [dict(r) for r in c.execute("SELECT * FROM offers WHERE status='ACTIVE'")]
             credits = [dict(r) for r in c.execute("SELECT * FROM credits WHERE status='ACTIVE'")]
@@ -396,11 +460,21 @@ class ResearchJobs:
             trades = [
                 dict(r) for r in c.execute("SELECT * FROM market_trades WHERE mts>=? AND mts<=?", (now - 7 * DAY, now))
             ]
+            stat = c.execute(
+                "SELECT mts,frr_daily_rate FROM funding_stats WHERE mts<=? ORDER BY mts DESC LIMIT 1", (now,)
+            ).fetchone()
         from ExchangeModels import parse_book
 
         raw = json.loads(book["book_json"])
         normalized = raw if not raw or isinstance(raw[0], dict) else parse_book(raw)
-        plan = build_plan(account, policy, model, normalized, trades, now, model["id"])
+        if policy.strategy_engine == MULTI_ENGINE:
+            from StrategyV41 import build_plan as multi_plan
+            from decimal import Decimal as D
+
+            frr = D(stat["frr_daily_rate"]) if stat and now - stat["mts"] <= policy.rest_stale_seconds * 1000 else None
+            plan = multi_plan(account, policy, model, normalized, trades, now, model["id"], frr)
+        else:
+            plan = build_plan(account, policy, model, normalized, trades, now, model["id"])
         after = self.shadow_observed_until.get(store.currency, now)
         observed = [row for row in trades if after < row["mts"] <= now]
         self.shadow_observed_until[store.currency] = now
