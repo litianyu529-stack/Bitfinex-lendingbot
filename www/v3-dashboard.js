@@ -15,10 +15,10 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     const groups = [
         {
             title: "策略引擎与长期保护",
-            description: "V4.0 比较 LIMIT；V4.1 同时比较 LIMIT 与 FRR 系列。均按120天资金时间净收益动态分配，研究合格后才允许人工实盘启动。",
+            description: "V4.0 比较 LIMIT；V4.1 同时比较 LIMIT 与 FRR 系列。V4.1 通过运行验收后可人工启动，收益研究单独展示；低置信度不代表已验证收益。",
             fields: [
                 ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"], ["adaptive_net_yield_v2", "V4.1 策略"]] }],
-                ["model_id", "冻结模型 ID", "text", "", { placeholder: "研究评估后选择模型" }],
+                ["model_id", "冻结模型 ID", "text", "", { placeholder: "快速准备后选用模型" }],
                 ["long_from_days", "长期起始天数", "number", "天", { min: 8, max: 120 }],
                 ["long_max_share", "长期贷款与挂单上限", "number", "%", { min: 1, max: 100 }],
                 ["maximum_period", "最长放贷期限", "number", "天", { min: 8, max: 120 }],
@@ -181,7 +181,11 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
                     <section><h2>${currency} 策略研究</h2><p id="v4ResearchState">尚未研究</p>
+                        <p id="v4OperationalState">运行验收：尚未准备</p>
+                        <p id="v4ProfitabilityState">收益研究：尚未验证收益优势</p>
                         <button id="v4Template" class="button secondary" type="button">载入所选 V4 策略草稿模板</button>
+                        <button id="v4Prepare" class="button secondary" type="button">快速准备 ${currency} V4.1 模型</button>
+                        <button id="v4UseModel" class="button secondary" type="button">选用已准备模型</button>
                         <button id="v4Evaluate" class="button secondary" type="button">评估 ${currency}</button>
                         <button id="v4Shadow" class="button secondary" type="button">影子观察 ${currency}</button>
                         <button id="v4ResearchStop" class="button secondary" type="button">取消研究 / 停止观察</button>
@@ -366,6 +370,8 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         typeNote.hidden = !adaptive;
         typeNote.textContent = multi ? "V4.1 比较 LIMIT 与勾选的 FRR 系列；Hidden 暂未支持。FRR 挂单成交前会变价，浮动贷款成交后仍会变价，可能低于底线；Variable 上限包含贷款与挂单。" : "V4.0 第一版仅支持可见 LIMIT；需要 FRR 系列时请选择 V4.1，并重新研究和预览。";
         byId("v4Template").textContent = `载入 ${multi ? "V4.1" : "V4.0"} 策略草稿模板`;
+        byId("v4Prepare").disabled = !multi;
+        renderModelStatus();
         surface.querySelector(".v3-fixed-safety").hidden = adaptive;
         for (const description of surface.querySelectorAll(".v3-section-heading > p")) description.hidden = adaptive;
         for (const pool of ["short", "medium", "long"]) {
@@ -383,7 +389,8 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         const box = byId("v4AdaptiveDetails"); box.replaceChildren();
         if (!plan?.engine?.startsWith("adaptive_net_yield_")) return;
         const description = document.createElement("p");
-        description.textContent = `模型 ${plan.modelId || "未选择"} · ${plan.confidence === "LOW" ? "低置信度" : plan.confidence || "未校准"} · ${plan.eligibleForLiveCandidate ? "研究合格候选" : "研究中"}。${(plan.blockReasons || []).join("；")}`;
+        const readiness = plan.engine === "adaptive_net_yield_v2" ? (plan.operationalReady ? "运行验收通过" : "运行尚未就绪") : "V4.0 沿用收益研究启用门槛";
+        description.textContent = `模型 ${plan.modelId || "未选择"} · ${plan.confidence === "LOW" ? "低置信度" : plan.confidence || "未校准"} · ${readiness} · ${plan.eligibleForLiveCandidate ? "收益研究通过" : "尚未验证收益优势"}。${[...(plan.blockReasons || []), ...(plan.operationalBlockReasons || [])].join("；")}`;
         box.append(description);
         for (const row of (plan.candidates || []).slice(0, 8)) {
             const line = document.createElement("p");
@@ -398,9 +405,21 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         }
     }
 
+    function renderModelStatus() {
+        const engine = input("strategy_engine").value;
+        const candidate = state.candidates?.[engine];
+        const modelId = input("model_id").value.trim();
+        const model = window.mikaV4.resolveStrategyModel(state.candidates, state.modelDetails, engine, modelId);
+        const origin = model?.dataBasis?.rollingRateSource === "FRR_HISTORY" ? "FRR 历史参考（不代表自身成交）" : "公共逐笔历史";
+        const confidences = Object.entries(model?.typeConfidence || {}).map(([kind, level]) => `${kind}：${level === "LOW" ? "低置信度" : "已校准"}`).join("；");
+        byId("v4OperationalState").textContent = engine === "adaptive_net_yield_v1" ? "V4.0 沿用收益研究启用门槛" : `运行验收：${model?.operationalReady ? "已通过" : "尚未就绪"}${modelId ? " · 当前编辑模型" : " · 候选模型，需选用"} · ${model ? origin : "尚未准备模型"}。${(model?.operationalBlockReasons || []).join("；")} ${confidences}`;
+        byId("v4ProfitabilityState").textContent = `收益研究：${model?.eligibleForLiveCandidate ? "通过严格研究验收" : "尚未验证收益优势；运行验收通过不代表收益更高"}`;
+        byId("v4UseModel").disabled = !candidate || (engine === "adaptive_net_yield_v2" && !candidate.operationalReady);
+    }
+
     function percentDaily(value) {
         const number = Number(value);
-        return Number.isFinite(number) ? `${(number * 100).toFixed(5)}%` : "--";
+        return Number.isFinite(number) && number > 0 ? `${(number * 100).toFixed(5)}%` : "—";
     }
 
     function scorePercent(value) {
@@ -615,11 +634,13 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
             state.candidate = config.candidateModel;
             state.templates = config.adaptiveTemplates;
             state.candidates = config.candidateModels;
+            state.modelDetails = config.modelDetails;
             const research = config.research || {};
-            byId("v4ResearchState").textContent = `${research.state || "IDLE"} · ${research.phase || ""} · ${research.report?.reason || research.error || "软件验证与收益研究分别验收"}`;
+            byId("v4ResearchState").textContent = `${research.state || "IDLE"} · ${research.phase || ""} · ${research.report?.reason || research.error || "运行验收与收益研究分别验收"}${research.backfill ? " · 公共历史回补 " + research.backfill.state : ""}`;
             if (sequence !== state.loadSequence) return false;
             if (!state.policy) for (const element of byId("v3StrategyForm").elements) element.disabled = false;
             if (!state.dirty && revision === state.editRevision) fillPolicy(config.strategyV3Draft || config.strategyV3Pending || config.strategyV3);
+            renderModelStatus();
         } catch (error) {
             if (sequence !== state.loadSequence) return false;
             byId("v3FormMessage").textContent = `配置载入失败：${error.message}`;
@@ -770,7 +791,12 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         const engine = input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1";
         fillPolicy({...state.policy, ...(state.templates?.[engine] || state.template), model_id: (state.candidates?.[engine] || (engine === "adaptive_net_yield_v1" ? state.candidate : null))?.id || ""}); edited();
     });
-    for (const [id, path] of [["v4Evaluate", "evaluate"], ["v4Shadow", "shadow/start"], ["v4ResearchStop", "cancel"], ["v4ResearchResume", "resume"]]) {
+    byId("v4UseModel").addEventListener("click", () => {
+        const candidate = state.candidates?.[input("strategy_engine").value];
+        if (!candidate) return;
+        input("model_id").value = candidate.id; edited(); updateDerived();
+    });
+    for (const [id, path] of [["v4Prepare", "prepare"], ["v4Evaluate", "evaluate"], ["v4Shadow", "shadow/start"], ["v4ResearchStop", "cancel"], ["v4ResearchResume", "resume"]]) {
         byId(id).addEventListener("click", async () => {
             try { const data = await postJson(`/api/research/v4/${path}`, {currency, engine: input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1"}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
             catch (error) { byId("v4ResearchState").textContent = error.message; }

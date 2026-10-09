@@ -1,5 +1,10 @@
 "use strict";
 
+function resolveStrategyModel(candidates, details, engine, modelId) {
+    // An edited/frozen model takes precedence over the latest research candidate.
+    return modelId ? details?.[modelId] : candidates?.[engine];
+}
+
 function createCurrencyRequester(fetcher, csrf) {
     const routes = {
         "/api/config": "/api/config/v4", "/api/status": "/api/status/v4",
@@ -80,7 +85,7 @@ function logCurrency(line) {
     return /\b(?:USD|fUSD)\b/i.test(text) ? "USD" : "system";
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = {CurrencySettings, createCurrencyRequester, logCurrency};
+if (typeof module !== "undefined" && module.exports) module.exports = {CurrencySettings, createCurrencyRequester, logCurrency, resolveStrategyModel};
 
 if (typeof window !== "undefined") {
     const contexts = {}, csrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
@@ -109,7 +114,7 @@ if (typeof window !== "undefined") {
         if (!stream.childElementCount) {const node = document.createElement("p"); node.className = "log-empty";
             node.textContent = "暂无匹配日志；未标记币种的系统日志可在“全部”查看。"; stream.append(node);}
     }
-    window.mikaV4 = {contexts, scopeIds, dialogOwner: null,
+    window.mikaV4 = {contexts, scopeIds, resolveStrategyModel, dialogOwner: null,
         request: createCurrencyRequester(window.fetch.bind(window), csrf),
         receiveLogs(_currency, lines) {logs = Array.isArray(lines) ? lines : []; renderLogs();},
         confirmStrategy(currency, message) {

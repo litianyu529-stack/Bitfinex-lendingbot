@@ -175,6 +175,27 @@ def parse_funding_trades(rows):
     return sorted(trades, key=lambda item: item["mts"])
 
 
+def current_frr_observation(client, symbol, observed_at_ms):
+    """Funding ticker index 0 is current daily FRR, observed locally now.
+
+    Historical statistics carry their original timestamps; never relabel those
+    rows as fresh quotes. The ticker provides no exchange observation timestamp.
+    """
+    row = client.ticker(symbol)
+    if not isinstance(row, (list, tuple)) or len(row) < 13:
+        raise ValueError("Funding ticker 格式无效")
+    rate = D(str(row[0]))
+    if not rate.is_finite() or rate <= 0:
+        raise ValueError("当前 FRR 必须为正有限数")
+    return {
+        "mts": int(observed_at_ms),
+        "frr_daily_rate": rate,
+        "source": "FUNDING_TICKER",
+        "observedAtMs": int(observed_at_ms),
+        "exchangeTimestampAvailable": False,
+    }
+
+
 def parse_funding_stats(rows):
     stats = []
     for row in rows or []:

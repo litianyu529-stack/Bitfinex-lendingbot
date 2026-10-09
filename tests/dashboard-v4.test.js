@@ -3,10 +3,22 @@ const {test} = require("node:test");
 const assert = require("node:assert/strict");
 const {readFileSync} = require("node:fs");
 const vm = require("node:vm");
-const {CurrencySettings, createCurrencyRequester, logCurrency} = require("../www/v4-dashboard.js");
+const {CurrencySettings, createCurrencyRequester, logCurrency, resolveStrategyModel} = require("../www/v4-dashboard.js");
 const initial = () => ({enabled:false, autoTransfer:false});
 const deferred = () => {let resolve, reject; const promise = new Promise((yes,no) => {resolve=yes; reject=no;}); return {promise,resolve,reject};};
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test("a prepared candidate cannot replace an edited frozen model or another currency model", () => {
+    const engine = "adaptive_net_yield_v2";
+    const usd = {candidates:{[engine]:{id:"usd-new",operationalReady:true}}, details:{"usd-active":{id:"usd-active",operationalReady:false}}};
+    const usdt = {candidates:{[engine]:{id:"usdt-new",operationalReady:false}}, details:{"usdt-active":{id:"usdt-active",operationalReady:true}}};
+    assert.equal(resolveStrategyModel(usd.candidates,usd.details,engine,"usd-active").id,"usd-active");
+    assert.equal(resolveStrategyModel(usdt.candidates,usdt.details,engine,"usdt-active").id,"usdt-active");
+    assert.equal(resolveStrategyModel(usd.candidates,usd.details,engine,"").id,"usd-new");
+    assert.equal(resolveStrategyModel(usdt.candidates,usdt.details,engine,"").id,"usdt-new");
+    assert.equal(resolveStrategyModel(usd.candidates,usd.details,engine,"usdt-active"),undefined);
+    assert.equal(resolveStrategyModel(usd.candidates,usd.details,"adaptive_net_yield_v1",""),undefined);
+});
 
 test("a polling response requested before a change cannot uncheck it", async () => {
     const read = deferred(), write = deferred(); let reads = 0;

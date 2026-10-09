@@ -609,6 +609,10 @@ class LendingRuntimeV3:
         book = parse_book_v3(raw_book)
         trades = parse_funding_trades(raw_trades)
         self._stats = parse_funding_stats(raw_stats)
+        if self.policy.strategy_engine == "adaptive_net_yield_v2":
+            from ExchangeModels import current_frr_observation
+
+            self._stats.append(current_frr_observation(self.client, symbol, now))
         offers = parse_offer_rows_v3(raw_offers, currency=self.currency)
         credits = parse_credit_rows_v3(raw_credits, currency=self.currency)
         loans = parse_loan_rows_v3(raw_loans, currency=self.currency)

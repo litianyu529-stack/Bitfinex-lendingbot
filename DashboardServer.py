@@ -338,6 +338,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             "/api/strategy/v4/apply",
             "/api/strategy/v4/discard",
             "/api/research/v4/evaluate",
+            "/api/research/v4/prepare",
             "/api/research/v4/shadow/start",
             "/api/research/v4/shadow/stop",
             "/api/research/v4/cancel",
@@ -363,6 +364,8 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                     if path.endswith("/resume")
                     else "shadow"
                     if path.endswith("/start")
+                    else "prepare"
+                    if path.endswith("/prepare")
                     else "evaluate"
                 )
                 result = service.research.start(

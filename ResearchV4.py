@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -57,7 +57,7 @@ class ModelRepository:
         try:
             model = json.loads((self.directory / (model_id + ".json")).read_text(encoding="utf-8"))
             return validate_model(model, self.currency, now_ms)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, TypeError, KeyError, AttributeError, ArithmeticError) as exc:
             raise ValueError("model unavailable or corrupted") from exc
 
     def candidate(self, now_ms, engine=None):
@@ -102,6 +102,69 @@ def connect_readonly(path):
         connection.close()
 
 
+class _MarketWindow:
+    """One sorted cursor supplies daily paths and quote-time rolling features."""
+
+    def __init__(self, connection, start, end, cancelled):
+        self.start, self.cancelled = start, cancelled
+        self.cursor = iter(
+            connection.execute(
+                "SELECT mts,rate,amount,period FROM market_trades WHERE mts>=? AND mts<=? ORDER BY mts",
+                (start - DAY, end),
+            )
+        )
+        self.next = next(self.cursor, None)
+        self.windows = [(DAY, deque(), defaultdict(float)), (3600000, deque(), defaultdict(float))]
+        self.hist = defaultdict(lambda: defaultdict(float))
+        self.count, self.earliest, self.latest = 0, None, None
+
+    def advance(self, cutoff):
+        while self.next is not None and self.next["mts"] <= cutoff:
+            row = self.next
+            mts, period, rate, amount = row["mts"], int(row["period"]), str(row["rate"]), abs(float(row["amount"]))
+            if self.count % 10000 == 0 and self.cancelled():
+                raise InterruptedError("research cancelled")
+            for _span, queue, levels in self.windows:
+                queue.append((mts, period, rate, amount))
+                levels[(period, rate)] += amount
+            if mts >= self.start:
+                self.earliest = mts if self.earliest is None else self.earliest
+                self.latest = mts
+                self.count += 1
+                self.hist[(mts // DAY, period)][rate] += amount
+            self.next = next(self.cursor, None)
+            self._prune(mts)
+        self._prune(cutoff)
+
+    def _prune(self, cutoff):
+        for span, queue, levels in self.windows:
+            while queue and queue[0][0] < cutoff - span:
+                _mts, period, rate, amount = queue.popleft()
+                key = (period, rate)
+                levels[key] -= amount
+                if levels[key] <= 1e-8:
+                    levels.pop(key, None)
+
+    def rates(self, index, period):
+        levels = defaultdict(float)
+        for (term, rate), amount in self.windows[index][2].items():
+            if term <= period:
+                levels[rate] += amount
+        return [dict(rate=rate, amount=amount) for rate, amount in levels.items()]
+
+    def daily(self, cutoff):
+        self.advance(cutoff)
+        result = []
+        for (day, period), levels in sorted(self.hist.items()):
+            total, cumulative = sum(levels.values()), 0.0
+            for rate, volume in sorted(levels.items(), key=lambda pair: float(pair[0])):
+                cumulative += volume
+                if cumulative >= total / 2:
+                    result.append(dict(mts=min(cutoff, (day + 1) * DAY - 1), rate=rate, amount=total, period=period))
+                    break
+        return result
+
+
 def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days=90):
     """Stream raw trades into day histograms, keeping memory bounded on multi-GB DBs."""
     with connect_readonly(path) as c:
@@ -109,29 +172,7 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
         tag = c.execute("SELECT value FROM schema_meta WHERE key='currency'").fetchone()
         if tag and tag[0] != currency:
             raise ValueError("database currency mismatch")
-        hist = defaultdict(lambda: defaultdict(float))
-        count, earliest, latest = 0, None, None
-        for r in c.execute(
-            "SELECT mts,rate,amount,period FROM market_trades WHERE mts>=? AND mts<=? ORDER BY mts",
-            (now_ms - lookback_days * DAY, now_ms),
-        ):
-            if count % 10000 == 0 and cancelled():
-                raise InterruptedError("research cancelled")
-            mts = r["mts"]
-            earliest = mts if earliest is None else earliest
-            latest = mts
-            count += 1
-            hist[(mts // DAY, int(r["period"]))][str(r["rate"])] += abs(float(r["amount"]))
-        daily = []
-        for (day, period), levels in sorted(hist.items()):
-            total, cumulative = sum(levels.values()), 0.0
-            for rate, volume in sorted(levels.items(), key=lambda pair: float(pair[0])):
-                cumulative += volume
-                if cumulative >= total / 2:
-                    daily.append(
-                        {"mts": min(now_ms, (day + 1) * DAY - 1), "rate": rate, "amount": total, "period": period}
-                    )
-                    break
+        market = _MarketWindow(c, now_ms - lookback_days * DAY, now_ms, cancelled)
         trades = [
             dict(r) for r in c.execute("SELECT * FROM funding_trades WHERE currency=? AND mts<=?", (currency, now_ms))
         ]
@@ -154,7 +195,7 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
         intents = [
             dict(r)
             for r in c.execute(
-                "SELECT * FROM order_intents WHERE created_at_ms>=? AND created_at_ms<=?",
+                "SELECT * FROM order_intents WHERE created_at_ms>=? AND created_at_ms<=? ORDER BY created_at_ms",
                 (now_ms - lookback_days * DAY, now_ms),
             )
         ]
@@ -165,6 +206,7 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
             oid = row["exchange_offer_id"]
             if oid is None or occurrences[oid] != 1:
                 continue
+            market.advance(row["created_at_ms"])
             end = min(now_ms, row["updated_at_ms"]) if row["state"] == "CLOSED" else now_ms
             # Features are measured at quote creation, never using a later book.
             observed_condition = pool_for_period(row["period"])
@@ -178,22 +220,8 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
 
                 raw = json.loads(observed_book["book_json"])
                 quote_book = raw if not raw or isinstance(raw[0], dict) else parse_book(raw)
-                recent = [
-                    dict(r)
-                    for r in c.execute(
-                        "SELECT rate,sum(abs(CAST(amount AS REAL))) AS amount FROM market_trades "
-                        "WHERE mts>=? AND mts<=? AND period<=? GROUP BY rate",
-                        (row["created_at_ms"] - DAY, row["created_at_ms"], row["period"]),
-                    )
-                ]
-                near = [
-                    dict(r)
-                    for r in c.execute(
-                        "SELECT rate,sum(abs(CAST(amount AS REAL))) AS amount FROM market_trades "
-                        "WHERE mts>=? AND mts<=? AND period<=? GROUP BY rate",
-                        (row["created_at_ms"] - 3600000, row["created_at_ms"], row["period"]),
-                    )
-                ]
+                recent = market.rates(0, row["period"])
+                near = market.rates(1, row["period"])
                 ref = weighted_rate(recent)
                 price = D(str(row["effective_rate"]))
                 queue = sum(
@@ -236,12 +264,24 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
             if row["credit_id"] not in closed_ids:
                 seen_ids.add(row["credit_id"])
                 holdings.append(
-                    {"currency": currency, "period": row["period"], "opened_ms": row["mts_opening"], "closed_ms": None}
+                    {
+                        "id": row["credit_id"],
+                        "currency": currency,
+                        "period": row["period"],
+                        "opened_ms": row["mts_opening"],
+                        "closed_ms": None,
+                    }
                 )
         for row in c.execute("SELECT * FROM credits WHERE currency=? AND mts_opening<=?", (currency, now_ms)):
             if row["credit_id"] not in closed_ids and row["credit_id"] not in seen_ids:
                 holdings.append(
-                    {"currency": currency, "period": row["period"], "opened_ms": row["mts_opening"], "closed_ms": None}
+                    {
+                        "id": row["credit_id"],
+                        "currency": currency,
+                        "period": row["period"],
+                        "opened_ms": row["mts_opening"],
+                        "closed_ms": None,
+                    }
                 )
         known_types = {
             row["credit_id"]: row["display_type"]
@@ -254,8 +294,9 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
             "SELECT min(mts),max(mts),count(*) FROM book_snapshots WHERE mts>=? AND mts<=?",
             (now_ms - lookback_days * DAY, now_ms),
         ).fetchone()
+        daily = market.daily(now_ms)
         coverage = {
-            "publicTrades": {"count": count, "earliestMs": earliest, "latestMs": latest},
+            "publicTrades": {"count": market.count, "earliestMs": market.earliest, "latestMs": market.latest},
             "bookSnapshots": {"earliestMs": books[0], "latestMs": books[1], "count": books[2]},
             "historicalBookBackfillable": False,
             "publicComplete": False,
@@ -279,7 +320,9 @@ def training_data(path, currency, now_ms, cancelled=lambda: False, lookback_days
         return daily, observations, holdings, coverage
 
 
-def build_from_store(store, now_ms, cancelled=lambda: False, lookback_days=90, engine=ENGINE):
+def build_from_store(
+    store, now_ms, cancelled=lambda: False, lookback_days=90, engine=ENGINE, allow_frr_reference=False
+):
     data = training_data(store.path, store.currency, now_ms, cancelled, lookback_days)
     if engine == MULTI_ENGINE:
         from StrategyV41 import fit_model as multi_fit
@@ -292,7 +335,9 @@ def build_from_store(store, now_ms, cancelled=lambda: False, lookback_days=90, e
                     (now_ms - lookback_days * DAY, now_ms),
                 )
             ]
-        return multi_fit(store.currency, *data[:3], now_ms=now_ms, coverage=data[3], frr=frr)
+        return multi_fit(
+            store.currency, *data[:3], now_ms=now_ms, coverage=data[3], frr=frr, allow_frr_reference=allow_frr_reference
+        )
     return fit_model(store.currency, *data[:3], now_ms=now_ms, coverage=data[3])
 
 
@@ -322,12 +367,19 @@ def moving_block_interval(candidate, baseline, seed=409, iterations=2000):
 class ResearchJobs:
     """Daemon jobs have only SQLite inputs, never an authenticated exchange client."""
 
-    def __init__(self, store_factory, clock=time.time):
+    def __init__(self, store_factory, clock=time.time, public_client_factory=None, public_interval=4.1):
         self.store_factory, self.clock = store_factory, clock
         self.lock = threading.RLock()
         self.tasks = {}
         self.stops = {}
         self.shadow_observed_until = {}
+        from StrategyResearch import PublicRateLimiter
+
+        self.public_client_factory = public_client_factory
+        self.public_limiter = PublicRateLimiter(public_interval)
+        self.public_lock = threading.Lock()
+        self.backfills = {}
+        self.backfill_stops = {}
 
     def status(self, currency):
         from Currency import require_currency
@@ -335,24 +387,36 @@ class ResearchJobs:
         require_currency(currency)
         with self.lock:
             if currency in self.tasks:
-                return dict(self.tasks[currency])
+                return {**self.tasks[currency], "backfill": self.backfills.get(currency)}
         store = self.store_factory(currency)
         repo = ModelRepository(store.path, currency)
         try:
             state = json.loads((repo.directory / "job.json").read_text(encoding="utf-8"))
             if state.get("state") == "RUNNING":
                 state["state"] = "INTERRUPTED"
+            try:
+                backfill = json.loads((repo.directory / "backfill-job.json").read_text(encoding="utf-8"))
+                if backfill.get("state") == "RUNNING":
+                    backfill["state"] = "INTERRUPTED"
+                state["backfill"] = backfill
+            except (OSError, ValueError):
+                pass
             return state
         except (OSError, ValueError):
             return {"currency": currency, "state": "IDLE"}
 
     def start(self, currency, kind="evaluate", resume=False, engine=ENGINE):
-        if engine not in (ENGINE, MULTI_ENGINE):
-            raise ValueError("请选择 V4.0 或 V4.1 研究引擎")
-        if kind not in ("evaluate", "shadow"):
-            raise ValueError("unknown research task")
         store = self.store_factory(currency)
         previous = self.status(currency) if resume else {}
+        if resume:
+            engine = previous.get("engine", engine)
+            kind = previous.get("kind", kind)
+        if engine not in (ENGINE, MULTI_ENGINE):
+            raise ValueError("请选择 V4.0 或 V4.1 研究引擎")
+        if kind not in ("evaluate", "shadow", "prepare"):
+            raise ValueError("unknown research task")
+        if kind == "prepare" and engine != MULTI_ENGINE:
+            raise ValueError("快速准备只适用于 V4.1，请显式选择 V4.1 引擎")
         with self.lock:
             current = self.tasks.get(currency, {})
             if current.get("state") == "RUNNING":
@@ -379,6 +443,8 @@ class ResearchJobs:
             event = self.stops.get(currency)
             if event:
                 event.set()
+            if currency in self.backfill_stops:
+                self.backfill_stops[currency].set()
         return self.status(currency)
 
     def _publish(self, store, patch):
@@ -394,7 +460,28 @@ class ResearchJobs:
         try:
             now = self.tasks[store.currency]["startedAtMs"] if kind == "evaluate" else int(self.clock() * 1000)
             engine = self.tasks[store.currency].get("engine", ENGINE)
-            if kind == "evaluate":
+            if kind == "prepare":
+                from OperationalV41 import accept
+
+                self._publish(store, {"phase": "PUBLIC_DATA"})
+                self._prepare_public(store, stop)
+                if stop.is_set():
+                    raise InterruptedError("prepare cancelled")
+                now = int(self.clock() * 1000)
+                self._publish(store, {"phase": "TRAINING"})
+                model = build_from_store(store, now, stop.is_set, engine=engine, allow_frr_reference=True)
+                repo.save(model)
+                self._publish(store, {"phase": "SIMULATED_ACCEPTANCE", "modelId": model["id"]})
+                report = accept(repo, model, now)
+                if stop.is_set():
+                    # A canceled task cannot leave a newly accepted report usable.
+                    from OperationalV41 import report_path
+
+                    report_path(repo, model).unlink(missing_ok=True)
+                    raise InterruptedError("prepare cancelled")
+                self._publish(store, {"state": "COMPLETED", "phase": "DONE", "modelId": model["id"], "report": report})
+                self._start_backfill(store)
+            elif kind == "evaluate":
                 from ReplayV4 import evaluate
 
                 self._publish(store, {"phase": "REPLAY"})
@@ -408,7 +495,13 @@ class ResearchJobs:
                 while not stop.is_set():
                     candidate = repo.candidate(int(self.clock() * 1000), engine)
                     if candidate is None or candidate["trainedUntilMs"] // DAY < int(self.clock() * 1000) // DAY:
-                        candidate = build_from_store(store, int(self.clock() * 1000), stop.is_set, engine=engine)
+                        candidate = build_from_store(
+                            store,
+                            int(self.clock() * 1000),
+                            stop.is_set,
+                            engine=engine,
+                            allow_frr_reference=engine == MULTI_ENGINE,
+                        )
                         repo.save(candidate)
                     self._shadow(store, candidate, repo)
                     self._publish(
@@ -420,6 +513,97 @@ class ResearchJobs:
             self._publish(store, {"state": "CANCELLED", "phase": "STOPPED"})
         except Exception as exc:
             self._publish(store, {"state": "FAILED", "error": f"{type(exc).__name__}: {exc}"})
+
+    def _public(self, method, stop, *args, **kwargs):
+        """Only named public reads, serialized across both currencies."""
+        from StrategyResearch import _public_read
+        from bitfinex import Bitfinex
+
+        if method not in ("funding_stats", "funding_book", "funding_trades", "ticker"):
+            raise ValueError("研究客户端禁止鉴权读取及交易所写入")
+        client = self.public_client_factory() if self.public_client_factory else Bitfinex()
+
+        def action():
+            if stop.is_set():
+                raise InterruptedError("public collection cancelled")
+            return getattr(client, method)(*args, **kwargs)
+
+        with self.public_lock:
+            return _public_read(action, self.public_limiter, stop.wait)
+
+    def _prepare_public(self, store, stop):
+        from ExchangeModels import current_frr_observation, parse_book, parse_funding_stats, parse_funding_trades
+        from Currency import funding_symbol
+
+        symbol = funding_symbol(store.currency)
+        now = int(self.clock() * 1000)
+        start, cursor = now - 30 * DAY, now
+        days = {r["mts"] // DAY for r in store.funding_stats(start, now) if float(r["frr_daily_rate"] or 0) > 0}
+        while len(days) < 20 and cursor >= start:
+            raw = self._public("funding_stats", stop, symbol, start=start, end=cursor, limit=250)
+            rows = parse_funding_stats(raw)
+            store.upsert_funding_stats(rows)
+            days.update(r["mts"] // DAY for r in rows if start <= r["mts"] <= now and r["frr_daily_rate"] > 0)
+            if len(raw or []) < 250 or not rows:
+                break
+            next_cursor = min(r["mts"] for r in rows) - 1
+            if next_cursor >= cursor:
+                raise ValueError("FRR历史分页没有前进")
+            cursor = next_cursor
+        raw_trades = self._public("funding_trades", stop, symbol, start=now - 7 * DAY, end=now, limit=10000, sort=-1)
+        trades = parse_funding_trades(raw_trades)
+        store.upsert_market_trades(trades)
+        book = parse_book(self._public("funding_book", stop, symbol, 250))
+        book_at = int(self.clock() * 1000)
+        if not book or not trades:
+            raise ValueError("当前盘口或近期逐笔成交不可用，无法准备运行模型")
+        store.record_book_snapshot(book, now_ms=book_at)
+        reader = type("TickerReader", (), {"ticker": lambda _self, symbol: self._public("ticker", stop, symbol)})()
+        store.upsert_funding_stats([current_frr_observation(reader, symbol, int(self.clock() * 1000))])
+
+    def _start_backfill(self, store):
+        with self.lock:
+            if self.backfills.get(store.currency, {}).get("state") == "RUNNING":
+                return
+            stop = self.backfill_stops[store.currency] = threading.Event()
+            self.backfills[store.currency] = {"state": "RUNNING", "publicOnly": True}
+        repo = ModelRepository(store.path, store.currency)
+        repo.directory.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(str(repo.directory / "backfill-job.json"), json.dumps(self.backfills[store.currency]))
+
+        def run():
+            from StrategyResearch import backfill_public_market_data
+
+            repo = ModelRepository(store.path, store.currency)
+            try:
+                # The adapter exposes only allowlisted public reads. No keys/nonce.
+                jobs = self
+
+                class Reader:
+                    def funding_trades(self, *args, **kwargs):
+                        return jobs._public("funding_trades", stop, *args, **kwargs)
+
+                    def funding_stats(self, *args, **kwargs):
+                        return jobs._public("funding_stats", stop, *args, **kwargs)
+
+                coverage = backfill_public_market_data(
+                    Reader(),
+                    store,
+                    now_ms=int(self.clock() * 1000),
+                    minimum_interval_seconds=0,
+                    retry_sleeper=stop.wait,
+                    currency=store.currency,
+                )
+                result = {"state": "COMPLETED", "publicOnly": True, "complete": coverage["complete"]}
+            except InterruptedError:
+                result = {"state": "CANCELLED", "publicOnly": True}
+            except Exception as exc:
+                result = {"state": "FAILED", "publicOnly": True, "error": str(exc)}
+            with self.lock:
+                self.backfills[store.currency] = result
+            atomic_write_text(str(repo.directory / "backfill-job.json"), json.dumps(result, ensure_ascii=False))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _shadow(self, store, model, repo):
         from RuntimeV3 import LendingRuntimeV3

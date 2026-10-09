@@ -118,6 +118,7 @@ WORKER_BUILD_FILES = (
     "StrategyResearch.py",
     "StrategyV4.py",
     "StrategyV41.py",
+    "OperationalV41.py",
     "ResearchV4.py",
     "ReplayV4.py",
     "AdaptiveRuntime.py",
@@ -425,6 +426,13 @@ def load_v3_market_context(client, policy, now_ms):
     except Exception as exc:
         stats = []
         warnings.append(f"Funding Stats 不可用：{exc}")
+    if policy.strategy_engine == "adaptive_net_yield_v2":
+        from ExchangeModels import current_frr_observation
+
+        try:
+            stats.append(current_frr_observation(client, currency_to_symbol(policy.currency), now_ms))
+        except Exception as exc:
+            warnings.append(f"当前 FRR 不可用：{exc}")
     return book, trades, stats, build_market_signals_v3(book, trades, stats, policy, now_ms), warnings
 
 
@@ -619,6 +627,7 @@ def _strategy_v3_preview(
             "accountDigest": account_digest,
             "planHash": result["plan_hash"],
             "modelHash": result.get("modelId"),
+            "operationalReportHash": result.get("operationalReportHash"),
         }
         with strategy_token_lock:
             strategy_preview_tokens[token] = context
@@ -792,6 +801,16 @@ def save_strategy_v3_draft(config_path, payload, app_context=None, currency="USD
         raise ApiRequestError("Dashboard build 或配置路径已变化，请重新计算", "PREVIEW_STALE", 409)
     if active["version_id"] != context["activeVersion"] or _canonical_sha256(policy.__dict__) != context["policyHash"]:
         raise ApiRequestError("ACTIVE 或拟议策略已变化，请重新计算", "PREVIEW_STALE", 409)
+    if policy.strategy_engine == "adaptive_net_yield_v2":
+        from OperationalV41 import status as operational_status
+        from ResearchV4 import ModelRepository
+
+        repo = ModelRepository(store.path, currency)
+        model = repo.load(policy.model_id, int(now() * 1000))
+        if operational_status(repo, model, int(now() * 1000))["operationalReportHash"] != context.get(
+            "operationalReportHash"
+        ):
+            raise ApiRequestError("运行验收报告已变化，请重新预览", "PREVIEW_STALE", 409)
     if strategy_v3_semantically_equal(policy, active_policy):
         return {
             "versionId": active["version_id"],
@@ -870,10 +889,13 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
         currency=currency,
         v4=context.get("v4", False),
     )
+    if draft_policy.strategy_engine == "adaptive_net_yield_v2" and not refreshed["plan"].get("operationalReady"):
+        raise ApiRequestError("V4.1 模型尚未通过运行验收，请先快速准备模型", "MODEL_NOT_OPERATIONAL", 409)
     if (
         refreshed["accountDigest"] != context["accountDigest"]
         or refreshed["plan"]["plan_hash"] != context["planHash"]
         or refreshed["plan"].get("modelId") != context.get("modelHash")
+        or refreshed["plan"].get("operationalReportHash") != context.get("operationalReportHash")
     ):
         raise ApiRequestError(
             "账户或计划已变化，请检查新预览后再次确认",
@@ -1409,12 +1431,28 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now, stats)
         model = signals["adaptiveContext"]["model"]
         qualified = eligible(store, model)
+        operational = signals["adaptiveContext"]
         add_check(
             "adaptive_model",
-            "自适应模型研究资格",
-            qualified,
-            "冻结模型已通过收益研究" if qualified else "模型缺失、损坏或研究数据不足；禁止实盘启动",
+            "V4.1 模型运行验收" if policy.strategy_engine == "adaptive_net_yield_v2" else "自适应模型研究资格",
+            operational["operationalReady"] if policy.strategy_engine == "adaptive_net_yield_v2" else qualified,
+            (
+                "冻结模型已通过运行验收；收益研究单独展示"
+                if operational["operationalReady"]
+                else "；".join(operational["operationalBlockReasons"])
+            )
+            if policy.strategy_engine == "adaptive_net_yield_v2"
+            else "冻结模型已通过收益研究"
+            if qualified
+            else "模型缺失、损坏或研究数据不足；禁止实盘启动",
         )
+        if policy.strategy_engine == "adaptive_net_yield_v2" and not qualified:
+            warnings.append(
+                {
+                    "code": "RESEARCH_NOT_VALIDATED",
+                    "message": "运行模型尚未证明收益优于旧策略；缺少自身样本的类型使用低置信度市场先验。",
+                }
+            )
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
     current_frr = signals.get("adaptiveContext", {}).get("frr")
     if policy.strategy_engine == "adaptive_net_yield_v2":
@@ -1537,6 +1575,11 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         "actualSlices": len(result["plan"]),
         "planHash": result["plan_hash"],
         "modelHash": result.get("modelId"),
+        "operationalReportHash": result.get("operationalReportHash"),
+        "operationalReady": result.get("operationalReady", False),
+        "eligibleForLiveCandidate": qualified
+        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+        else False,
         "strategyEngine": policy.strategy_engine,
         "strategyPlan": json_decimal(result["plan"]),
         "pendingCancellations": incompatible_managed,

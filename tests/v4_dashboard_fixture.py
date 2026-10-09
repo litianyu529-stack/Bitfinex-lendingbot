@@ -21,6 +21,7 @@ from test_bitfinex_bot import FakeControlledProcess  # noqa: E402
 from test_v4 import FundingClient, configuration, policy  # noqa: E402
 from RuntimeV4 import V4Coordinator  # noqa: E402
 from StrategyV3 import json_decimal  # noqa: E402
+from dataclasses import replace  # noqa: E402
 
 
 def main():
@@ -28,7 +29,14 @@ def main():
         path, settings = configuration(Path(directory))
         client = FundingClient()
         client.now = int(time.time() * 1000)
-        context = AppContext.for_project(directory, config_path=str(path), client_factory=lambda *_args: client)
+        if "--v41" in sys.argv:
+            from test_operational_v41 import PublicAccount
+
+            client = PublicAccount()
+            client.now = int(time.time() * 1000)
+        context = AppContext.for_project(
+            directory, config_path=str(path), client_factory=lambda *_args: client, now=lambda: client.now / 1000
+        )
         stores = stores_for_profiles(settings, clock=lambda: client.now / 1000)
         # Seed actual V4 runtime output using only the fixture account.
         BitfinexMarketDataHub.start = lambda _self: None
@@ -43,6 +51,25 @@ def main():
             clock=lambda: client.now / 1000,
         )
         statuses = coordinator.cycle()
+        if "--v41" in sys.argv:
+            from Configuration import strategy_v3_from_record
+            from OperationalV41 import accept
+            from ResearchV4 import ModelRepository
+            from StrategyV41 import fit_model, template
+
+            for currency, store in stores.items():
+                repo = ModelRepository(store.path, currency)
+                model = fit_model(
+                    currency,
+                    [],
+                    now_ms=client.now,
+                    frr=[dict(mts=client.now - d * 86400000, frr_daily_rate=".0008") for d in range(30)],
+                    allow_frr_reference=True,
+                )
+                repo.save(model)
+                accept(repo, model, client.now)
+                proposed = replace(template(strategy_v3_from_record(store.strategy("ACTIVE"))), model_id=model["id"])
+                store.save_strategy(json_decimal(proposed.__dict__), "DRAFT")
         for store in stores.values():
             store.pause_currency()
         client.now += 31_000

@@ -31,7 +31,9 @@ def display_type(offer):
     return "FRR_DELTA_FIXED" if raw == "FRRDELTAFIX" else raw
 
 
-def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage=None, frr=()):
+def fit_model(
+    currency, trades, observations=(), holdings=(), now_ms=0, coverage=None, frr=(), allow_frr_reference=False
+):
     observations = list(observations)
     model = base.fit_model(currency, trades, observations, holdings, now_ms, coverage)
     days = {}
@@ -41,6 +43,11 @@ def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage
     model.update(
         algorithm=VERSION, frrDays=list(days.values()), typeTables={}, typeHoldings={}, typeObservationCounts={}
     )
+    model["dataBasis"] = {"rollingRateSource": "PUBLIC_TRADES", "queueEvidence": "CURRENT_BOOK_ESTIMATE"}
+    if allow_frr_reference and len({r["mts"] // base.DAY for r in model["days"] if D(r["rate"]) > 0}) < 20:
+        model["days"] = [dict(mts=r["mts"], rate=r["rate"], source="FRR_HISTORY") for r in model["frrDays"]]
+        model["dataBasis"]["rollingRateSource"] = "FRR_HISTORY"
+        model["dataBasis"]["note"] = "FRR仅用于滚动收益情景，不是逐笔成交、排队或自身成交证据"
     for kind in TYPES:
         subset = [r for r in observations if r.get("displayType", "LIMIT") == kind]
         trained = base.fit_model(
@@ -50,7 +57,7 @@ def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage
         model["typeHoldings"][kind] = trained["holdings"]
         model["typeObservationCounts"][kind] = trained["ownObservationCount"]
     model["pathSeed"] = base.digest(
-        {"seed": model["pathSeed"], "frrDays": model["frrDays"], "types": model["typeTables"]}
+        {"seed": model["pathSeed"], "frrDays": model["frrDays"], "types": model["typeTables"], "days": model["days"]}
     )
     model.pop("id")
     model["id"] = base.digest(model)
@@ -58,7 +65,10 @@ def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage
 
 
 def validate_frr_paths(model):
-    if any(int(r["mts"]) > model["trainedUntilMs"] or D(str(r["rate"])) <= 0 for r in model.get("frrDays", [])):
+    if any(
+        int(r["mts"]) > model["trainedUntilMs"] or not D(str(r["rate"])).is_finite() or D(str(r["rate"])) <= 0
+        for r in model.get("frrDays", [])
+    ):
         raise ValueError("FRR历史包含未来或无效数据")
 
 

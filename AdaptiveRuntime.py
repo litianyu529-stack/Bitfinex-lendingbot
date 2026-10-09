@@ -20,12 +20,16 @@ def context(store, policy, book, trades, now_ms, stats=()):
         model = None
     valid = [r for r in stats if 0 <= now_ms - int(r["mts"]) <= policy.rest_stale_seconds * 1000]
     latest = max(valid, key=lambda r: int(r["mts"]), default=None)
+    from OperationalV41 import status as operational_status
+
     return {
         "model": model,
         "book": book,
         "trades": trades,
         "now_ms": now_ms,
         "frr": D(str(latest["frr_daily_rate"])) if latest else None,
+        "researchValidated": eligible(store, model),
+        **operational_status(repo, model, now_ms),
     }
 
 
@@ -53,7 +57,7 @@ def plan(account, policy, signals, version):
     if policy.strategy_engine == "adaptive_net_yield_v2":
         from StrategyV41 import build_plan as multi_plan
 
-        return multi_plan(
+        result = multi_plan(
             account,
             policy,
             ctx.get("model"),
@@ -63,6 +67,15 @@ def plan(account, policy, signals, version):
             version,
             ctx.get("frr"),
         )
+        result.update({k: ctx.get(k) for k in ("operationalReady", "operationalReportHash", "operationalBlockReasons")})
+        model = ctx.get("model") or {}
+        result["dataBasis"] = model.get("dataBasis", {})
+        result["eligibleForLiveCandidate"] = ctx.get("researchValidated", False)
+        result["typeConfidence"] = {
+            kind: "CALIBRATED" if count >= 20 else "LOW"
+            for kind, count in model.get("typeObservationCounts", {}).items()
+        }
+        return result
     return build_plan(
         account, policy, ctx.get("model"), ctx.get("book", []), ctx.get("trades", []), ctx.get("now_ms", 0), version
     )
@@ -82,8 +95,15 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
     if store.runtime()["mode"] != "LIVE" or resume_barrier:
         result["recoveryResumeBarrier"] = bool(resume_barrier)
         return result
-    if not eligible(store, ctx["model"]):
-        result["blockReasons"] = ["模型尚未通过收益研究验收；保持研究状态"]
+    runnable = (
+        ctx["operationalReady"] if policy.strategy_engine == "adaptive_net_yield_v2" else eligible(store, ctx["model"])
+    )
+    if not runnable:
+        result["blockReasons"] = (
+            ctx["operationalBlockReasons"]
+            if policy.strategy_engine == "adaptive_net_yield_v2"
+            else ["模型尚未通过收益研究验收；保持研究状态"]
+        )
         store.enter_protected_pause("ADAPTIVE_MODEL_NOT_QUALIFIED")
         return result
     if result.get("blockReasons"):
@@ -112,6 +132,8 @@ def cycle(runtime, snapshot, account, signals, now, resume_barrier):
                 "mode": "LIVE",
                 "modelId": policy.model_id,
                 "modelChecksum": ctx["model"]["id"],
+                "operationalReportHash": ctx.get("operationalReportHash"),
+                "dataBasis": ctx["model"].get("dataBasis", {}),
                 "strategyVersion": version,
                 "accountDigest": digest(account),
                 "account": account,

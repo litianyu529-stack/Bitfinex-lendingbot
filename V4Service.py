@@ -75,7 +75,11 @@ class V4DashboardService:
 
             return app.v3_store_for_config(self.config_path, currency)[0]
 
-        self.research = ResearchJobs(store_factory, context.now)
+        self.research = ResearchJobs(
+            store_factory,
+            context.now,
+            public_client_factory=(lambda: context.client_factory("", "")) if context.client_factory else None,
+        )
 
     def _client(self, settings):
         factory = self.context.client_factory or Bitfinex
@@ -97,6 +101,33 @@ class V4DashboardService:
         repo = ModelRepository(store.path, currency)
         models = {engine: repo.candidate(int(self.context.now() * 1000), engine) for engine in (ENGINE, MULTI_ENGINE)}
         candidate = models[ENGINE]
+        from OperationalV41 import status as operational_status
+
+        def model_info(model):
+            if model is None:
+                return None
+            from AdaptiveRuntime import eligible
+
+            return {
+                **{key: model[key] for key in ("id", "confidence", "coverage")},
+                "eligibleForLiveCandidate": eligible(store, model),
+                **operational_status(repo, model, int(self.context.now() * 1000)),
+                "dataBasis": model.get("dataBasis", {}),
+                "typeConfidence": {
+                    kind: "CALIBRATED" if count >= 20 else "LOW"
+                    for kind, count in model.get("typeObservationCounts", {}).items()
+                },
+            }
+
+        details = {model["id"]: model_info(model) for model in models.values() if model}
+        for record in (active, store.strategy("DRAFT"), store.strategy("PENDING")):
+            if record:
+                model_id = strategy_v3_from_record(record).model_id
+                if model_id and model_id not in details:
+                    try:
+                        details[model_id] = model_info(repo.load(model_id, int(self.context.now() * 1000)))
+                    except ValueError:
+                        details[model_id] = None
         return {
             "credentialsConfigured": self._client(settings).has_credentials(),
             "currency": currency,
@@ -116,15 +147,9 @@ class V4DashboardService:
                 ENGINE: strategy_v3_api_values(adaptive_template(policy)),
                 MULTI_ENGINE: strategy_v3_api_values(multi_template(policy)),
             },
-            "candidateModels": {
-                engine: None
-                if model is None
-                else {key: model[key] for key in ("id", "confidence", "coverage", "eligibleForLiveCandidate")}
-                for engine, model in models.items()
-            },
-            "candidateModel": None
-            if candidate is None
-            else {key: candidate[key] for key in ("id", "confidence", "coverage", "eligibleForLiveCandidate")},
+            "candidateModels": {engine: model_info(model) for engine, model in models.items()},
+            "modelDetails": details,
+            "candidateModel": model_info(candidate),
             "research": self.research.status(currency),
         }
 
@@ -260,6 +285,7 @@ class V4DashboardService:
                 "policyHash",
                 "planHash",
                 "modelHash",
+                "operationalReportHash",
                 "accountDigest",
                 "externalAdoptionDigest",
                 "pendingCancellations",

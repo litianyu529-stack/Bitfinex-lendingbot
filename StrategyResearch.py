@@ -102,7 +102,9 @@ def backfill_public_market_data(
         )
         parsed = parse_funding_trades(raw)
         fresh = [row for row in parsed if str(row["id"]) not in seen]
-        seen.update(str(row["id"]) for row in parsed)
+        # Monotonic timestamp pagination only overlaps the previous boundary.
+        # Do not retain millions of historical IDs in memory.
+        seen = {str(row["id"]) for row in parsed}
         store.upsert_market_trades(parsed)
         trade_pages += 1
         if len(raw or []) < limit:
@@ -142,10 +144,17 @@ def backfill_public_market_data(
             raise RuntimeError("funding stats pagination cursor did not move backwards")
         stats_cursor = next_cursor
 
-    trades = store.market_trades(start, now)
-    stats = store.funding_stats(start, now)
-    trade_coverage = _coverage(trades)
-    stats_coverage = _coverage(stats)
+    # Coverage metadata never materializes multi-million-row history lists.
+    with store.read_connection() as connection:
+
+        def summary(table):
+            row = connection.execute(
+                f"SELECT count(*),min(mts),max(mts) FROM {table} WHERE mts>=? AND mts<=?", (start, now)
+            ).fetchone()
+            return {"count": row[0], "earliestMs": row[1], "latestMs": row[2]}
+
+        trade_coverage = summary("market_trades")
+        stats_coverage = summary("funding_stats")
     tolerance = DAY_MS
     complete = bool(
         not gaps
