@@ -20,7 +20,6 @@ from RuntimeV4 import FundingWriteGate, V4Coordinator
 from StateStore import LendingStateStore, StateStoreError
 from StrategyV3 import StrategyPolicyV3, evenly_distributed_amounts, json_decimal, validate_policy_v3
 from V4Service import V4DashboardService, restart_control_digest, run_worker, stores_for_profiles, supervisor_tick
-from types import SimpleNamespace
 from bitfinex import Bitfinex, BitfinexApiError, currency_to_symbol, symbol_to_currency
 
 
@@ -588,6 +587,8 @@ def test_v4_http_currency_validation_csrf_and_usd_compatibility(tmp_path):
 
 
 def test_confirmed_cli_worker_runs_both_coins_once_and_preserves_pause(tmp_path, monkeypatch):
+    from Logger import Logger
+
     path, settings = configuration(tmp_path)
     client = FundingClient()
     context = AppContext.for_project(
@@ -595,14 +596,15 @@ def test_confirmed_cli_worker_runs_both_coins_once_and_preserves_pause(tmp_path,
     )
     monkeypatch.setattr(BitfinexMarketDataHub, "start", lambda _self: None)
     monkeypatch.setattr(LendingRuntimeV3, "start_income_history_sync", lambda _self: None)
-    published = {}
-    log = SimpleNamespace(updateMetaValue=lambda key, value: published.update({key: value}), persistStatus=lambda: None)
+    log = Logger(context.status_path, 20)
     args = lendingbot.parse_args(
         ["--config", str(path), "--live", "--confirmed-preflight", "--currencies", "USD,USDT", "--once", "--no-server"]
     )
     run_worker(args, settings, context, log)
+    published = json.loads(open(context.status_path, encoding="utf-8").read())
     assert {row[0] for row in client.submissions} == {"fUSD", "fUST"}
     assert set(published["currencies"]) == {"USD", "USDT"}
+    assert isinstance(published["releaseComparison"]["after"]["submitted"][0]["amount"], str)
     for store in stores_for_profiles(settings, context.now).values():
         assert store.runtime()["mode"] == "PAUSED"
 

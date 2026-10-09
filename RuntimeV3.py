@@ -2353,6 +2353,8 @@ class LendingRuntimeV3:
         self.store.touch_heartbeat(now)
         if not self._bootstrapped:
             self.bootstrap(start_websocket=True)
+            if now_ms is None:
+                now = int(self.clock() * 1000)
         recovery = self.store.recovery_status()
         rest_due = now - self._last_rest_sync_ms >= self.policy.rest_stale_seconds * 1000
         if recovery["active"]:
@@ -2380,6 +2382,8 @@ class LendingRuntimeV3:
                 self._log(f"v3 REST 同步失败：{exc}")
         else:
             snapshot = self.hub.snapshot(now)
+        if now_ms is None:
+            now = int(self.clock() * 1000)
         if snapshot["safeRequired"]:
             self.store.enter_protected_pause("MARKET_DATA_STALE")
         account = self._account(snapshot, self.currency)

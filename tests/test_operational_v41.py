@@ -236,6 +236,49 @@ def test_cold_start_runtime_uses_ready_model_and_stale_or_missing_report_prevent
     assert len(client.submissions) == count and store.runtime()["mode"] == "PAUSED"
 
 
+@pytest.mark.parametrize("currency", ["USD", "USDT"])
+@pytest.mark.parametrize("explicit_cutoff", [False, True])
+def test_first_live_cycle_uses_post_bootstrap_time_without_changing_explicit_cutoff(
+    tmp_path, currency, explicit_cutoff
+):
+    from MarketDataStream import BitfinexMarketDataHub
+
+    client = PublicAccount()
+    client.now = NOW
+    historical_stats = client.funding_stats
+    client.funding_stats = lambda symbol, **kwargs: [r for r in historical_stats(symbol, **kwargs) if r[0] < NOW]
+
+    def clock():
+        return client.now / 1000
+
+    store = LendingStateStore(tmp_path / (currency + ".sqlite3"), currency=currency, clock=clock)
+    repo = ModelRepository(store.path, currency)
+    m = model(currency)
+    repo.save(m)
+    readiness.accept(repo, m, NOW)
+    policy = replace(
+        multi.template(lendingbot.StrategyPolicyV3(currency=currency)), model_id=m["id"], max_lend_amount=D(1000)
+    )
+    store.save_strategy(json_decimal(policy.__dict__), "ACTIVE")
+    store.set_mode("LIVE")
+    hub = BitfinexMarketDataHub(symbol="fUSD" if currency == "USD" else "fUST", store=store, enable_auth=False)
+    runtime = LendingRuntimeV3(client, policy, store, hub=hub, clock=clock)
+    runtime.sync_history = lambda *_: None
+
+    def bootstrap(**_kwargs):
+        client.now += 1000
+        runtime.sync_rest()
+        runtime._bootstrapped = True
+
+    runtime.bootstrap = bootstrap
+    status = runtime.cycle(now_ms=NOW if explicit_cutoff else None)
+    assert store.runtime()["mode"] == ("PAUSED" if explicit_cutoff else "LIVE")
+    if explicit_cutoff:
+        assert status["strategyV3"]["blockReasons"]
+    else:
+        assert not status["strategyV3"].get("blockReasons")
+
+
 def test_prepare_cancel_resume_and_background_public_backfill(tmp_path, monkeypatch):
     client = PublicAccount()
     store = LendingStateStore(tmp_path / "usd.sqlite3", currency="USD")

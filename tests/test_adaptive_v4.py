@@ -21,6 +21,32 @@ from StrategyV3 import StrategyPolicyV3, validate_policy_v3
 NOW = 1_900_000_000_000
 
 
+def test_cached_holding_curve_matches_censored_survival_and_exact_boundaries():
+    rows = [
+        dict(period=term, hours=hours, event=event)
+        for term in (2, 14, 120)
+        for hours, event in ((0, True), (1, False), (2, True), (2, False), (4, True), (500, False))
+    ]
+
+    def reference(period, u):
+        selected = [r for r in rows if core.pool_for_period(r["period"]) == core.pool_for_period(period)]
+        survival = 1.0
+        for hours in sorted({r["hours"] for r in selected if r["event"]}):
+            risk = sum(r["hours"] >= hours for r in selected)
+            events = sum(r["event"] and r["hours"] == hours for r in selected)
+            survival *= 1 - events / risk
+            if u > survival:
+                return min(period * 24.0, max(1 / 3600, hours))
+        return period * 24.0
+
+    core._holding_curve.cache_clear()
+    for period in (2, 7, 14, 30, 31, 120):
+        for u in (0, 0.1, 0.3, 0.5, 0.7, 5 / 6, 0.9, 1):
+            assert core.holding_hours({"holdings": rows}, period, u) == reference(period, u)
+    assert core._holding_curve.cache_info().hits > 0
+    assert core.holding_hours({"holdings": [dict(period=2, hours=1, event=False)]}, 2, 0.9) == 48
+
+
 def market(rate=".0008", period=2, amount="100000"):
     return [{"mts": NOW - 1000, "id": "1", "rate": D(rate), "period": period, "amount": D(amount)}]
 

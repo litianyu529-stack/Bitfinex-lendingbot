@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import random
+from bisect import bisect_right
+from collections import Counter
 from dataclasses import replace
 from decimal import Decimal
 from functools import lru_cache
@@ -244,19 +246,35 @@ def hazards(model, period, key, prior):
     return result
 
 
+@lru_cache(maxsize=64)
+def _holding_curve(rows):
+    counts = Counter(hours for hours, _event in rows)
+    events = Counter(hours for hours, event in rows if event)
+    risk, survival = len(rows), 1.0
+    times, negatives = [], []
+    for hours in sorted(counts):
+        if events[hours]:
+            survival *= 1 - events[hours] / risk
+            times.append(hours)
+            negatives.append(-survival)
+        risk -= counts[hours]
+    return tuple(times), tuple(negatives)
+
+
 def holding_hours(model, period, u, stress=False):
-    rows = [r for r in model.get("holdings", []) if pool_for_period(r["period"]) == pool_for_period(period)]
     if stress:
         return min(1.0, period * 24.0)
+    rows = tuple(
+        (r["hours"], r["event"])
+        for r in model.get("holdings", [])
+        if pool_for_period(r["period"]) == pool_for_period(period)
+    )
     if not rows:
         return period * 24.0
-    survival = 1.0
-    for hours in sorted({r["hours"] for r in rows if r["event"]}):
-        at_risk = sum(r["hours"] >= hours for r in rows)
-        events = sum(r["event"] and r["hours"] == hours for r in rows)
-        survival *= 1 - events / at_risk
-        if u > survival:
-            return min(period * 24.0, max(1 / 3600, hours))
+    times, negatives = _holding_curve(rows)
+    index = bisect_right(negatives, -u)
+    if index < len(times):
+        return min(period * 24.0, max(1 / 3600, times[index]))
     return period * 24.0
 
 

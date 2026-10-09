@@ -517,7 +517,7 @@ def run_worker(args, settings, context, log):
                 status["runtime"] = stores[currency].runtime()
                 status["recovery"] = stores[currency].recovery_status()
                 status["operationMode"] = status["runtime"]["mode"]
-            for key, value in statuses.get("USD", {}).items():
+            for key, value in json_decimal(statuses.get("USD", {})).items():
                 log.updateMetaValue(key, value)
             log.updateMetaValue("v4SchemaVersion", 4)
             log.updateMetaValue("currencies", json_decimal(statuses))
