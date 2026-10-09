@@ -415,6 +415,66 @@ def test_manual_pause_during_unknown_write_preserves_evidence_and_revokes_resume
     assert store.recovery_status()["targetMode"] == "PAUSED"
 
 
+@pytest.mark.parametrize("currency", ["USD", "USDT"])
+@pytest.mark.parametrize("reason", [
+    "ADAPTIVE_DATA_UNAVAILABLE", "ADAPTIVE_MODEL_NOT_QUALIFIED", "ADAPTIVE_JOURNAL_FAILED"
+])
+def test_fresh_preflight_can_resume_inactive_adaptive_pause(tmp_path, currency, reason):
+    store = LendingStateStore(tmp_path / (currency + ".sqlite3"), currency=currency)
+    store.set_mode("LIVE")
+    store.enter_protected_pause(reason)
+    store.pause_currency()
+    store.authorize_live_after_preflight()
+    assert store.runtime()["mode"] == "PAUSED"
+    assert store.runtime()["safe_reason"] == reason
+    store.authorize_live_after_preflight(revalidated_adaptive=True)
+    assert store.runtime()["mode"] == "LIVE"
+    assert store.runtime()["safe_reason"] is None
+
+
+@pytest.mark.parametrize("kind", ["manual", "active_recovery", "other_reason"])
+def test_adaptive_revalidation_preserves_other_safety_barriers(tmp_path, kind):
+    store = LendingStateStore(tmp_path / "usd.sqlite3")
+    store.set_mode("LIVE")
+    reason = "OTHER_SAFETY_BARRIER" if kind == "other_reason" else "ADAPTIVE_DATA_UNAVAILABLE"
+    store.enter_protected_pause(reason, manual=kind == "manual")
+    if kind == "manual":
+        with pytest.raises(StateStoreError, match="manual"):
+            store.authorize_live_after_preflight(revalidated_adaptive=True)
+    else:
+        if kind == "active_recovery":
+            store.begin_recovery("WORKER_EXIT", "interrupted", origin_mode="LIVE", target_mode="LIVE")
+        store.authorize_live_after_preflight(revalidated_adaptive=True)
+    assert store.runtime()["mode"] == "PAUSED"
+    assert store.runtime()["safe_reason"] == reason
+
+
+@pytest.mark.parametrize("currency", ["USD", "USDT"])
+def test_currency_start_clears_only_revalidated_adaptive_pause(tmp_path, monkeypatch, currency):
+    path, settings = configuration(tmp_path)
+    client = FundingClient()
+    context = AppContext.for_project(
+        tmp_path, config_path=str(path), client_factory=lambda *_args: client, now=lambda: client.now / 1000
+    )
+    service = V4DashboardService(str(path), context.status_path, context)
+    stores = stores_for_profiles(settings, context.now)
+    for coin, store in stores.items():
+        store.save_strategy(json_decimal(policy(coin).__dict__), "ACTIVE")
+        store.set_mode("LIVE")
+        store.enter_protected_pause("ADAPTIVE_DATA_UNAVAILABLE")
+        store.pause_currency()
+    preflight = service.preflight([currency])
+    assert preflight["canStart"]
+    monkeypatch.setattr(lendingbot, "controlled_bot_running", lambda *_: True)
+    monkeypatch.setattr(lendingbot.LiveProcessLock, "inspect", lambda *_: {"metadata": {"v4": True}})
+    monkeypatch.setattr(lendingbot, "controlled_bot_status", lambda *_: {"running": True})
+    service.start(preflight["preflightId"], [currency])
+    assert stores[currency].runtime()["mode"] == "LIVE"
+    other = "USDT" if currency == "USD" else "USD"
+    assert stores[other].runtime()["mode"] == "PAUSED"
+    assert client.submissions == []
+
+
 def test_usdt_history_sync_and_statistics_do_not_use_usd(tmp_path):
     client = FundingClient()
     store = LendingStateStore(tmp_path / "usdt.sqlite3", currency="USDT", clock=lambda: client.now / 1000)

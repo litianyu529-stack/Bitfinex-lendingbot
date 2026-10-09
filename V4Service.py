@@ -332,7 +332,7 @@ class V4DashboardService:
                 store = stores[currency]
                 if store.runtime().get("safe_manual"):
                     raise ConfigError("存在需要人工处理的未决写入")
-                store.authorize_live_after_preflight()
+                store.authorize_live_after_preflight(revalidated_adaptive=True)
         if not running:
             os.makedirs(os.path.dirname(self.context.process_log_path), exist_ok=True)
             app.cleanup_controlled_bot_handle(self.context)

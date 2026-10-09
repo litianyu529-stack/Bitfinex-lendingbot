@@ -906,12 +906,20 @@ class LendingStateStore:
             )
         return self.runtime()
 
-    def authorize_live_after_preflight(self):
+    def authorize_live_after_preflight(self, revalidated_adaptive=False):
         """Keep uncertainty while setting an explicitly confirmed resume destination."""
         row = self.runtime()
         if row["safe_manual"]:
             raise StateStoreError("manual unresolved writes require resolution before LIVE")
-        if row["safe_reason"] or self.recovery_status()["active"]:
+        recovery = self.recovery_status()
+        adaptive_revalidated = (
+            revalidated_adaptive
+            and not recovery["active"]
+            and row["safe_reason"] in {
+                "ADAPTIVE_DATA_UNAVAILABLE", "ADAPTIVE_MODEL_NOT_QUALIFIED", "ADAPTIVE_JOURNAL_FAILED"
+            }
+        )
+        if (row["safe_reason"] or recovery["active"]) and not adaptive_revalidated:
             with self.transaction(immediate=True) as connection:
                 connection.execute("UPDATE runtime_state SET previous_mode='LIVE' WHERE singleton=1")
                 connection.execute("UPDATE recovery_state SET origin_mode='LIVE', target_mode='LIVE' WHERE singleton=1")
