@@ -21,6 +21,50 @@ from StrategyV3 import StrategyPolicyV3, validate_policy_v3
 NOW = 1_900_000_000_000
 
 
+def test_market_distributions_match_scans_and_exclude_future_and_incompatible_trades():
+    trades = [
+        dict(mts=NOW - age, period=period, rate=D(rate), amount=D(amount))
+        for age in (0, 3600000, core.DAY, 7 * core.DAY, 7 * core.DAY + 1, -1)
+        for period in (2, 7, 30, 31, 120)
+        for rate, amount in ((".0002", "0"), (".0004", "-1.23456789"), (".0004", "2"), (".0008", "9"))
+    ]
+    market = core.CandidateMarket(trades, NOW)
+    for period in (2, 7, 30, 31, 120):
+        for interval in (3600000, core.DAY, 7 * core.DAY):
+            selected = [r for r in trades if r["period"] <= period and NOW - interval <= r["mts"] <= NOW]
+            for q in (0, 0.25, 0.5, 0.75, 0.9, 1):
+                assert market.reference(period, interval, q) == core.weighted_rate(selected, q)
+        for rate in (D(0), D(".0002"), D(".0004"), D(".0006"), D(".0008"), D(1)):
+            volume = sum(
+                abs(r["amount"]) for r in trades
+                if r["period"] <= period and NOW - core.DAY <= r["mts"] <= NOW and r["rate"] >= rate
+            )
+            assert market.flow(period, rate) == float(volume) / 1440
+    cached = market.distribution(7, core.DAY)
+    assert market.distribution(7, core.DAY) is cached
+    assert core.CandidateMarket([], NOW).reference(2, core.DAY) == 0
+    assert core.CandidateMarket([], NOW).flow(2, D(0)) == 0
+    assert core.CandidateMarket(trades, NOW + 8 * core.DAY).reference(2, core.DAY) == 0
+
+
+def test_candidate_paths_select_holding_distribution_once(monkeypatch):
+    rows = [dict(period=2, opened_ms=NOW - core.DAY, closed_ms=None)]
+    p, model, trades, book, _ = setup(holdings=rows)
+    original = core._holding_curve
+    calls = []
+
+    def observed(rows):
+        calls.append(rows)
+        return original(rows)
+
+    monkeypatch.setattr(core, "_holding_curve", observed)
+    value = core.value_candidate(p, model, 2, D(".0008"), D(150), trades, book, NOW)
+    assert len(calls) == 1
+    assert set(value["pathHoldingHours"]) == {48.0}
+    stress = core.value_candidate(p, model, 2, D(".0008"), D(150), trades, book, NOW, stress=True)
+    assert set(stress["pathHoldingHours"]) == {1.0}
+
+
 def test_cached_holding_curve_matches_censored_survival_and_exact_boundaries():
     rows = [
         dict(period=term, hours=hours, event=event)

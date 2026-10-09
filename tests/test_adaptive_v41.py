@@ -19,6 +19,42 @@ from test_v4 import FundingClient
 NOW = 1_900_000_000_000
 
 
+@pytest.mark.parametrize("currency", ["USD", "USDT"])
+def test_indexed_market_preserves_four_type_plans_and_adjustments(currency, monkeypatch):
+    p, model, trades, book, account = setup(currency)
+    trades = [
+        {**trades[0], "id": i, "period": term, "rate": D(rate), "mts": NOW - age}
+        for i, (term, rate, age) in enumerate(
+            (term, rate, age)
+            for term in (2, 7, 14, 30, 31, 120)
+            for rate in (".0006", ".0008", ".0009")
+            for age in (1000, 3600000, base.DAY, 7 * base.DAY, -1)
+        )
+    ]
+    offer = dict(managed=True, amount=D(200), period=2, rate=D(".0008"), offer_type="LIMIT", mts_created=NOW-600000)
+    optimized = multi.build_plan(account, p, model, book, trades, NOW, "v4", D(".0006"))
+    decision = multi.adjustment(p, model, offer, optimized["candidates"], trades, book, NOW, D(".0006"))
+
+    class ScanMarket:
+        def __init__(self, rows, now):
+            self.rows, self.now = rows, now
+
+        def reference(self, period, interval, q=0.5):
+            selected = [r for r in self.rows if r["period"] <= period and self.now-interval <= r["mts"] <= self.now]
+            return base.weighted_rate(selected, q)
+
+        def flow(self, period, rate):
+            return float(sum(
+                abs(r["amount"]) for r in self.rows
+                if r["period"] <= period and self.now-base.DAY <= r["mts"] <= self.now and r["rate"] >= rate
+            )) / 1440
+
+    monkeypatch.setattr(base, "CandidateMarket", ScanMarket)
+    original = multi.build_plan(account, p, model, book, trades, NOW, "v4", D(".0006"))
+    assert optimized == original
+    assert decision == multi.adjustment(p, model, offer, original["candidates"], trades, book, NOW, D(".0006"))
+
+
 def setup(currency="USD", rate=".0008", frr=".0006"):
     trades = [dict(id=1, mts=NOW - 1000, period=2, rate=D(rate), amount=D(100000))]
     history = [dict(mts=NOW - day * base.DAY, frr_daily_rate=frr) for day in range(30)]

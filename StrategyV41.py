@@ -115,7 +115,8 @@ def frr_paths(seed_id, currency, rates, current_frr):
 
 
 def value_candidate(
-    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False, quote=None
+    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False,
+    quote=None, market=None,
 ):
     quote = quote or dict(rate=rate, offer_type="LIMIT", display_type="LIMIT", submitted_rate=rate)
     kind = quote["display_type"]
@@ -125,7 +126,7 @@ def value_candidate(
         "holdings": model.get("typeHoldings", {}).get(kind, []),
     }
     value = base.value_candidate(
-        policy, local, period, rate, amount, trades, book, now_ms, age_minutes, cancel_minutes, stress
+        policy, local, period, rate, amount, trades, book, now_ms, age_minutes, cancel_minutes, stress, market=market
     )
     value["confidence"] = "CALIBRATED" if model.get("typeObservationCounts", {}).get(kind, 0) >= 20 else "LOW"
     value.update({key: quote[key] for key in ("rate", "submitted_rate", "offer_type", "display_type")})
@@ -188,7 +189,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
     )
 
 
-def adjustment(policy, model, offer, candidates, trades, book, now_ms, current_frr=None):
+def adjustment(policy, model, offer, candidates, trades, book, now_ms, current_frr=None, market=None):
     kind, amount = display_type(offer), D(str(offer["amount"]))
     if not offer.get("managed"):
         return dict(action="KEEP", reason="EXTERNAL_OFFER")
@@ -211,11 +212,15 @@ def adjustment(policy, model, offer, candidates, trades, book, now_ms, current_f
     quote = dict(
         rate=effective, submitted_rate=raw_rate, offer_type=offer.get("offer_type", "LIMIT"), display_type=kind
     )
+    market = market or base.CandidateMarket(trades, now_ms)
     current = value_candidate(
-        policy, model, period, effective, amount, trades, book, now_ms, age_minutes=age, quote=quote
+        policy, model, period, effective, amount, trades, book, now_ms, age_minutes=age, quote=quote, market=market
     )
     choices = [
-        value_candidate(policy, model, r["period"], r["rate"], amount, trades, book, now_ms, cancel_minutes=1, quote=r)
+        value_candidate(
+            policy, model, r["period"], r["rate"], amount, trades, book, now_ms,
+            cancel_minutes=1, quote=r, market=market,
+        )
         for r in candidates
     ]
     choices = [r for r in choices if r["expectedFillProbability"] > 0]

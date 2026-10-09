@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import random
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import replace
 from decimal import Decimal
@@ -122,6 +122,49 @@ def weighted_rate(rows, q=0.5):
         if cumulative >= volume * D(str(q)):
             return D(str(row["rate"]))
     return D(0)
+
+
+class CandidateMarket:
+    """Decision-local price distributions; no reuse across times or currencies."""
+
+    def __init__(self, trades, now_ms):
+        self.now_ms = now_ms
+        self.rows = [
+            (int(r["mts"]), int(r["period"]), D(str(r["rate"])), abs(D(str(r["amount"]))))
+            for r in trades
+            if now_ms - 7 * DAY <= int(r["mts"]) <= now_ms
+        ]
+        self._distributions = {}
+
+    def distribution(self, period, interval):
+        key = (period, interval)
+        if key not in self._distributions:
+            rows = sorted(
+                ((rate, amount) for mts, term, rate, amount in self.rows
+                 if term <= period and mts >= self.now_ms - interval),
+                key=lambda row: row[0],
+            )
+            rates, cumulative, total = [], [], D(0)
+            for rate, amount in rows:
+                rates.append(rate)
+                total += amount
+                cumulative.append(total)
+            self._distributions[key] = (rates, cumulative)
+        return self._distributions[key]
+
+    def reference(self, period, interval, q=0.5):
+        rates, cumulative = self.distribution(period, interval)
+        if not rates:
+            return D(0)
+        index = bisect_left(cumulative, cumulative[-1] * D(str(q)))
+        return rates[min(index, len(rates) - 1)]
+
+    def flow(self, period, rate):
+        rates, cumulative = self.distribution(period, DAY)
+        if not rates:
+            return 0.0
+        index = bisect_left(rates, rate)
+        return float(cumulative[-1] - (cumulative[index - 1] if index else D(0))) / 1440
 
 
 def condition(period, quote, reference, queue_ratio, trend):
@@ -296,19 +339,19 @@ def rolling_paths(model_id, currency, days, net_fee, base_floor):
 
 
 def value_candidate(
-    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False, quote=None
+    policy, model, period, rate, amount, trades, book, now_ms, age_minutes=0, cancel_minutes=0, stress=False,
+    quote=None, market=None,
 ):
-    compatible = [r for r in trades if int(r["period"]) <= period and now_ms - DAY <= int(r["mts"]) <= now_ms]
-    reference = weighted_rate(compatible)
-    flow = float(sum(abs(D(str(r["amount"]))) for r in compatible if D(str(r["rate"])) >= rate)) / 1440
+    market = market or CandidateMarket(trades, now_ms)
+    reference = market.reference(period, DAY)
+    flow = market.flow(period, rate)
     queue = float(
         sum(abs(D(str(r["amount"]))) for r in book if D(str(r["amount"])) > 0 and 0 < D(str(r["rate"])) <= rate)
     )
     # An existing order has already waited; this is an estimate, not a FIFO claim.
     queue = max(0.0, queue - age_minutes * flow)
     ratio = queue / max(float(amount), flow * 60, 1.0)
-    recent = [r for r in compatible if int(r["mts"]) >= now_ms - 3600000]
-    near = weighted_rate(recent) or reference
+    near = market.reference(period, 3600000) or reference
     trend = "up" if near > reference * D("1.05") else "down" if near < reference * D(".95") else "flat"
     key = condition(period, rate, reference, ratio, trend)
     base_wait = (queue + float(amount)) / max(flow, 0.000001)
@@ -325,6 +368,14 @@ def value_candidate(
     path_seed = model.get("pathSeed", model["id"])
     seed = int(digest({"currency": policy.currency, "model": path_seed})[:12], 16)
     curves = rolling_paths(path_seed, policy.currency, days, net_fee, float(gross_floor(policy, 2)))
+    # Select the censored holding distribution once per candidate, not once for
+    # every simulated path. It remains local to the selected order type/model.
+    holding_rows = tuple(
+        (r["hours"], r["event"])
+        for r in model.get("holdings", [])
+        if pool_for_period(r["period"]) == pool_for_period(period)
+    )
+    holding_times, holding_survival = _holding_curve(holding_rows)
     for path in range(PATHS):
         rng = random.Random(seed + path)
         survival, wait = 1.0, None
@@ -337,7 +388,14 @@ def value_candidate(
         elapsed, earned = 0.0, 0.0
         hold = None
         if wait is not None:
-            hold = holding_hours(model, period, rng.random(), stress)
+            index = bisect_right(holding_survival, -rng.random())
+            hold = (
+                min(period * 24.0, max(1 / 3600, holding_times[index]))
+                if index < len(holding_times)
+                else period * 24.0
+            )
+            if stress:
+                hold = 1.0
             elapsed = wait / 1440
             duration = min(hold / 24, max(0.0, HORIZON - elapsed))
             earned += float(amount) * float(rate) * duration * net_fee
@@ -379,7 +437,8 @@ def value_candidate(
 
 
 def build_plan(
-    account, policy, model, book, trades, now_ms, strategy_version, *, valuator=value_candidate, quotes=None
+    account, policy, model, book, trades, now_ms, strategy_version, *, valuator=value_candidate, quotes=None,
+    market=None,
 ):
     validate_adaptive(policy)
     total, available = D(account["total"]), D(account["wallet"])
@@ -436,6 +495,7 @@ def build_plan(
         result["plan_hash"] = digest({"currency": policy.currency, "policy": policy.__dict__, "reason": str(exc)})
         return result
     live_trades = [r for r in trades if now_ms - 7 * DAY <= int(r["mts"]) <= now_ms]
+    market = market or CandidateMarket(live_trades, now_ms)
     terms = sorted(
         {*TERMS, *(int(r["period"]) for r in live_trades), *(int(r["period"]) for r in book)}
         & set(range(2, policy.maximum_period + 1))
@@ -443,8 +503,7 @@ def build_plan(
     minimum = funding_minimum()
     candidates = []
     for term in terms:
-        compatible = [r for r in live_trades if int(r["period"]) <= term]
-        rates = {weighted_rate(compatible, q) for q in (0.25, 0.5, 0.75, 0.9)}
+        rates = {market.reference(term, 7 * DAY, q) for q in (0.25, 0.5, 0.75, 0.9)}
         bids = [D(str(r["rate"])) for r in book if D(str(r["amount"])) < 0 and int(r["period"]) <= term]
         asks = [D(str(r["rate"])) for r in book if D(str(r["amount"])) > 0 and int(r["period"]) >= term]
         rates.update((max(bids, default=D(0)), min(asks, default=D(0))))
@@ -461,7 +520,9 @@ def build_plan(
                 else [{"rate": rate, "offer_type": "LIMIT", "display_type": "LIMIT", "submitted_rate": rate}]
             )
             for quote in descriptors:
-                value = valuator(policy, model, term, quote["rate"], minimum, live_trades, book, now_ms, quote=quote)
+                value = valuator(
+                    policy, model, term, quote["rate"], minimum, live_trades, book, now_ms, quote=quote, market=market
+                )
                 value.update(quote)
                 if value["expectedFillProbability"] >= 0.01:
                     candidates.append(value)
@@ -548,6 +609,7 @@ def build_plan(
                     book,
                     now_ms,
                     quote=candidate,
+                    market=market,
                 )
             )
         candidates.sort(key=lambda r: (-r["conservativeNetApr"], r["period"], r["rate"]))
@@ -593,7 +655,7 @@ def build_plan(
     return result
 
 
-def adjustment(policy, model, offer, candidates, trades, book, now_ms):
+def adjustment(policy, model, offer, candidates, trades, book, now_ms, market=None):
     amount, rate = D(str(offer["amount"])), D(str(offer.get("rate_real") or offer["rate"]))
     period = int(offer["period"])
     if not offer.get("managed"):
@@ -613,9 +675,12 @@ def adjustment(policy, model, offer, candidates, trades, book, now_ms):
         }
     if not hard and age < max(5, policy.minimum_offer_minutes):
         return {"action": "KEEP", "reason": "MINIMUM_AGE"}
-    current = value_candidate(policy, model, period, rate, amount, trades, book, now_ms, age_minutes=age)
+    market = market or CandidateMarket(trades, now_ms)
+    current = value_candidate(policy, model, period, rate, amount, trades, book, now_ms, age_minutes=age, market=market)
     choices = [
-        value_candidate(policy, model, c["period"], c["rate"], amount, trades, book, now_ms, cancel_minutes=1)
+        value_candidate(
+            policy, model, c["period"], c["rate"], amount, trades, book, now_ms, cancel_minutes=1, market=market
+        )
         for c in candidates
     ]
     if not choices:
