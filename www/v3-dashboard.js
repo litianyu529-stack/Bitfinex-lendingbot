@@ -15,9 +15,9 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     const groups = [
         {
             title: "策略引擎与长期保护",
-            description: "自适应 V1 按120天资金时间净收益动态分配；研究合格后才允许人工实盘启动。",
+            description: "V4.0 策略按120天资金时间净收益动态分配；研究合格后才允许人工实盘启动。",
             fields: [
-                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "现有策略"], ["adaptive_net_yield_v1", "自适应净收益 V1"]] }],
+                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"]] }],
                 ["model_id", "冻结模型 ID", "text", "", { placeholder: "研究评估后选择模型" }],
                 ["long_from_days", "长期起始天数", "number", "天", { min: 8, max: 120 }],
                 ["long_max_share", "长期贷款与挂单上限", "number", "%", { min: 1, max: 100 }],
@@ -181,7 +181,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
                     <section><h2>${currency} 策略研究</h2><p id="v4ResearchState">尚未研究</p>
-                        <button id="v4Template" class="button secondary" type="button">载入自适应草稿模板</button>
+                        <button id="v4Template" class="button secondary" type="button">载入 V4.0 策略草稿模板</button>
                         <button id="v4Evaluate" class="button secondary" type="button">评估 ${currency}</button>
                         <button id="v4Shadow" class="button secondary" type="button">影子观察 ${currency}</button>
                         <button id="v4ResearchStop" class="button secondary" type="button">取消研究 / 停止观察</button>
