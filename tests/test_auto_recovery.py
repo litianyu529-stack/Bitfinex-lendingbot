@@ -50,6 +50,7 @@ def test_runtime_error_classification(error, category, retryable):
     ("reason", "category"),
     [
         ("MARKET_DATA_STALE", "MARKET_DATA"),
+        ("ADAPTIVE_FRR_STALE", "ADAPTIVE_FRR_STALE"),
         ("ACCOUNT_AVAILABLE_BALANCE_UNKNOWN", "ACCOUNT_DATA"),
         ("ACCOUNT_RECONCILIATION_MISMATCH", "ACCOUNT_DATA"),
         ("AMBIGUOUS_WALLET_TRANSFER", "AMBIGUOUS_WRITE"),

@@ -5,7 +5,7 @@ import json
 import socket
 import threading
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from urllib import error, parse, request
 
 from DomainTypes import WriteOutcome, WriteResult
@@ -53,7 +53,38 @@ def _write_rejection_category(message):
     value = str(message).lower()
     if "balance" in value and any(token in value for token in ("not enough", "insufficient", "available")):
         return "BALANCE_DRIFT"
+    if any(token in value for token in ("invalid", "not valid", "unsupported", "minimum", "precision")):
+        return "WRITE_PARAMETER_INVALID"
     return "WRITE_REJECTED"
+
+
+def validate_funding_payload(amount, rate, period, offer_type="LIMIT", flags=0, hidden=False):
+    """Validate the actual exchange contract, including signed fixed FRR deltas."""
+    kind = str(offer_type or "LIMIT").upper()
+    if kind not in FUNDING_OFFER_TYPES:
+        raise BitfinexApiError(f"Unsupported funding offer type: {offer_type}", category="PARAMETER_INVALID")
+    try:
+        quantity, value = Decimal(str(amount)), Decimal(str(rate))
+        term, flag_value = Decimal(str(period)), Decimal(str(flags or 0))
+        if not all(item.is_finite() for item in (quantity, value, term, flag_value)):
+            raise ValueError("Funding offer numbers must be finite")
+        if quantity <= 0:
+            raise ValueError("Funding offer amount must be positive")
+        if kind == "LIMIT" and value <= 0:
+            raise ValueError("LIMIT funding rate must be positive")
+        if kind == "FRRDELTAVAR" and value < 0:
+            raise ValueError("FRRDELTAVAR rate offset cannot be negative")
+        if term != term.to_integral_value() or not 2 <= term <= 120:
+            raise ValueError("Funding offer period must be 2-120 whole days")
+        if flag_value != flag_value.to_integral_value() or flag_value < 0:
+            raise ValueError("Unsupported funding offer flags")
+        numeric_flags = int(flag_value) | (HIDDEN_OFFER_FLAG if hidden else 0)
+        if numeric_flags & ~HIDDEN_OFFER_FLAG:
+            raise ValueError("Unsupported funding offer flags")
+    except (InvalidOperation, ValueError, TypeError, OverflowError) as exc:
+        raise BitfinexApiError(str(exc), category="PARAMETER_INVALID") from exc
+    # Plain FRR uses a zero variable offset. Fixed deltas are allowed to be signed.
+    return ("FRRDELTAVAR" if kind == "FRR" else kind), ("0" if kind == "FRR" else str(rate)), int(term), numeric_flags
 
 
 class Bitfinex:
@@ -294,23 +325,9 @@ class Bitfinex:
         flags=0,
         hidden=False,
     ):
-        normalized_type = str(offer_type or "LIMIT").upper()
-        if normalized_type not in FUNDING_OFFER_TYPES:
-            raise BitfinexApiError(f"Unsupported funding offer type: {offer_type}")
-        if normalized_type == "FRR":
-            normalized_type = "FRRDELTAVAR"
-            rate = "0"
-        numeric_rate = Decimal(str(rate))
-        if normalized_type in {"FRRDELTAFIX", "FRRDELTAVAR"} and numeric_rate < 0:
-            raise BitfinexApiError(f"{normalized_type} rate offset cannot be negative")
-        numeric_period = int(period)
-        if numeric_period < 2 or numeric_period > 120:
-            raise BitfinexApiError("Funding offer period must be 2-120 days")
-        numeric_flags = int(flags or 0)
-        if hidden:
-            numeric_flags |= HIDDEN_OFFER_FLAG
-        if numeric_flags & ~HIDDEN_OFFER_FLAG:
-            raise BitfinexApiError("Unsupported funding offer flags")
+        normalized_type, rate, numeric_period, numeric_flags = validate_funding_payload(
+            amount, rate, period, offer_type, flags, hidden
+        )
         return self._auth_write(
             "v2/auth/w/funding/offer/submit",
             {
@@ -328,9 +345,11 @@ class Bitfinex:
             response = self.submit_funding_offer(*args, **kwargs)
             return WriteResult(WriteOutcome.CONFIRMED, response=response)
         except BitfinexAmbiguousWriteError as exc:
-            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc))
+            return WriteResult(WriteOutcome.UNKNOWN, error=str(exc), category=exc.category)
         except BitfinexApiError as exc:
-            return WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc))
+            return WriteResult(
+                WriteOutcome.DEFINITE_REJECT, error=str(exc), category=exc.category, retryable=exc.retryable
+            )
 
     def cancel_all_funding_offers(self, currency):
         return self._auth_write(

@@ -170,6 +170,8 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             if self._handle_v4_get(app, path):
                 return
             if path == "/api/health":
+                from Lifecycle import status as lifecycle_status
+
                 self._send_json(
                     {
                         "ok": True,
@@ -180,6 +182,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                         "projectRoot": app.project_root,
                         "configPath": os.path.abspath(self.config_path),
                         "time": app.timestamp(),
+                        "lifecycle": lifecycle_status(self.app_context) if self.app_context is not None else None,
                     }
                 )
                 return

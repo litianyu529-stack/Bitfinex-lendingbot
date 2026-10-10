@@ -42,7 +42,9 @@ const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')
 const state = {
     config: null,
     status: null,
-    control: { running: false, pid: null, startedAt: null, returnCode: null, stopReason: null },
+    control: null,
+    connectionAvailable: false,
+    controlAvailable: false,
     preflight: null,
     activeDialog: null,
     previousFocus: null,
@@ -116,13 +118,36 @@ function statusMode(status = state.status || {}) {
 }
 
 function statusAge(status = state.status || {}) {
+    if (state.control?.dataAgeSeconds != null) return Math.max(0, Number(state.control.dataAgeSeconds)) * 1000;
     if (!status.last_update) return Infinity;
     const parsed = Date.parse(String(status.last_update).replace(" ", "T"));
     return Number.isFinite(parsed) ? Math.max(0, Date.now() - parsed) : Infinity;
 }
 
 function statusIsStale(status = state.status || {}) {
-    return statusAge(status) > 180000;
+    return state.control?.sourceFresh === false || statusAge(status) > 180000;
+}
+
+function renderStrategyDecisions() {
+    const status = state.status || {}, plan = status.strategy || status.strategyV3 || {};
+    const profile = window.mikaV4.strategyEngineProfile(plan.engine || status.activeStrategy?.engine || "legacy_v3");
+    const snapshotNote = statusIsStale(status) || !state.connectionAvailable ? " · 历史决策，等待新同步" : "";
+    $("strategyDecisionSummary").textContent = profile.adaptive
+        ? `${profile.name}${snapshotNote} · ${plan.operationalReady ? "运行验收通过" : "运行验收尚未确认"} · ${plan.eligibleForLiveCandidate ? "收益研究通过" : "收益优势尚未验证"}`
+        : `${profile.name}${snapshotNote} · 按固定规则执行`;
+    $("strategyVersionPerformance").textContent = window.mikaV4.describeVersionPerformance(status.versionPerformance, currency);
+    const box = $("strategyDecisions"); box.replaceChildren();
+    const rows = Array.isArray(plan.decisions) ? plan.decisions : [];
+    for (const row of rows) {
+        const line = document.createElement("p"); line.className = "adaptive-decision";
+        line.textContent = window.mikaV4.describeAdaptiveDecision(row, currency); box.append(line);
+    }
+    if (!rows.length) {
+        const line = document.createElement("p");
+        const reason = plan.emptyReason || plan.empty_reason;
+        line.textContent = reason ? window.mikaV4.adaptiveReasonLabel(reason) : "尚无当前决策记录；暂停或未同步时不会新增或调整挂单。";
+        box.append(line);
+    }
 }
 
 function normalizedOffer(offer) {
@@ -570,7 +595,7 @@ function renderCredits(valid, stale, total) {
 function renderStatus() {
     const status = state.status || {};
     const valid = status.schemaVersion === 3 && !status.legacyIgnored && Boolean(status.last_update);
-    const stale = valid && statusIsStale(status);
+    const stale = valid && (!state.connectionAvailable || statusIsStale(status));
     const mode = statusMode(status);
     const snapshotAvailable = status.snapshotAvailable !== false;
     const accountValid = valid && snapshotAvailable;
@@ -680,6 +705,7 @@ function renderStatus() {
     renderLegend(values, total);
     renderCredits(valid, stale, total);
     renderOffers();
+    renderStrategyDecisions();
     window.mikaV4.receiveLogs(currency, status.log || []);
     drawDistribution();
 }
@@ -694,24 +720,26 @@ function renderControl() {
     const recovery = state.status?.recovery || {};
     const writeRecovery = state.status?.writeRecovery || {};
     const writeBlocked = writeRecovery.canSubmit === false;
-    $("controlTitle").textContent = running
+    const lifecycle = window.mikaV4.describeControlState(state.control, state.status, state.connectionAvailable && state.controlAvailable);
+    root.dataset.sourceFresh = String(!lifecycle.stale && state.connectionAvailable);
+    $("controlTitle").textContent = !state.connectionAvailable || !state.controlAvailable ? lifecycle.title : running
         ? (recovery.active
             ? (recovery.manualRequired ? "等待人工处理" : "自动修复中")
-            : (writeBlocked ? "自动恢复中" : (mode === "PAUSED" ? "PAUSED" : (stale ? "进程运行 · 状态过期" : "运行中"))))
-        : "已停止";
-    $("controlDetail").textContent = running
+            : (writeBlocked ? "自动恢复中" : (stale ? "进程运行 · 状态过期" : (mode === "PAUSED" ? "PAUSED" : "运行中"))))
+        : lifecycle.title;
+    $("controlDetail").textContent = !state.connectionAvailable || !state.controlAvailable ? lifecycle.detail : running
         ? (recovery.active
             ? `${recovery.manualRequired ? "自动写入保持关闭。" : "正在只读同步，恢复后将在下一正常周期继续放贷。"} 已尝试 ${Number(recovery.attempts || 0)} 次。`
-            : `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
-        : "普通启动不会下单。启动实盘前必须完成只读安全预检。";
+            : `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${lifecycle.detail}${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
+        : lifecycle.detail;
     $("primaryControlButton").textContent = running ? `暂停 ${currency}` : `启动 ${currency}`;
-    $("primaryControlButton").disabled = !running && !context.settings.ready;
+    $("primaryControlButton").disabled = !state.connectionAvailable || !state.controlAvailable || (!running && !context.settings.ready);
     $("credentialState").textContent = state.config?.credentialsConfigured ? "已配置" : "未配置";
     $("permissionState").textContent = running
         ? "启动前已通过"
         : (state.preflight ? (state.preflight.canStart ? "预检通过" : "存在阻断项") : "待预检");
     $("preflightButton").textContent = `${currency} 实盘预检`;
-    $("preflightButton").disabled = running || !context.settings.ready;
+    $("preflightButton").disabled = !state.connectionAvailable || !state.controlAvailable || running || !context.settings.ready;
 }
 
 function renderConfig() {
@@ -732,18 +760,23 @@ async function loadStatus() {
 }
 
 async function loadControl() {
-    state.control = await getJson("/api/control/status");
+    try {state.control = await getJson("/api/control/status"); state.controlAvailable = true;}
+    catch (error) {state.controlAvailable = false; throw error;}
     renderControl();
 }
 
 async function refreshAll(showMessage = false) {
     try {
         await Promise.all([loadConfig(), loadStatus(), loadControl()]);
+        state.connectionAvailable = true;
+        renderStatus(); renderControl();
         setConnection(true);
         $("railError").textContent = "";
         if (showMessage) showToast("控制台已刷新");
     } catch (error) {
+        state.connectionAvailable = false;
         setConnection(false);
+        renderStatus(); renderControl();
         $("railError").textContent = error.message;
         if (showMessage) showToast(error.message);
     }
@@ -979,6 +1012,8 @@ $("preflightButton").addEventListener("click", runPreflight);
 window.addEventListener("resize", drawDistribution);
 refreshAll();
 window.setInterval(() => refreshAll(), 30000);
-window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
+window.setInterval(() => loadControl().catch(() => {
+    state.connectionAvailable = false; setConnection(false); renderStatus(); renderControl();
+}), 5000);
 return controller;
 };

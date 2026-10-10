@@ -10,7 +10,9 @@ import subprocess
 import sys
 import threading
 import time
+from decimal import Decimal
 
+from AdaptiveEngines import REGISTRY, algorithm_engine, template_for
 from bitfinex import Bitfinex
 from Configuration import (
     ConfigError,
@@ -28,6 +30,7 @@ from Currency import SUPPORTED_CURRENCIES, funding_sizing, require_currency
 from RuntimeV4 import FundingWriteGate, V4Coordinator
 from StateStore import LendingStateStore
 from StrategyV3 import json_decimal
+import Lifecycle
 
 
 def load_profiles(config_path):
@@ -62,6 +65,50 @@ def restart_control_digest(config_path):
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
+def version_performance(store, active):
+    """Count only this ACTIVE version's submitted offers, never adopted loans.
+
+    Funding ledger entries do not reliably identify an offer or credit. Account
+    interest therefore remains separate until exact attribution is available.
+    Closed credits are retained locally and count alongside outstanding loans.
+    """
+    if active is None:
+        return None
+    policy = strategy_v3_from_record(active)
+    activated = active.get("activated_at_ms")
+    if activated is None:
+        return None
+    parameters = (store.currency, active["version_id"], int(activated))
+    own_intents = """SELECT exchange_offer_id FROM order_intents
+                     WHERE currency=? AND strategy_version=? AND created_at_ms>=?
+                       AND exchange_offer_id IS NOT NULL
+                       AND COALESCE(resolution, '')!='PREFLIGHT_ADOPTED'
+                       AND slice_key NOT LIKE 'adopted:%'"""
+    with store.read_connection() as connection:
+        fills = connection.execute(
+            f"""SELECT trade_id, amount FROM funding_trades
+                WHERE currency=? AND mts>=? AND offer_id IN ({own_intents})""",
+            (store.currency, int(activated), *parameters),
+        ).fetchall()
+        loans = connection.execute(
+            f"""SELECT credit_id, amount FROM credits
+                WHERE currency=? AND mts_opening>=? AND offer_id IN ({own_intents})""",
+            (store.currency, int(activated), *parameters),
+        ).fetchall()
+    return {
+        "engine": policy.strategy_engine,
+        "strategyVersion": active["version_id"],
+        "activatedAtMs": int(activated),
+        "newFillCount": len(fills),
+        "newFillPrincipal": sum((abs(Decimal(row["amount"])) for row in fills), Decimal(0)),
+        "newLoanCount": len(loans),
+        "newLoanPrincipal": sum((abs(Decimal(row["amount"])) for row in loans), Decimal(0)),
+        "netInterest": None,
+        "interestAttribution": "UNAVAILABLE",
+        "coverage": "LOCALLY_LINKED_OFFERS_ONLY",
+    }
+
+
 class V4DashboardService:
     def __init__(self, config_path, status_path, context):
         self.config_path = config_path
@@ -92,16 +139,21 @@ class V4DashboardService:
         settings = load_profiles(self.config_path)
         store, selected = app.v3_store_for_config(self.config_path, currency)
         active, policy = ensure_active_strategy_v3(store, selected)
-        from StrategyV4 import adaptive_template
         from ResearchV4 import ModelRepository
-
-        from StrategyV4 import ENGINE, MULTI_ENGINE
-        from StrategyV41 import template as multi_template
+        from StrategyV4 import ENGINE
 
         repo = ModelRepository(store.path, currency)
-        models = {engine: repo.candidate(int(self.context.now() * 1000), engine) for engine in (ENGINE, MULTI_ENGINE)}
+        models = {engine: repo.candidate(int(self.context.now() * 1000), engine) for engine in REGISTRY}
         candidate = models[ENGINE]
         from OperationalV41 import status as operational_status
+
+        def template_info(engine):
+            return {
+                **strategy_v3_api_values(template_for(engine, policy)),
+                "engine": engine,
+                "algorithm": REGISTRY[engine][0],
+                "currency": currency,
+            }
 
         def model_info(model):
             if model is None:
@@ -110,6 +162,9 @@ class V4DashboardService:
 
             return {
                 **{key: model[key] for key in ("id", "confidence", "coverage")},
+                "engine": algorithm_engine(model["algorithm"]),
+                "algorithm": model["algorithm"],
+                "currency": model["currency"],
                 "eligibleForLiveCandidate": eligible(store, model),
                 **operational_status(repo, model, int(self.context.now() * 1000)),
                 "dataBasis": model.get("dataBasis", {}),
@@ -140,12 +195,11 @@ class V4DashboardService:
             "strategyV3Pending": strategy_v3_api_values(strategy_v3_from_record(store.strategy("PENDING")))
             if store.strategy("PENDING")
             else None,
-            "activeStrategy": active,
+            "activeStrategy": {**active, "engine": policy.strategy_engine},
             "supportedCurrencies": list(SUPPORTED_CURRENCIES),
-            "adaptiveTemplate": strategy_v3_api_values(adaptive_template(policy)),
+            "adaptiveTemplate": template_info(ENGINE),
             "adaptiveTemplates": {
-                ENGINE: strategy_v3_api_values(adaptive_template(policy)),
-                MULTI_ENGINE: strategy_v3_api_values(multi_template(policy)),
+                engine: template_info(engine) for engine in REGISTRY
             },
             "candidateModels": {engine: model_info(model) for engine, model in models.items()},
             "modelDetails": details,
@@ -196,8 +250,29 @@ class V4DashboardService:
             incomeHistorySync=store.income_history_sync_payload(currency),
             releaseComparison=store.release_comparison_v4(),
         )
-        status["last_update"] = status.get("last_update") or raw.get("last_update")
+        snapshot_time = status.get("last_update")
+        if not raw.get("currencies"):
+            snapshot_time = snapshot_time or raw.get("last_update")
+        status["last_update"] = snapshot_time or raw.get("last_update")
         status["log"] = raw.get("log", [])
+        control = dict(app.controlled_bot_status(self.config_path, self.context))
+        # Global Worker health cannot make a stale or absent currency snapshot fresh.
+        snapshot_time = snapshot_time if status.get("snapshotAvailable", True) else None
+        age = None
+        if snapshot_time:
+            try:
+                age = self.context.now() - datetime.datetime.fromisoformat(str(snapshot_time)).timestamp()
+            except (ValueError, TypeError, OverflowError):
+                pass
+        control["dataAgeSeconds"] = None if age is None else max(0, int(age))
+        control["sourceFresh"] = bool(control.get("running") and age is not None and 0 <= age <= 60)
+        status["control"] = control
+        for key in ("sourceFresh", "dataAgeSeconds", "lastLifecycleEvent", "stopReason"):
+            status[key] = control.get(key)
+        active = store.strategy("ACTIVE")
+        if active:
+            status["activeStrategy"] = {**active, "engine": strategy_v3_from_record(active).strategy_engine}
+        status["versionPerformance"] = version_performance(store, active)
         return json_decimal(status)
 
     def preflight(self, currencies, issue_token=True):
@@ -375,6 +450,14 @@ class V4DashboardService:
                     stores[currency].set_mode("PAUSED", "dashboard_stop")
                 raise
             state.started_at = app.timestamp()
+            Lifecycle.record(
+                self.context,
+                "WORKER_STARTED",
+                pid=state.process.pid,
+                currencies=selected,
+                authorized=True,
+                reason="supervisor_recovery" if recovering else "confirmed_preflight",
+            )
         old = state.auto_restart_authorization or {}
         authorized = sorted(set(old.get("currencies", ())) | set(selected))
         state.auto_restart_authorization = {
@@ -529,7 +612,7 @@ def run_worker(args, settings, context, log):
                     settings.sleep_active,
                     10
                     if any(
-                        runtime.policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+                        runtime.policy.strategy_engine in REGISTRY
                         for runtime in coordinator.runtimes.values()
                     )
                     else 30,
@@ -594,6 +677,17 @@ def supervisor_tick(config_path, status_path, context):
                     currency: stores[currency].strategy("ACTIVE")["version_id"] for currency in selected
                 }
                 return
+            Lifecycle.record(
+                context,
+                "HEARTBEAT_TIMEOUT",
+                pid=status.get("pid"),
+                currencies=selected,
+                authorized=True,
+                reason="worker_heartbeat_timeout",
+                heartbeatAtMs=min(
+                    int(stores[currency].recovery_status().get("heartbeatAt") or 0) for currency in selected
+                ),
+            )
             app.stop_controlled_bot(
                 config_path, reason="worker_heartbeat_timeout", context=context, preserve_authorization=True
             )
@@ -626,4 +720,12 @@ def supervisor_tick(config_path, status_path, context):
             for currency in selected:
                 stores[currency].record_recovery_failure("watchdog preflight failed", "WATCHDOG_PREFLIGHT", now_ms)
             return
-        service._launch(selected, recovering=True)
+        restarted = service._launch(selected, recovering=True)
+        Lifecycle.record(
+            context,
+            "SUPERVISOR_RESTART",
+            pid=(restarted or {}).get("pid"),
+            currencies=selected,
+            authorized=True,
+            reason="revalidated_recovery",
+        )

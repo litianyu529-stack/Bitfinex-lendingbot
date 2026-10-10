@@ -11,6 +11,7 @@ from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
 from RuntimeV3 import LendingRuntimeV3
 from Configuration import strategy_v3_from_record
+from Recovery import resume_target
 
 
 class FundingWriteGate:
@@ -134,7 +135,23 @@ class CurrencyFundingClient:
         )
         if offer is None or not offer["managed"]:
             raise ValueError("cannot cancel an offer without currency-specific ownership")
-        return self._write("cancel_funding_offer_result", offer_id)
+        from ExecutionSafety import blocked, record_rejection
+
+        store = self.gate.stores[self.currency]
+        action = {"currency": self.currency, "action": "CANCEL", "offerId": int(offer_id)}
+        try:
+            prior = blocked(store, action)
+            if prior:
+                return WriteResult(WriteOutcome.DEFINITE_REJECT, category=prior["category"],
+                                   error="Cancellation parameters were already definitively rejected")
+            result = self._write("cancel_funding_offer_result", offer_id)
+            if result.outcome == WriteOutcome.DEFINITE_REJECT:
+                record_rejection(store, action, result, int(self.gate.clock() * 1000))
+            return result
+        except OSError:
+            store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
+            return WriteResult(WriteOutcome.DEFINITE_REJECT, category="EXECUTION_BARRIER_UNAVAILABLE",
+                               error="Cannot verify durable cancellation rejection barriers")
 
     def transfer_between_wallets_result(self, source, destination, currency, amount):
         if normalize_currency(currency) != self.currency:
@@ -183,7 +200,7 @@ class V4Coordinator:
     def _pause(self, store, exc, category):
         runtime = store.runtime()
         recovery = store.recovery_status()
-        target = recovery.get("targetMode") or runtime["mode"]
+        target = resume_target(runtime, recovery)
         if runtime["mode"] != "PAUSED":
             store.set_mode("PAUSED", f"AUTO_RECOVERY:{category}")
         store.begin_recovery(category, str(exc), origin_mode=target, target_mode=target)

@@ -18,7 +18,9 @@ ENGINE = "adaptive_net_yield_v1"
 VERSION = "ADAPTIVE_NET_YIELD_V1"
 MULTI_ENGINE = "adaptive_net_yield_v2"
 MULTI_VERSION = "ADAPTIVE_NET_YIELD_V2"
-ENGINES = (ENGINE, MULTI_ENGINE)
+V42_ENGINE = "adaptive_net_yield_v3"
+V42_VERSION = "ADAPTIVE_NET_YIELD_V3"
+ENGINES = (ENGINE, MULTI_ENGINE, V42_ENGINE)
 DAY = 86_400_000
 HORIZON = 120
 WAIT_BINS = (0, 5, 15, 30, 60, 120, 360, 720, 1440)
@@ -82,7 +84,7 @@ def validate_adaptive(policy):
             )
         ):
             raise ValueError("adaptive V1 supports visible LIMIT only")
-        if policy.strategy_engine == MULTI_ENGINE:
+        if policy.strategy_engine in (MULTI_ENGINE, V42_ENGINE):
             if policy.enable_hidden or not any(
                 (
                     policy.enable_limit,
@@ -92,6 +94,11 @@ def validate_adaptive(policy):
                 )
             ):
                 raise ValueError("V4.1 requires a visible funding type; Hidden is not supported")
+        if policy.strategy_engine == V42_ENGINE:
+            if not policy.reprice_gain_apr.is_finite() or policy.reprice_gain_apr < 0:
+                raise ValueError("调价效率门槛必须是非负有效百分数")
+            if not 15 <= policy.passive_wait_minutes <= 360:
+                raise ValueError("被动等待期限必须在15至360分钟之间")
     return policy
 
 
@@ -258,7 +265,7 @@ def fit_model(currency, trades, observations=(), holdings=(), now_ms=0, coverage
 
 
 def validate_model(model, currency, now_ms, allow_empty=False):
-    if model.get("algorithm") not in (VERSION, MULTI_VERSION) or model.get("currency") != currency:
+    if model.get("algorithm") not in (VERSION, MULTI_VERSION, V42_VERSION) or model.get("currency") != currency:
         raise ValueError("model algorithm/currency mismatch")
     body = {k: v for k, v in model.items() if k != "id"}
     if model.get("id") != digest(body):
@@ -269,7 +276,7 @@ def validate_model(model, currency, now_ms, allow_empty=False):
         raise ValueError("model expired")
     if any(r["mts"] > model["trainedUntilMs"] for r in model["days"]):
         raise ValueError("future market path")
-    if model.get("algorithm") == MULTI_VERSION:
+    if model.get("algorithm") in (MULTI_VERSION, V42_VERSION):
         from StrategyV41 import validate_frr_paths
 
         validate_frr_paths(model)

@@ -29,7 +29,8 @@ def main():
         path, settings = configuration(Path(directory))
         client = FundingClient()
         client.now = int(time.time() * 1000)
-        if "--v41" in sys.argv:
+        adaptive_fixture = "--v41" in sys.argv or "--v42" in sys.argv
+        if adaptive_fixture:
             from test_operational_v41 import PublicAccount
 
             client = PublicAccount()
@@ -51,15 +52,17 @@ def main():
             clock=lambda: client.now / 1000,
         )
         statuses = coordinator.cycle()
-        if "--v41" in sys.argv:
+        if adaptive_fixture:
+            from AdaptiveEngines import engine_module, template_for
             from Configuration import strategy_v3_from_record
             from OperationalV41 import accept
             from ResearchV4 import ModelRepository
-            from StrategyV41 import fit_model, template
+
+            engine = "adaptive_net_yield_v3" if "--v42" in sys.argv else "adaptive_net_yield_v2"
 
             for currency, store in stores.items():
                 repo = ModelRepository(store.path, currency)
-                model = fit_model(
+                model = engine_module(engine).fit_model(
                     currency,
                     [],
                     now_ms=client.now,
@@ -68,7 +71,9 @@ def main():
                 )
                 repo.save(model)
                 accept(repo, model, client.now)
-                proposed = replace(template(strategy_v3_from_record(store.strategy("ACTIVE"))), model_id=model["id"])
+                proposed = replace(
+                    template_for(engine, strategy_v3_from_record(store.strategy("ACTIVE"))), model_id=model["id"]
+                )
                 store.save_strategy(json_decimal(proposed.__dict__), "DRAFT")
         for store in stores.values():
             store.pause_currency()

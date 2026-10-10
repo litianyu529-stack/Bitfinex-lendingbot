@@ -16,6 +16,7 @@ from Recovery import (
     RECOVERY_REQUIRED_SNAPSHOTS,
     recovery_category_for_reason,
     recovery_delay_seconds,
+    resume_target,
 )
 
 
@@ -23,10 +24,15 @@ D = Decimal
 RUNTIME_MODES = {"PAUSED", "LIVE", "REPLAY", "APPLYING"}
 OPEN_INTENT_STATES = {"PLANNED", "SUBMITTING", "AMBIGUOUS"}
 AUTO_RECOVERABLE_PAUSE_REASONS = {
+    "ADAPTIVE_FRR_STALE",
     "MARKET_DATA_STALE",
     "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN",
     "ACCOUNT_RECONCILIATION_MISMATCH",
     "AMBIGUOUS_WALLET_TRANSFER",
+}
+NON_RECOVERABLE_PAUSE_REASONS = {
+    "ADAPTIVE_DATA_UNAVAILABLE", "ADAPTIVE_MODEL_NOT_QUALIFIED", "ADAPTIVE_JOURNAL_FAILED",
+    "EXECUTION_BARRIER_UNAVAILABLE",
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
 EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
@@ -986,7 +992,13 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
             current = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            origin = str(origin_mode or runtime["previous_mode"] or runtime["mode"] or "PAUSED").upper()
+            if (
+                runtime["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS
+                and not current["active"]
+                and category != "WORKER_EXIT"
+            ):
+                return self._recovery_payload(current)
+            origin = str(origin_mode or resume_target(dict(runtime), self._recovery_payload(current))).upper()
             target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
             if target not in {"LIVE", "PAUSED", "REPLAY"}:
                 target = "PAUSED"
@@ -1058,6 +1070,9 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
             if not row["active"] or row["manual_required"]:
+                return {"resumed": False, "recovery": self._recovery_payload(row)}
+            runtime = connection.execute("SELECT safe_reason FROM runtime_state WHERE singleton=1").fetchone()
+            if runtime["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS:
                 return {"resumed": False, "recovery": self._recovery_payload(row)}
             last = row["last_probe_at_ms"]
             count = int(row["successful_snapshots"] or 0)
@@ -1162,7 +1177,10 @@ class LendingStateStore:
             current = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             previous = current["previous_mode"] if current["safe_reason"] else current["mode"]
             sticky_manual = bool(manual or current["safe_manual"])
-            safe_reason = current["safe_reason"] if sticky_manual and current["safe_manual"] else str(reason)
+            sticky_barrier = current["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS
+            safe_reason = (
+                current["safe_reason"] if sticky_barrier or (sticky_manual and current["safe_manual"]) else str(reason)
+            )
             connection.execute(
                 """UPDATE runtime_state
                    SET mode = 'PAUSED', previous_mode = ?, safe_reason = ?, safe_manual = ?,
@@ -1175,7 +1193,7 @@ class LendingStateStore:
                     "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, 'PAUSED', ?, ?)",
                     (current["mode"], str(reason), now),
                 )
-        category = recovery_category_for_reason(reason)
+        category = None if sticky_barrier else recovery_category_for_reason(reason)
         if category is not None:
             self.begin_recovery(
                 category,

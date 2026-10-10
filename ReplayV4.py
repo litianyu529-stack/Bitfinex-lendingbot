@@ -4,6 +4,8 @@ from collections import deque
 from dataclasses import replace
 from decimal import Decimal
 
+from AdaptiveEngines import REGISTRY, engine_module, template_for
+from AdaptiveExecutionState import MAX_PASSIVE_MS, evidence, quote_key
 from Configuration import strategy_v3_from_record
 from ExchangeModels import parse_book
 from Currency import funding_minimum
@@ -15,16 +17,64 @@ from StrategyV4 import (
     ENGINE,
     ENGINES,
     MULTI_ENGINE,
-    adaptive_template,
+    V42_ENGINE,
     adjustment,
     build_plan,
     digest,
     fee,
+    gross_floor,
     holding_hours,
     pool_for_period,
 )
 
 D = Decimal
+PUBLIC_DYNAMIC = "public_dynamic_limit"
+
+
+def public_dynamic_plan(state, policy, book):
+    """Transparent current-price LIMIT reference, not a commercial predictor."""
+    total, exposure = state["total"], state["existingExposure"]["total"]
+    cap = min(
+        total * policy.max_lend_percent / 100, policy.max_lend_amount if policy.max_lend_amount is not None else total
+    )
+    budget = min(state["wallet"], max(D(0), cap - exposure))
+    rows = []
+    for row in book:
+        period, rate = int(row["period"]), D(str(row["rate"]))
+        if (
+            D(str(row["amount"])) >= 0
+            or int(row.get("count", 1)) <= 0
+            or not 2 <= period <= policy.maximum_period
+            or rate < gross_floor(policy, period)
+        ):
+            continue
+        if row.get("demandType", "UNKNOWN") not in ("UNKNOWN", "FIXED", "LIMIT"):
+            continue
+        rows.append((rate, period, abs(D(str(row["amount"])))))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    plan = []
+    long_used = sum((D(v) for p, v in state["exposureByPeriod"].items() if int(p) >= policy.long_from_days), D(0))
+    for rate, period, capacity in rows:
+        if len(plan) >= max(0, 8 - state["openOfferCount"]):
+            break
+        if period >= policy.long_from_days:
+            capacity = min(capacity, max(D(0), total * policy.long_max_share / 100 - long_used))
+        amount = min(budget, capacity)
+        if amount < funding_minimum():
+            continue
+        plan.append(
+            dict(
+                period=period,
+                amount=amount,
+                effective_rate=rate,
+                submitted_rate=rate,
+                offer_type="LIMIT",
+                display_type="LIMIT",
+            )
+        )
+        budget -= amount
+        long_used += amount if period >= policy.long_from_days else 0
+    return dict(plan=plan, candidates=[], dynamicTarget=rows[0] if rows else None)
 
 
 def replay(
@@ -53,6 +103,8 @@ def replay(
     interest, capital_time, idle_time = D(0), D(0), D(0)
     coverage_ms, frr_coverage_ms, total_ms = 0, 0, end_ms - start_ms
     actions = 0
+    quarantines, lease_events, blocked, unknown_volume = {}, [], [], D(0)
+    core = engine_module(policy.strategy_engine) if policy.strategy_engine in ENGINES else None
 
     def account():
         exposure = {p: D(0) for p in ("short", "medium", "long")}
@@ -74,6 +126,9 @@ def replay(
                 for period in {r["period"] for r in orders + credits}
             },
             "openOfferCount": len(orders),
+            "managedOffers": [{**r, "rate": r["rate"], "managed": True} for r in orders],
+            "passiveLeaseStates": [r["lease"] for r in orders if r.get("lease")],
+            "passiveQuarantines": quarantines,
         }
 
     while cursor < end_ms:
@@ -115,14 +170,22 @@ def replay(
                 wallet += order["amount"]
                 orders.remove(order)
                 continuations.append(order)
+                if order.get("lease"):
+                    lease = order["lease"]
+                    quarantines[lease["quoteKey"]] = {
+                        "closedAtMs": cursor,
+                        "chainStartMs": lease["chainStartMs"],
+                        "evidenceWatermark": lease["evidenceWatermark"],
+                    }
+                    lease_events.append(dict(atMs=cursor, action="CLOSED", quoteKey=lease["quoteKey"]))
         if cursor >= next_decision:
             if book and cursor - book_at <= 60000:
                 state = account()
-                if policy.strategy_engine == MULTI_ENGINE:
-                    from StrategyV41 import build_plan as multi_plan
-
+                if policy.strategy_engine == PUBLIC_DYNAMIC:
+                    plan = public_dynamic_plan(state, policy, book)
+                elif core and policy.strategy_engine != ENGINE:
                     fresh_frr = current_frr if cursor - frr_at <= policy.rest_stale_seconds * 1000 else None
-                    plan = multi_plan(state, policy, model, book, list(history), cursor, "replay", fresh_frr)
+                    plan = core.build_plan(state, policy, model, book, list(history), cursor, "replay", fresh_frr)
                 elif policy.strategy_engine == ENGINE:
                     plan = build_plan(state, policy, model, book, list(history), cursor, "replay")
                 else:
@@ -137,13 +200,14 @@ def replay(
                         "replay",
                         existing_exposure=state["existingExposure"],
                     )
+                if plan.get("blockReasons"):
+                    blocked.append(dict(atMs=cursor, reasons=plan["blockReasons"]))
                 for order in orders:
                     if order.get("cancel_at"):
                         continue
                     if policy.strategy_engine in ENGINES:
-                        if policy.strategy_engine == MULTI_ENGINE:
-                            from StrategyV41 import adjustment as decide
-
+                        if policy.strategy_engine != ENGINE:
+                            decide = core.adjustment
                             extra = {
                                 "current_frr": current_frr
                                 if cursor - frr_at <= policy.rest_stale_seconds * 1000
@@ -160,6 +224,7 @@ def replay(
                                 "rate_real": order["rate"],
                                 "managed": True,
                                 "mts_created": order["created_ms"],
+                                "passiveLease": order.get("lease"),
                             },
                             plan["candidates"],
                             list(history),
@@ -167,14 +232,45 @@ def replay(
                             cursor,
                             **extra,
                         )
-                        key = (
-                            decision.get("targetPeriod"),
-                            decision.get("targetRate"),
-                            decision.get("targetType"),
-                            decision["reason"],
-                        )
-                        count = order.get("confirmations", 0) + 1 if key == order.get("confirmation_key") else 1
-                        order.update(confirmations=count, confirmation_key=key)
+                        lease = order.get("lease")
+                        if lease and decision["reason"] == "PASSIVE_TO_NORMAL":
+                            order.pop("lease")
+                            lease_events.append(dict(atMs=cursor, action="NORMAL", quoteKey=lease["quoteKey"]))
+                            lease = None
+                        if lease and decision["reason"] == "PASSIVE_LEASE_RENEW":
+                            fresh = set(decision.get("evidenceWatermark", [])) & evidence(
+                                history, book, cursor, lease["startedAtMs"]
+                            )
+                            fresh -= set(lease["evidenceWatermark"])
+                            if fresh and cursor < lease["chainStartMs"] + MAX_PASSIVE_MS:
+                                lease["evidenceWatermark"] = sorted(set(lease["evidenceWatermark"]) | fresh)
+                                lease["expiresAtMs"] = min(
+                                    cursor + policy.passive_wait_minutes * 60000, lease["chainStartMs"] + MAX_PASSIVE_MS
+                                )
+                                lease_events.append(dict(atMs=cursor, action="RENEW", quoteKey=lease["quoteKey"]))
+                        if policy.strategy_engine == V42_ENGINE:
+                            # Compare the exact native submitted value, not an FRR-dependent effective quote.
+                            key = (
+                                model["id"],
+                                decision.get("targetPeriod"),
+                                decision.get("targetType"),
+                                str(D(str(decision.get("targetSubmittedRate", 0))).normalize()),
+                            )
+                            if decision["action"] != "CANCEL" or decision.get("hard"):
+                                order.update(confirmations=0, confirmation_key=None)
+                                count = 0
+                            else:
+                                count = order.get("confirmations", 0) + 1 if key == order.get("confirmation_key") else 1
+                                order.update(confirmations=count, confirmation_key=key)
+                        else:
+                            key = (
+                                decision.get("targetPeriod"),
+                                decision.get("targetRate"),
+                                decision.get("targetType"),
+                                decision["reason"],
+                            )
+                            count = order.get("confirmations", 0) + 1 if key == order.get("confirmation_key") else 1
+                            order.update(confirmations=count, confirmation_key=key)
                         recent_adjustments = sum(r["atMs"] > cursor - 3600000 for r in cancellations)
                         ordinary = (
                             count >= 2
@@ -182,6 +278,24 @@ def replay(
                             and recent_adjustments < 12
                         )
                         change = decision["action"] == "CANCEL" and (decision.get("hard") or ordinary)
+                        if lease and cursor >= lease["expiresAtMs"]:
+                            # Expiry cannot be silently extended by an unconfirmed ordinary adjustment.
+                            change = True
+                            decision = dict(action="CANCEL", reason="LEASE_EXPIRED", hard=True)
+                    elif policy.strategy_engine == PUBLIC_DYNAMIC:
+                        target = plan.get("dynamicTarget")
+                        change = bool(
+                            target
+                            and cursor - order["created_ms"] >= 5 * 60000
+                            and (target[0], target[1]) != (order["rate"], order["period"])
+                        )
+                        change = change and cursor - order.get("last_adjustment", 0) >= 120000
+                        change = change and sum(r["atMs"] > cursor - 3600000 for r in cancellations) < 12
+                        decision = dict(
+                            reason="PUBLIC_DYNAMIC_QUOTE",
+                            targetRate=target[0] if target else None,
+                            targetPeriod=target[1] if target else None,
+                        )
                     else:
                         from RuntimeV3 import _exploration_age_stage_target
 
@@ -226,7 +340,7 @@ def replay(
                     if change:
                         order.update(cancel_at=cursor + 60000, last_adjustment=cursor, replacement=decision)
                         cancellations.append({"atMs": cursor, "remainingAmount": order["amount"], **decision})
-                if policy.strategy_engine not in ENGINES:
+                if policy.strategy_engine not in ENGINES and policy.strategy_engine != PUBLIC_DYNAMIC:
                     # Repricing keeps term and chain timing, with a one-minute
                     # cancel-confirmation barrier during which fills remain possible.
                     for old in continuations:
@@ -236,6 +350,33 @@ def replay(
                     amount = min(wallet, proposed["amount"])
                     if amount < funding_minimum():
                         continue
+                    lease = None
+                    if policy.strategy_engine == V42_ENGINE and proposed.get("passive"):
+                        if any(r.get("lease") for r in orders):
+                            continue
+                        key = quote_key(policy.currency, proposed)
+                        closed = quarantines.get(key)
+                        if closed and not (
+                            evidence(history, book, cursor, closed["closedAtMs"])
+                            & set(proposed.get("evidenceWatermark", []))
+                        ) - set(closed["evidenceWatermark"]):
+                            continue
+                        latest = max(quarantines.values(), key=lambda r: r["closedAtMs"], default=None)
+                        chain_start = latest["chainStartMs"] if latest else cursor
+                        if latest and cursor >= chain_start + MAX_PASSIVE_MS:
+                            new = evidence(history, book, cursor, latest["closedAtMs"])
+                            if not new - set(latest["evidenceWatermark"]):
+                                continue
+                            chain_start = cursor
+                        lease = dict(
+                            quoteKey=key,
+                            startedAtMs=cursor,
+                            chainStartMs=chain_start,
+                            expiresAtMs=min(cursor + policy.passive_wait_minutes * 60000, chain_start + MAX_PASSIVE_MS),
+                            evidenceWatermark=list(proposed.get("evidenceWatermark", [])),
+                        )
+                        amount = min(amount, funding_minimum())
+                        lease_events.append(dict(atMs=cursor, action="OPEN", quoteKey=lease["quoteKey"]))
                     rate = proposed["effective_rate"]
                     if proposed["offer_type"] == "FRR" and current_frr is not None:
                         rate = current_frr
@@ -269,18 +410,51 @@ def replay(
                             ),
                             "stage": proposed.get("stage", 0),
                             "last_adjustment": proposed.get("last_adjustment", cursor),
+                            "lease": lease,
                         }
                     )
                     wallet -= amount
                     actions += 1
                 continuations.clear()
+            else:
+                # No fresh quote data means no renewal, even if the timer expired between books.
+                for order in orders:
+                    lease = order.get("lease")
+                    if lease and cursor >= lease["expiresAtMs"] and not order.get("cancel_at"):
+                        order["cancel_at"] = cursor + 60000
+                        cancellations.append(
+                            dict(
+                                atMs=cursor,
+                                remainingAmount=order["amount"],
+                                action="CANCEL",
+                                reason="LEASE_EXPIRED",
+                                hard=True,
+                            )
+                        )
             next_decision = cursor + interval_ms
+            next_decision = min(
+                [
+                    next_decision,
+                    *[
+                        r["lease"]["expiresAtMs"]
+                        for r in orders
+                        if r.get("lease") and r["lease"]["expiresAtMs"] > cursor
+                    ],
+                ]
+            )
         if next_trade and int(next_trade["mts"]) <= cursor:
             trade = next_trade
             volume = abs(D(str(trade["amount"])))
             for order in sorted(orders, key=lambda r: (r["rate"], r["created_ms"])):
                 if order["period"] < int(trade["period"]) or order["rate"] > D(str(trade["rate"])) or volume <= 0:
                     continue
+                compatibility = "UNKNOWN"
+                if policy.strategy_engine == V42_ENGINE:
+                    compatibility = core.compatibility(order["display_type"], trade)
+                    if compatibility == "INCOMPATIBLE" or (
+                        stress and compatibility == "UNKNOWN" and order["display_type"] != "LIMIT"
+                    ):
+                        continue
                 queued = min(volume, order["queue"])
                 order["queue"] -= queued
                 volume -= queued
@@ -289,7 +463,14 @@ def replay(
                     continue
                 order["amount"] -= amount
                 volume -= amount
-                duration = holding_hours(model, order["period"], 0.5, stress) if model else order["period"] * 24
+                if policy.strategy_engine == V42_ENGINE:
+                    duration = core._hold(
+                        core._holding_curve(model, order["display_type"], order["period"]), order["period"], 0.5, stress
+                    )
+                    if compatibility == "UNKNOWN":
+                        unknown_volume += amount
+                else:
+                    duration = holding_hours(model, order["period"], 0.5, stress) if model else order["period"] * 24
                 credits.append(
                     {
                         "amount": amount,
@@ -308,6 +489,9 @@ def replay(
                         "period": order["period"],
                         "waitMinutes": (cursor - order["created_ms"]) / 60000,
                         "cumulativeWaitMinutes": (cursor - order["chain_start"]) / 60000,
+                        "evidence": "SIMULATED_PUBLIC_CAPACITY",
+                        "demandCompatibility": compatibility,
+                        "displayType": order["display_type"],
                     }
                 )
             orders = [r for r in orders if r["amount"] > 0]
@@ -323,6 +507,9 @@ def replay(
             targets.append(int(next_trade["mts"]))
         targets.extend(r["return_ms"] for r in credits)
         targets.extend(r["cancel_at"] for r in orders if r.get("cancel_at"))
+        targets.extend(
+            r["lease"]["expiresAtMs"] for r in orders if r.get("lease") and r["lease"]["expiresAtMs"] > cursor
+        )
         target = min(t for t in targets if t > cursor)
         if current_frr is not None and cursor - frr_at <= policy.rest_stale_seconds * 1000:
             frr_coverage_ms += min(target - cursor, max(0, frr_at + policy.rest_stale_seconds * 1000 - cursor))
@@ -357,6 +544,10 @@ def replay(
         "frrCoverageFraction": frr_coverage_ms / total_ms if total_ms else 0,
         "fills": fills,
         "returns": returns,
+        "leaseEvents": lease_events,
+        "blockedDecisions": blocked,
+        "unknownTypeSimulatedAmount": unknown_volume,
+        "ownsRealFillEvidence": False,
         "assumptions": ["公共成交是成交容量上限，不是自己的成交证明", "未知真实队列以可见竞争供给估计"],
     }
 
@@ -394,13 +585,9 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
     from pathlib import Path
     from FileUtils import atomic_write_text
 
-    if engine == MULTI_ENGINE:
-        from StrategyV41 import template as make_template
-    else:
-        make_template = adaptive_template
-    template = make_template(strategy_v3_from_record(store.strategy("ACTIVE")))
     current = strategy_v3_from_record(store.strategy("ACTIVE"))
-    training_options = {"engine": engine} if engine == MULTI_ENGINE else {}
+    template = template_for(engine, current)
+    training_options = {"engine": engine} if engine != ENGINE else {}
     final_model = build_from_store(store, now_ms, cancelled, **training_options)
     train_end, validation_end = now_ms - 30 * DAY, now_ms - 15 * DAY
     report = {
@@ -412,6 +599,10 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
         "eligibleForLiveCandidate": False,
         "requiresManualPromotion": True,
         "comparisons": {},
+        "requestedBaselines": ["original_active", "repaired_v41", "public_dynamic_limit", "v42"]
+        if engine == V42_ENGINE
+        else ["original_active", "same_floor_legacy"],
+        "simulationIsOwnFillEvidence": False,
     }
     # Missing raw historical books or own evidence never yields an eligible result.
     cov = final_model["coverage"]
@@ -423,14 +614,14 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
         report["reason"] = "逐笔成交、历史盘口或自己的订单证据不足；K线和影子成交不能替代"
         return report, final_model
     model = build_from_store(store, train_end, cancelled, lookback_days=60, **training_options)
-    if engine == MULTI_ENGINE and (
+    if engine in (MULTI_ENGINE, V42_ENGINE) and (
         len(model.get("frrDays", [])) < 20
         or any(
             model.get("typeObservationCounts", {}).get(kind, 0) < 20
             for kind in ("LIMIT", "FRR", "FRR_DELTA_FIXED", "FRR_DELTA_VARIABLE")
         )
     ):
-        report["reason"] = "V4.1缺少至少20天FRR历史或各订单类型20条自身资金链；保持研究状态"
+        report["reason"] = "缺少至少20天FRR历史或各订单类型20条自身资金链；收益研究保持未通过"
         return report, model
     if model["ownObservationCount"] < 20:
         report["reason"] = "训练窗口自身资金链不足20条；测试集不能用于拟合或调参"
@@ -468,7 +659,38 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
         "near_limit": near,
         "adaptive": policy,
     }
-    if engine == MULTI_ENGINE:
+    variant_models = {"original_active": original_model}
+    repaired_available = True
+    if engine == V42_ENGINE:
+        from ResearchV4 import ModelRepository
+
+        variants["v42"] = variants.pop("adaptive")
+        variants[PUBLIC_DYNAMIC] = replace(
+            policy,
+            strategy_engine=PUBLIC_DYNAMIC,
+            enable_limit=True,
+            enable_frr=False,
+            enable_frr_delta_fixed=False,
+            enable_frr_delta_variable=False,
+        )
+        repository = ModelRepository(store.path, store.currency)
+        old_model = (
+            original_model if current.strategy_engine == MULTI_ENGINE else repository.candidate(train_end, MULTI_ENGINE)
+        )
+        repaired_available = old_model is not None
+        report["baselineAvailability"] = {
+            "repaired_v41": "AVAILABLE_FROZEN_MODEL" if repaired_available else "MISSING_HISTORICAL_FROZEN_MODEL",
+            PUBLIC_DYNAMIC: "TRANSPARENT_CURRENT_COMPATIBLE_LIMIT_5_MINIMUM_MINUTES",
+        }
+        if old_model:
+            old_policy = current if current.strategy_engine == MULTI_ENGINE else template_for(MULTI_ENGINE, current)
+            variants["repaired_v41"] = replace(old_policy, model_id=old_model["id"])
+            variant_models["repaired_v41"] = old_model
+            report["repairedV41ModelId"] = old_model["id"]
+        else:
+            report["missingBaselineReason"] = "缺少当时可用的V4.1冻结模型，不用新模型补造旧引擎成绩"
+    adaptive_name = "v42" if engine == V42_ENGINE else "adaptive"
+    if engine in (MULTI_ENGINE, V42_ENGINE):
         from StrategyV41 import FIELDS
 
         for kind, field in FIELDS.items():
@@ -478,18 +700,14 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
             "SELECT total_principal FROM account_samples WHERE mts<=? ORDER BY mts DESC LIMIT 1", (train_end,)
         ).fetchone()
     principal = D(sample[0]) if sample else D(1000)
-    checkpoint = (
-        Path(store.path).resolve().parent
-        / "research"
-        / store.currency
-        / ("replay-checkpoint-v2.json" if engine == MULTI_ENGINE else "replay-checkpoint.json")
-    )
+    checkpoint = Path(store.path).resolve().parent / "research" / store.currency / REGISTRY[engine][4]
     binding = digest(
         {
             "now": now_ms,
             "model": model["id"],
             "principal": principal,
             "policies": {k: p.__dict__ for k, p in variants.items()},
+            "baselineModels": {k: m["id"] for k, m in variant_models.items()},
         }
     )
     metrics = {}
@@ -512,22 +730,30 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
                 continue
             raw, books = streams(store.path, start, end)
             metrics[split][name] = replay(
-                p, original_model if name == "original_active" else model, raw, books, principal, start, end, cancelled
+                p, variant_models.get(name, model), raw, books, principal, start, end, cancelled
             )
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             from StrategyV3 import json_decimal
 
             atomic_write_text(str(checkpoint), json.dumps(json_decimal({"binding": binding, "metrics": metrics})))
-    good = True
-    for baseline in ("original_active", "same_floor_legacy"):
+    good = repaired_available
+    baselines = (
+        ("original_active", "same_floor_legacy", "repaired_v41", PUBLIC_DYNAMIC)
+        if engine == V42_ENGINE
+        else ("original_active", "same_floor_legacy")
+    )
+    for baseline in baselines:
+        if baseline not in variants:
+            report["comparisons"][baseline] = dict(state="DATA_UNAVAILABLE", gainVerified=False)
+            continue
         gains = []
         for split in ("validation", "test"):
-            new, old = metrics[split]["adaptive"], metrics[split][baseline]
+            new, old = metrics[split][adaptive_name], metrics[split][baseline]
             gains.append(new["netInterest"] > old["netInterest"] and new["bookCoverageFraction"] >= 0.95)
-            if engine == MULTI_ENGINE:
+            if engine in (MULTI_ENGINE, V42_ENGINE):
                 gains[-1] = gains[-1] and new["frrCoverageFraction"] >= 0.95
         ci = moving_block_interval(
-            metrics["test"]["adaptive"]["dailyNetInterest"], metrics["test"][baseline]["dailyNetInterest"]
+            metrics["test"][adaptive_name]["dailyNetInterest"], metrics["test"][baseline]["dailyNetInterest"]
         )
         report["comparisons"][baseline] = {
             "validationGainPositive": gains[0],
@@ -537,10 +763,18 @@ def evaluate(store, now_ms, cancelled=lambda: False, engine=ENGINE):
         good = good and all(gains) and ci["valid"] and ci["lower"] > 0
     raw, books = streams(store.path, validation_end, now_ms)
     pessimistic = replay(policy, model, raw, books, principal, validation_end, now_ms, cancelled, stress=True)
-    stress_ok = all(
-        pessimistic["netInterest"] > metrics["test"][b]["netInterest"] for b in ("original_active", "same_floor_legacy")
-    )
+    stress_ok = all(pessimistic["netInterest"] > metrics["test"][b]["netInterest"] for b in baselines if b in variants)
     good = good and stress_ok
+    if engine == V42_ENGINE:
+        # UNKNOWN public type has no identifiable native lane or observed own queue.
+        # A favorable assumed fill is not sufficient for a profitability verdict.
+        unknown = any(
+            D(str(metrics[s][adaptive_name].get("unknownTypeSimulatedAmount", 0))) > 0 for s in ("validation", "test")
+        )
+        report["unknownPublicTypeAffectedFills"] = unknown
+        if unknown:
+            good = False
+            report["qualificationReason"] = "公共成交类型不可识别；模拟容量不能证明自己的真实成交或收益优势"
     report.update(
         state="EVALUATED",
         metrics=metrics,

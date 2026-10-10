@@ -174,6 +174,8 @@ class StrategyPolicyV3:
     maximum_period: int = 120
     model_id: str = ""
     fee_verified: bool = False
+    reprice_gain_apr: D = D("0.0025")
+    passive_wait_minutes: int = 60
     short_share: D = D("50")
     medium_share: D = D("35")
     long_share: D = D("15")
@@ -242,6 +244,8 @@ class StrategyPolicyV3:
 
 
 V3_FIELD_CONVERTERS = {
+    "reprice_gain_apr": _d,
+    "passive_wait_minutes": int,
     "strategy_engine": str,
     "long_from_days": int,
     "long_max_share": _d,
@@ -308,7 +312,8 @@ def policy_v3_with_overrides(base, values):
     for name, converter in V3_FIELD_CONVERTERS.items():
         if name in values:
             updates[name] = converter(values[name])
-    updates["adopt_external_offers"] = True
+    if updates.get("strategy_engine", base.strategy_engine) != "adaptive_net_yield_v3":
+        updates["adopt_external_offers"] = True
     return replace(base, **updates)
 
 

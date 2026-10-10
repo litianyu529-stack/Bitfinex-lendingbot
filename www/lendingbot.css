@@ -666,6 +666,13 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .currency-settings [role="status"] { flex-basis: 100%; color: var(--muted); font-size: 12px; }
 .currency-settings .save-error { color: var(--danger); }
 .currency-status, .currency-sync { margin: 0 20px 6px; color: var(--muted); font-size: 11px; }
+.income-attribution-note { margin: 12px 20px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.strategy-decisions-surface { min-width: 0; padding: 18px 20px; border-top: 1px solid var(--line); }
+.strategy-decisions-surface .surface-heading { margin-bottom: 12px; }
+.strategy-decisions-surface > p, .adaptive-decisions > p { font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.adaptive-decision { padding-top: 10px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.currency-overview[data-source-fresh="false"] .currency-sync { color: var(--danger); }
+.currency-strategy [data-ref="v4VersionPerformance"] { font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .currency-overview .control-room { display: flex; flex-direction: column; border: 0; border-radius: 0; }
 .currency-overview .control-rail { order: -1; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; padding: 16px 20px; }
 .currency-overview .rail-state { grid-column: 1 / -1; margin: 0; }
@@ -678,6 +685,8 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .currency-overview .rail-kicker, .currency-overview .rail-divider, .currency-overview .rail-footer { display: none; }
 .coin-safety summary { color: #aac0bf; cursor: pointer; font-size: 11px; }
 .currency-overview .rail-facts { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 0 18px; margin-bottom: 0; }
+.currency-overview .coin-safety, .currency-overview .rail-facts div, .currency-overview .rail-facts dd { min-width: 0; }
+.currency-overview .rail-facts dd { overflow-wrap: anywhere; }
 .currency-overview .metric-strip { grid-template-columns: repeat(4, minmax(0,1fr)); }
 .currency-overview .metric-strip strong { font-size: 21px; }
 .currency-overview .metric-strip article { padding: 16px 12px; border-bottom: 1px solid var(--line); }

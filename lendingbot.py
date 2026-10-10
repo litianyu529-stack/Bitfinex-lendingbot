@@ -29,7 +29,8 @@ from RuntimeV3 import (
     parse_wallet_rows_v3,
 )
 from MarketDataStream import BitfinexMarketDataHub, websocket_dependency_available
-from Recovery import WORKER_HEARTBEAT_TIMEOUT_MS, classify_runtime_error
+from Recovery import WORKER_HEARTBEAT_TIMEOUT_MS, classify_runtime_error, resume_target
+import Lifecycle
 from StrategyV3 import (
     build_market_signals_v3,
     gross_daily_floor,
@@ -426,7 +427,7 @@ def load_v3_market_context(client, policy, now_ms):
     except Exception as exc:
         stats = []
         warnings.append(f"Funding Stats 不可用：{exc}")
-    if policy.strategy_engine == "adaptive_net_yield_v2":
+    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         from ExchangeModels import current_frr_observation
 
         try:
@@ -556,7 +557,7 @@ def _strategy_v3_preview(
     account, planned_snapshot, adoption_candidates = proposed_external_adoption(account_snapshot, policy)
     book, trades, stats, signals, warnings = load_v3_market_context(client, policy, now)
     warnings = [*basis["warnings"], *warnings]
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         from AdaptiveRuntime import context
 
         signals["adaptiveContext"] = context(store, policy, book, trades, now, stats)
@@ -605,7 +606,7 @@ def _strategy_v3_preview(
             LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
         ),
         "replay": {"state": "RESEARCH_REQUIRED", "note": "收益资格通过异步研究评估；即时预览不证明收益"}
-        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3")
         else replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
@@ -688,13 +689,13 @@ def v3_credit_violations(credit, policy):
 
 
 def v3_offer_violations(offer, policy, current_frr=None):
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         from StrategyV4 import gross_floor
 
         period = int(offer.get("period") or 0)
         effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
         kind = v3_offer_display_type(offer)
-        if policy.strategy_engine == "adaptive_net_yield_v2" and kind in (
+        if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3") and kind in (
             "FRR",
             "FRR_DELTA_FIXED",
             "FRR_DELTA_VARIABLE",
@@ -801,7 +802,7 @@ def save_strategy_v3_draft(config_path, payload, app_context=None, currency="USD
         raise ApiRequestError("Dashboard build 或配置路径已变化，请重新计算", "PREVIEW_STALE", 409)
     if active["version_id"] != context["activeVersion"] or _canonical_sha256(policy.__dict__) != context["policyHash"]:
         raise ApiRequestError("ACTIVE 或拟议策略已变化，请重新计算", "PREVIEW_STALE", 409)
-    if policy.strategy_engine == "adaptive_net_yield_v2":
+    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         from OperationalV41 import status as operational_status
         from ResearchV4 import ModelRepository
 
@@ -876,7 +877,9 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
         raise ApiRequestError("待应用草稿与已确认版本不一致", "PREVIEW_STALE", 409)
     draft_policy = strategy_v3_from_record(draft)
     if any(
-        r.get("policy", {}).get("strategy_engine") in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+        r.get("policy", {}).get("strategy_engine") in (
+            "adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"
+        )
         for r in (draft, active)
     ) and (store.runtime()["mode"] == "LIVE" or store.recovery_status()["active"]):
         raise ApiRequestError("先暂停该币种并完成恢复，再应用自适应策略", "CURRENCY_PAUSE_REQUIRED", 409)
@@ -889,7 +892,10 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
         currency=currency,
         v4=context.get("v4", False),
     )
-    if draft_policy.strategy_engine == "adaptive_net_yield_v2" and not refreshed["plan"].get("operationalReady"):
+    if (
+        draft_policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
+        and not refreshed["plan"].get("operationalReady")
+    ):
         raise ApiRequestError("V4.1 模型尚未通过运行验收，请先快速准备模型", "MODEL_NOT_OPERATIONAL", 409)
     if (
         refreshed["accountDigest"] != context["accountDigest"]
@@ -1260,7 +1266,19 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
         if process is not None:
             return_code = process.poll()
         if process is not None and return_code is not None:
+            Lifecycle.record(context, "WORKER_EXITED", pid=process.pid, returnCode=return_code,
+                             reason=state.stop_reason or "unknown")
             cleanup_controlled_bot_handle(context)
+        lifecycle = Lifecycle.status(context)
+        latest = lifecycle.get("latest")
+        data_age = None
+        try:
+            published = read_status_payload(context.status_path)
+            updated = published.get("last_update")
+            if updated:
+                data_age = context.now() - datetime.datetime.strptime(updated, "%Y-%m-%d %H:%M:%S").timestamp()
+        except (OSError, ValueError, TypeError):
+            pass
         return {
             "running": running,
             "pid": process.pid if internal_running else (external or {}).get("pid"),
@@ -1275,6 +1293,11 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
                 or (external and external.get("buildMismatch"))
             ),
             "watchdogAuthorized": bool(state.auto_restart_authorization),
+            "lifecycle": lifecycle,
+            "lastLifecycleEvent": ({"kind": latest["event"], "atMs": latest["atMs"],
+                                    "reason": latest.get("reason")} if latest else None),
+            "sourceFresh": bool(running and data_age is not None and 0 <= data_age <= 60),
+            "dataAgeSeconds": data_age,
             **({"stateError": external["stateError"]} if external and external.get("stateError") else {}),
         }
 
@@ -1425,7 +1448,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
     for message in market_warnings:
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2"):
+    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         from AdaptiveRuntime import context as adaptive_context, eligible
 
         signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now, stats)
@@ -1434,19 +1457,27 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         operational = signals["adaptiveContext"]
         add_check(
             "adaptive_model",
-            "V4.1 模型运行验收" if policy.strategy_engine == "adaptive_net_yield_v2" else "自适应模型研究资格",
-            operational["operationalReady"] if policy.strategy_engine == "adaptive_net_yield_v2" else qualified,
+            (
+                "自适应模型运行验收"
+                if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
+                else "自适应模型研究资格"
+            ),
+            (
+                operational["operationalReady"]
+                if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
+                else qualified
+            ),
             (
                 "冻结模型已通过运行验收；收益研究单独展示"
                 if operational["operationalReady"]
                 else "；".join(operational["operationalBlockReasons"])
             )
-            if policy.strategy_engine == "adaptive_net_yield_v2"
+            if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
             else "冻结模型已通过收益研究"
             if qualified
             else "模型缺失、损坏或研究数据不足；禁止实盘启动",
         )
-        if policy.strategy_engine == "adaptive_net_yield_v2" and not qualified:
+        if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3") and not qualified:
             warnings.append(
                 {
                     "code": "RESEARCH_NOT_VALIDATED",
@@ -1455,11 +1486,11 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
             )
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
     current_frr = signals.get("adaptiveContext", {}).get("frr")
-    if policy.strategy_engine == "adaptive_net_yield_v2":
+    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
         reasons = result.get("blockReasons", [])
         add_check(
             "adaptive_market_data",
-            "V4.1 FRR与模型数据",
+            "自适应 FRR与模型数据",
             not reasons,
             "FRR与模型数据可用于规划" if not reasons else "；".join(reasons),
         )
@@ -1578,7 +1609,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         "operationalReportHash": result.get("operationalReportHash"),
         "operationalReady": result.get("operationalReady", False),
         "eligibleForLiveCandidate": qualified
-        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2")
+        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3")
         else False,
         "strategyEngine": policy.strategy_engine,
         "strategyPlan": json_decimal(result["plan"]),
@@ -1813,6 +1844,8 @@ def stop_controlled_bot(
         if not internal_running and external is None:
             cleanup_controlled_bot_handle(context)
             return controlled_bot_status(config_path, context)
+        Lifecycle.record(context, "WORKER_STOP_REQUESTED", reason=reason,
+                         pid=process.pid if internal_running else (external or {}).get("pid"))
         if external is not None:
             if external.get("stateError"):
                 raise ConfigError(external["stateError"])
@@ -1827,6 +1860,7 @@ def stop_controlled_bot(
             if external_live_process(config_path, context) is not None:
                 raise ConfigError("实盘进程未在超时时间内释放单实例锁")
             state.stop_reason = reason
+            Lifecycle.record(context, "WORKER_STOPPED", pid=pid, reason=reason)
             return controlled_bot_status(config_path, context)
         process.terminate()
         try:
@@ -1836,6 +1870,7 @@ def stop_controlled_bot(
             process.wait(timeout=5)
         cleanup_controlled_bot_handle(context)
         state.stop_reason = reason
+        Lifecycle.record(context, "WORKER_STOPPED", pid=process.pid, reason=reason, returnCode=process.poll())
         return controlled_bot_status(config_path, context)
 
 
@@ -1878,7 +1913,7 @@ def worker_supervisor_loop(config_path, status_path, context):
                 if now_ms - baseline < WORKER_HEARTBEAT_TIMEOUT_MS:
                     continue
                 runtime = store.runtime()
-                target = recovery.get("targetMode") or runtime.get("previous_mode") or runtime["mode"]
+                target = resume_target(runtime, recovery)
                 if target not in {"LIVE", "PAUSED", "REPLAY"}:
                     target = "LIVE"
                 if runtime["mode"] != "PAUSED":
@@ -2029,10 +2064,12 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
             state.market_hub.start()
         server = ThreadingHTTPServer((host, port), handler)
         state.dashboard_server = server
+        Lifecycle.record(context, "DASHBOARD_STARTED", pid=os.getpid())
         try:
             log.log(f"网页控制台已启动：http://{host}:{port}/lendingbot.html")
             server.serve_forever()
         finally:
+            Lifecycle.record(context, "DASHBOARD_STOPPED", pid=os.getpid(), reason="server_closed")
             server.server_close()
             if state.dashboard_server is server:
                 state.dashboard_server = None
@@ -2041,6 +2078,7 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
                 state.supervisor_thread.join(timeout=5)
                 state.supervisor_thread = None
     except Exception as exc:
+        Lifecycle.record(context, "DASHBOARD_FAILED", pid=os.getpid(), reason=type(exc).__name__)
         log.log(f"网页控制台启动失败：{exc}")
         if raise_errors:
             raise
@@ -2076,7 +2114,7 @@ def publish_safe_status(log, store, exc):
     current = store.runtime()
     if decision.retryable:
         recovery = store.recovery_status()
-        origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
+        origin = resume_target(current, recovery)
         if current["mode"] != "PAUSED":
             runtime = store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
         else:

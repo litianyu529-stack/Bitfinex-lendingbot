@@ -1230,11 +1230,11 @@ def test_bitfinex_offer_payload_maps_frr_and_hidden_flag():
     assert [row[1]["type"] for row in writes[1:]] == ["FRRDELTAFIX", "FRRDELTAVAR"]
 
 
-def test_bitfinex_rejects_negative_frr_delta_before_network_write():
+def test_bitfinex_rejects_negative_variable_frr_delta_before_network_write():
     client = Bitfinex("key", "secret")
     client._auth_write = lambda *_args, **_kwargs: pytest.fail("invalid delta must not reach Bitfinex")
     with pytest.raises(BitfinexApiError, match="cannot be negative"):
-        client.submit_funding_offer("fUSD", "150", "-0.0001", 14, "FRRDELTAFIX")
+        client.submit_funding_offer("fUSD", "150", "-0.0001", 14, "FRRDELTAVAR")
 
 
 def test_variable_share_cap_includes_plain_frr():

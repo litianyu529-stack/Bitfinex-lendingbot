@@ -113,6 +113,7 @@ def split_csv(raw):
 
 
 V3_PERCENT_FIELDS = {
+    "reprice_gain_apr",
     "short_floor_apr",
     "medium_floor_apr",
     "long_floor_apr",
@@ -131,6 +132,7 @@ V3_BOOL_FIELDS = {
     "adopt_external_offers",
 }
 V3_INT_FIELDS = {
+    "passive_wait_minutes",
     "long_from_days",
     "maximum_period",
     "minimum_offer_minutes",
@@ -241,7 +243,7 @@ def strategy_v3_api_values(policy):
         "lowDemandThresholdPercent": "5",
         "lowDemandConfirmationCycles": 2,
         "allocationCurve": "100/0,90/10,75/25,60/40",
-        "automaticExternalTakeover": True,
+        "automaticExternalTakeover": policy.strategy_engine != "adaptive_net_yield_v3",
         "submissionLimitPer60Seconds": 60,
     }
     return payload
@@ -355,6 +357,12 @@ def backup_strategy_state(config_path, state_db_file):
 
 def _normalization_payload(policy, record):
     payload = json_decimal(policy.__dict__)
+    # V4.2 read defaults must not silently create new ACTIVE versions for any
+    # previously frozen engine.
+    if policy.strategy_engine != "adaptive_net_yield_v3":
+        for key in ("reprice_gain_apr", "passive_wait_minutes"):
+            if key not in record["policy"]:
+                payload.pop(key, None)
     # Optional adaptive defaults are supplied when reading legacy records.
     # Their absence alone must not activate a new strategy during startup.
     if policy.strategy_engine == "legacy_v3":

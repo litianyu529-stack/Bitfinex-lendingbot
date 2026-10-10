@@ -18,6 +18,11 @@ python -m pytest -q `
     --cov=StrategyV3 `
     --cov=StrategyV4 `
     --cov=StrategyV41 `
+    --cov=StrategyV42 `
+    --cov=AdaptiveExecutionState `
+    --cov=AdaptiveEngines `
+    --cov=ExecutionSafety `
+    --cov=Lifecycle `
     --cov=AdaptiveRuntime `
     --cov=OperationalV41 `
     --cov=ResearchV4 `
@@ -38,6 +43,9 @@ python -m coverage report --include=StrategyV4.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m coverage report --include=StrategyV41.py --fail-under=90
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+python -m coverage report --include=StrategyV42.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m coverage report --include=OperationalV41.py --fail-under=90

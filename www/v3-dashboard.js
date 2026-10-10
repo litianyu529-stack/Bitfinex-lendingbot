@@ -15,13 +15,15 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     const groups = [
         {
             title: "策略引擎与长期保护",
-            description: "V4.0 比较 LIMIT；V4.1 同时比较 LIMIT 与 FRR 系列。V4.1 通过运行验收后可人工启动，收益研究单独展示；低置信度不代表已验证收益。",
+            description: "V4.2 按下一资金周期的净收益效率调价，并保留120天收益保护；V4.1 与 V4.0 保留。运行验收与收益研究分别展示。",
             fields: [
-                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"], ["adaptive_net_yield_v2", "V4.1 策略"]] }],
+                ["strategy_engine", "策略引擎", "select", "", { choices: [["legacy_v3", "V3 旧策略"], ["adaptive_net_yield_v1", "V4.0 策略"], ["adaptive_net_yield_v2", "V4.1 策略"], ["adaptive_net_yield_v3", "V4.2 策略"]] }],
                 ["model_id", "冻结模型 ID", "text", "", { placeholder: "快速准备后选用模型" }],
                 ["long_from_days", "长期起始天数", "number", "天", { min: 8, max: 120 }],
                 ["long_max_share", "长期贷款与挂单上限", "number", "%", { min: 1, max: 100 }],
                 ["maximum_period", "最长放贷期限", "number", "天", { min: 8, max: 120 }],
+                ["reprice_gain_apr", "下一周期调价收益门槛", "number", "百分点", { min: 0, max: 100, step: 0.01 }],
+                ["passive_wait_minutes", "被动报价等待时限", "number", "分钟", { min: 15, max: 360, step: 1 }],
             ],
         },
         {
@@ -184,7 +186,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                         <p id="v4OperationalState">运行验收：尚未准备</p>
                         <p id="v4ProfitabilityState">收益研究：尚未验证收益优势</p>
                         <button id="v4Template" class="button secondary" type="button">载入所选 V4 策略草稿模板</button>
-                        <button id="v4Prepare" class="button secondary" type="button">快速准备 ${currency} V4.1 模型</button>
+                        <button id="v4Prepare" class="button secondary" type="button">快速准备 ${currency} 模型</button>
                         <button id="v4UseModel" class="button secondary" type="button">选用已准备模型</button>
                         <button id="v4Evaluate" class="button secondary" type="button">评估 ${currency}</button>
                         <button id="v4Shadow" class="button secondary" type="button">影子观察 ${currency}</button>
@@ -192,7 +194,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                         <button id="v4ResearchResume" class="button secondary" type="button">恢复研究</button>
                         <div id="v4AdaptiveDetails"></div>
                     </section>
-                    <section><h2>实际统计</h2><div id="v3Stats" class="v3-stats"></div></section>
+                    <section><h2>实际统计</h2><p id="v4VersionPerformance">新增成交与全账户收益分别统计。</p><div id="v3Stats" class="v3-stats"></div></section>
                     <section><h2>期限自主选择</h2><div id="v3PeriodSelection" class="v3-period-selection"><p>等待市场评分</p></div></section>
                     <section><h2>近24小时期限分布</h2><div id="v3PeriodActivity" class="v3-period-activity"><p>等待运行数据</p></div></section>
                 </aside>
@@ -269,7 +271,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
                 value = periodFields.has(name) ? value.join(",") : value.join(" / ");
             }
             if (element.type === "checkbox") element.checked = Boolean(value);
-            else element.value = value ?? ({strategy_engine: "legacy_v3", long_from_days: 31, long_max_share: 95, maximum_period: 120}[name] ?? "");
+            else element.value = value ?? ({strategy_engine: "legacy_v3", long_from_days: 31, long_max_share: 95, maximum_period: 120, reprice_gain_apr: 0.25, passive_wait_minutes: 60}[name] ?? "");
         }
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         state.dirty = false;
@@ -300,6 +302,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
             if (numberValue("short_floor_apr") <= 0 || numberValue("long_floor_apr") < numberValue("short_floor_apr")) throw new Error("请设置短期底线和不低于短期的长期底线");
             if (!(8 <= numberValue("long_from_days") && numberValue("long_from_days") <= numberValue("maximum_period") && numberValue("maximum_period") <= 120)) throw new Error("长期边界和最长期限必须在8～120天内");
             if (!["enable_limit", "enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable"].some(name => input(name).checked)) throw new Error("至少启用一种Funding订单类型");
+            if (input("strategy_engine").value === "adaptive_net_yield_v3") window.mikaV4.validateRepricingInputs(input("reprice_gain_apr").value, input("passive_wait_minutes").value);
             return;
         }
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
@@ -350,13 +353,14 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     }
 
     function updateDerived() {
-        const adaptive = input("strategy_engine").value.startsWith("adaptive_net_yield_");
-        const multi = input("strategy_engine").value === "adaptive_net_yield_v2";
+        const profile = window.mikaV4.strategyEngineProfile(input("strategy_engine").value);
+        const {adaptive, multi, repricing} = profile;
         const fee = Math.max(adaptive ? 15 : 0, numberValue("normal_fee_rate")) / 100;
         const legacyFields = new Set(["short_share", "medium_share", "long_share", "short_periods", "medium_periods", "long_periods", "quick_share", "balanced_share", "high_share", "balanced_start_premium_percent", "high_start_premium_percent", "balanced_landing_stage", "high_landing_stage", "enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "enable_hidden", "variable_max_share", "hidden_max_share", "hidden_fee_rate"]);
         if (multi) for (const name of ["enable_frr", "enable_frr_delta_fixed", "enable_frr_delta_variable", "variable_max_share"]) legacyFields.delete(name);
         for (const name of allFields) input(name).closest("label").hidden = adaptive && (legacyFields.has(name) || name.endsWith("_reprice_stages_minutes"));
         for (const name of ["model_id", "long_from_days", "long_max_share", "maximum_period"]) input(name).closest("label").hidden = !adaptive;
+        for (const name of ["reprice_gain_apr", "passive_wait_minutes"]) input(name).closest("label").hidden = !repricing;
         if (adaptive) {
             input("medium_floor_apr").value = input("short_floor_apr").value;
             if (!multi) {
@@ -368,12 +372,19 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         input("medium_floor_apr").readOnly = adaptive;
         const typeNote = surface.querySelector(".v4-order-note");
         typeNote.hidden = !adaptive;
-        typeNote.textContent = multi ? "V4.1 比较 LIMIT 与勾选的 FRR 系列；Hidden 暂未支持。FRR 挂单成交前会变价，浮动贷款成交后仍会变价，可能低于底线；Variable 上限包含贷款与挂单。" : "V4.0 第一版仅支持可见 LIMIT；需要 FRR 系列时请选择 V4.1，并重新研究和预览。";
-        byId("v4Template").textContent = `载入 ${multi ? "V4.1" : "V4.0"} 策略草稿模板`;
+        typeNote.textContent = multi ? `${profile.name}比较 LIMIT 与勾选的 FRR 系列；Hidden 暂未支持。FRR 挂单成交前会变价，浮动贷款成交后仍会变价，可能低于底线；Variable 上限包含贷款与挂单。` : "V4.0 第一版仅支持可见 LIMIT；需要 FRR 系列时请选择 V4.1 或 V4.2，并重新准备和预览。";
+        byId("v4Template").textContent = `载入 ${profile.name}草稿模板`;
+        byId("v4Prepare").textContent = `快速准备 ${currency} ${profile.name}模型`;
         byId("v4Prepare").disabled = !multi;
         renderModelStatus();
         surface.querySelector(".v3-fixed-safety").hidden = adaptive;
         for (const description of surface.querySelectorAll(".v3-section-heading > p")) description.hidden = adaptive;
+        const engineDescription = input("strategy_engine").closest("section").querySelector(".v3-section-heading > p");
+        engineDescription.hidden = false;
+        engineDescription.textContent = !adaptive ? "V3 旧策略使用固定期限池、成交层比例和分阶段调价。"
+            : repricing ? "V4.2 比较下一次等待、成交和归还周期的净收益效率，再检查120天收益保护。等待时限到期会重新比较，不会自动突破5%／10%底线。运行就绪不代表收益研究通过。"
+                : multi ? "V4.1 比较LIMIT与FRR系列的120天净收益。运行验收与收益研究分别展示。"
+                    : "V4.0 比较LIMIT的120天净收益，沿用严格收益研究启用门槛。";
         for (const pool of ["short", "medium", "long"]) {
             const apr = numberValue(`${pool}_floor_apr`);
             const hint = surface.querySelector(`[data-daily-floor="${pool}"]`);
@@ -382,25 +393,25 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
         const poolTotal = numberValue("short_share") + numberValue("medium_share") + numberValue("long_share");
         const layerTotal = numberValue("quick_share") + numberValue("balanced_share") + numberValue("high_share");
-        byId("v3AllocationHint").textContent = adaptive ? "动态分配 · 最多8单 · 调整需两次确认 · 普通费用保守按至少15%计算" : `资金池 ${poolTotal}% · 成交层 ${layerTotal}%`;
+        byId("v3AllocationHint").textContent = adaptive ? `动态分配 · 最多8单 · 调整需两次确认 · ${repricing ? "下一周期效率＋120天保护 · " : ""}普通费用保守按至少15%计算` : `资金池 ${poolTotal}% · 成交层 ${layerTotal}%`;
     }
 
     function renderAdaptive(plan) {
         const box = byId("v4AdaptiveDetails"); box.replaceChildren();
         if (!plan?.engine?.startsWith("adaptive_net_yield_")) return;
         const description = document.createElement("p");
-        const readiness = plan.engine === "adaptive_net_yield_v2" ? (plan.operationalReady ? "运行验收通过" : "运行尚未就绪") : "V4.0 沿用收益研究启用门槛";
+        const readiness = window.mikaV4.strategyEngineProfile(plan.engine).multi ? (plan.operationalReady ? "运行验收通过" : "运行尚未就绪") : "V4.0 沿用收益研究启用门槛";
         description.textContent = `模型 ${plan.modelId || "未选择"} · ${plan.confidence === "LOW" ? "低置信度" : plan.confidence || "未校准"} · ${readiness} · ${plan.eligibleForLiveCandidate ? "收益研究通过" : "尚未验证收益优势"}。${[...(plan.blockReasons || []), ...(plan.operationalBlockReasons || [])].join("；")}`;
         box.append(description);
         for (const row of (plan.candidates || []).slice(0, 8)) {
             const line = document.createElement("p");
-            line.textContent = `${row.display_type || "LIMIT"} · ${row.period}天 · 报价净年化 ${(Number(row.netApr) * 100).toFixed(2)}% · 保守资金时间年化 ${(Number(row.conservativeNetApr) * 100).toFixed(2)}% · 预期净利息 ${Number(row.expectedNetInterest).toFixed(2)} ${currency} / ${Number(row.amount).toFixed(2)} ${currency} · 成交概率 ${(Number(row.expectedFillProbability) * 100).toFixed(1)}% · 等待 ${row.expectedWaitMinutes == null ? "未知" : Number(row.expectedWaitMinutes).toFixed(1) + "分钟"} · 持有 ${row.expectedHoldingHours == null ? "未知" : Number(row.expectedHoldingHours).toFixed(1) + "小时"} · ${row.confidence === "LOW" ? "低置信度" : "已校准"}${row.rateRiskNote ? " · " + row.rateRiskNote : ""}`;
+            line.textContent = window.mikaV4.describeAdaptiveCandidate(row, currency);
             box.append(line);
         }
         for (const row of plan.decisions || []) {
             const line = document.createElement("p");
-            const labels = {KEEP: "保持", CANCEL: "调整", WAIT: "等待", QUEUE_VALUE: "重新排队收益不足", MINIMUM_AGE: "未达最短保留时间", VALUE_GAIN: "收益优势成立", HARD_FLOOR: "安全底线调整", EXTERNAL_OFFER: "外部挂单", EVALUATION_INTERVAL: "等待下一评估周期"};
-            line.textContent = `${row.offerId || ""} ${labels[row.action] || row.action} · ${labels[row.reason] || row.reason} · 优势 ${row.aprGain == null ? "—" : (Number(row.aprGain) * 100).toFixed(2) + "个百分点"} · 累计等待 ${row.cumulativeWaitMinutes == null ? "未知" : Number(row.cumulativeWaitMinutes).toFixed(1) + "分钟"}`;
+            line.className = "adaptive-decision";
+            line.textContent = window.mikaV4.describeAdaptiveDecision(row, currency);
             box.append(line);
         }
     }
@@ -414,7 +425,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         const confidences = Object.entries(model?.typeConfidence || {}).map(([kind, level]) => `${kind}：${level === "LOW" ? "低置信度" : "已校准"}`).join("；");
         byId("v4OperationalState").textContent = engine === "adaptive_net_yield_v1" ? "V4.0 沿用收益研究启用门槛" : `运行验收：${model?.operationalReady ? "已通过" : "尚未就绪"}${modelId ? " · 当前编辑模型" : " · 候选模型，需选用"} · ${model ? origin : "尚未准备模型"}。${(model?.operationalBlockReasons || []).join("；")} ${confidences}`;
         byId("v4ProfitabilityState").textContent = `收益研究：${model?.eligibleForLiveCandidate ? "通过严格研究验收" : "尚未验证收益优势；运行验收通过不代表收益更高"}`;
-        byId("v4UseModel").disabled = !candidate || (engine === "adaptive_net_yield_v2" && !candidate.operationalReady);
+        byId("v4UseModel").disabled = !candidate || (window.mikaV4.strategyEngineProfile(engine).multi && !candidate.operationalReady);
     }
 
     function percentDaily(value) {
@@ -541,7 +552,8 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     function renderRuntime(data, status) {
         const runtime = data.runtime || {};
         state.runtime = runtime;
-        if (!state.dirty && !state.saving) renderAdaptive(status?.strategyV3);
+        if (!state.dirty && !state.saving) renderAdaptive(status?.strategy || status?.strategyV3);
+        byId("v4VersionPerformance").textContent = window.mikaV4.describeVersionPerformance(status?.versionPerformance, currency);
         byId("v3Mode").textContent = data.displayMode || runtime.mode || "PAUSED";
         for (const [id, version] of [
             ["v3ActiveVersion", data.activeStrategy?.version_id],
@@ -559,7 +571,10 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
             status?.strategyV3?.periodActivity,
         );
         byId("v3MarketSource").textContent = `${marketData.source || "--"}${marketData.publicAgeMs != null ? ` · ${marketData.publicAgeMs}ms` : ""}`;
-        if (status?.last_update) byId("v3AccountSource").textContent = `实时账户 · ${status.last_update}`;
+        if (status?.last_update) {
+            const freshness = window.mikaV4.describeControlState(status.control || {running:true, sourceFresh:status.sourceFresh, dataAgeSeconds:status.dataAgeSeconds}, status).stale;
+            byId("v3AccountSource").textContent = `${freshness ? "历史账户快照" : "最近账户同步"} · ${status.last_update}`;
+        }
         if (market.regime) byId("v3Regime").textContent = market.regime;
         if (market.frr_daily_rate != null) byId("v3Frr").textContent = percentDaily(market.frr_daily_rate);
         if (market.best_bid != null) byId("v3BestBid").textContent = percentDaily(market.best_bid);
@@ -630,6 +645,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
         let config;
         try {
             config = await requestJson("/api/config");
+            if (sequence !== state.loadSequence) return false;
             state.template = config.adaptiveTemplate;
             state.candidate = config.candidateModel;
             state.templates = config.adaptiveTemplates;
@@ -788,8 +804,10 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     byId("v3LiveButton").addEventListener("click", () => context.overview.runPreflight());
     byId("v4Template").addEventListener("click", () => {
         if (!state.template) return;
-        const engine = input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1";
-        fillPolicy({...state.policy, ...(state.templates?.[engine] || state.template), model_id: (state.candidates?.[engine] || (engine === "adaptive_net_yield_v1" ? state.candidate : null))?.id || ""}); edited();
+        const engine = input("strategy_engine").value;
+        const template = state.templates?.[engine] || (engine === "adaptive_net_yield_v1" ? state.template : null);
+        if (!template) {byId("v3FormMessage").textContent = "所选引擎的草稿模板尚未提供，请先刷新配置。"; return;}
+        fillPolicy({...state.policy, ...template, model_id: (state.candidates?.[engine] || (engine === "adaptive_net_yield_v1" ? state.candidate : null))?.id || ""}); edited();
     });
     byId("v4UseModel").addEventListener("click", () => {
         const candidate = state.candidates?.[input("strategy_engine").value];
@@ -798,7 +816,7 @@ window.createCurrencyStrategy = async function(surface, currency, context) {
     });
     for (const [id, path] of [["v4Prepare", "prepare"], ["v4Evaluate", "evaluate"], ["v4Shadow", "shadow/start"], ["v4ResearchStop", "cancel"], ["v4ResearchResume", "resume"]]) {
         byId(id).addEventListener("click", async () => {
-            try { const data = await postJson(`/api/research/v4/${path}`, {currency, engine: input("strategy_engine").value === "adaptive_net_yield_v2" ? "adaptive_net_yield_v2" : "adaptive_net_yield_v1"}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
+            try { const data = await postJson(`/api/research/v4/${path}`, {currency, engine: input("strategy_engine").value}); byId("v4ResearchState").textContent = `${data.state} · ${data.phase || ""}`; }
             catch (error) { byId("v4ResearchState").textContent = error.message; }
         });
     }

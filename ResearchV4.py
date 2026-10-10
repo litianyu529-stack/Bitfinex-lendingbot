@@ -15,14 +15,12 @@ from StrategyV3 import json_decimal, pool_for_period
 from StrategyV4 import (
     DAY,
     ENGINE,
-    MULTI_ENGINE,
-    MULTI_VERSION,
-    adaptive_template,
     condition,
     fit_model,
     validate_model,
     weighted_rate,
 )
+from AdaptiveEngines import REGISTRY, algorithm_engine, engine_module, template_for
 
 
 class ModelRepository:
@@ -34,12 +32,12 @@ class ModelRepository:
 
     @staticmethod
     def report_name(algorithm):
-        return "evaluation-v2.json" if algorithm == MULTI_VERSION else "evaluation.json"
+        return REGISTRY[algorithm_engine(algorithm)][3]
 
     def save(self, model):
         validate_model(model, self.currency, model["trainedUntilMs"], allow_empty=True)
         self.directory.mkdir(parents=True, exist_ok=True)
-        if model["algorithm"] == MULTI_VERSION and not (self.directory / "candidate-v1.json").exists():
+        if model["algorithm"] != REGISTRY[ENGINE][0] and not (self.directory / "candidate-v1.json").exists():
             previous = self.candidate(model["trainedUntilMs"], ENGINE)
             if previous:
                 atomic_write_text(str(self.directory / "candidate-v1.json"), json.dumps({"modelId": previous["id"]}))
@@ -47,7 +45,7 @@ class ModelRepository:
             str(self.directory / (model["id"] + ".json")), json.dumps(json_decimal(model), sort_keys=True)
         )
         atomic_write_text(str(self.directory / "candidate.json"), json.dumps({"modelId": model["id"]}))
-        pointer = "candidate-v2.json" if model["algorithm"] == MULTI_VERSION else "candidate-v1.json"
+        pointer = REGISTRY[algorithm_engine(model["algorithm"])][2]
         atomic_write_text(str(self.directory / pointer), json.dumps({"modelId": model["id"]}))
         return model["id"]
 
@@ -62,19 +60,13 @@ class ModelRepository:
 
     def candidate(self, now_ms, engine=None):
         try:
-            name = (
-                "candidate-v2.json"
-                if engine == MULTI_ENGINE
-                else "candidate-v1.json"
-                if engine == ENGINE
-                else "candidate.json"
-            )
+            name = REGISTRY[engine][2] if engine else "candidate.json"
             path = self.directory / name
             if engine == ENGINE and not path.exists():
                 path = self.directory / "candidate.json"
             pointer = json.loads(path.read_text(encoding="utf-8"))
             model = self.load(pointer["modelId"], now_ms)
-            if engine and (model["algorithm"] == MULTI_VERSION) != (engine == MULTI_ENGINE):
+            if engine and model["algorithm"] != REGISTRY[engine][0]:
                 return None
             return model
         except (OSError, ValueError, KeyError):
@@ -324,8 +316,8 @@ def build_from_store(
     store, now_ms, cancelled=lambda: False, lookback_days=90, engine=ENGINE, allow_frr_reference=False
 ):
     data = training_data(store.path, store.currency, now_ms, cancelled, lookback_days)
-    if engine == MULTI_ENGINE:
-        from StrategyV41 import fit_model as multi_fit
+    if engine in REGISTRY and engine != ENGINE:
+        multi_fit = engine_module(engine).fit_model
 
         with connect_readonly(store.path) as c:
             frr = [
@@ -411,12 +403,12 @@ class ResearchJobs:
         if resume:
             engine = previous.get("engine", engine)
             kind = previous.get("kind", kind)
-        if engine not in (ENGINE, MULTI_ENGINE):
-            raise ValueError("请选择 V4.0 或 V4.1 研究引擎")
+        if engine not in REGISTRY:
+            raise ValueError("请选择 V4.0、V4.1 或 V4.2 研究引擎")
         if kind not in ("evaluate", "shadow", "prepare"):
             raise ValueError("unknown research task")
-        if kind == "prepare" and engine != MULTI_ENGINE:
-            raise ValueError("快速准备只适用于 V4.1，请显式选择 V4.1 引擎")
+        if kind == "prepare" and engine == ENGINE:
+            raise ValueError("快速准备只适用于 V4.1 或 V4.2，请显式选择引擎")
         with self.lock:
             current = self.tasks.get(currency, {})
             if current.get("state") == "RUNNING":
@@ -500,7 +492,7 @@ class ResearchJobs:
                             int(self.clock() * 1000),
                             stop.is_set,
                             engine=engine,
-                            allow_frr_reference=engine == MULTI_ENGINE,
+                            allow_frr_reference=engine != ENGINE,
                         )
                         repo.save(candidate)
                     self._shadow(store, candidate, repo)
@@ -618,12 +610,8 @@ class ResearchJobs:
             if sample is None or book is None or now - book["mts"] > 60000 or now - sample["mts"] > 60000:
                 repo.journal({"atMs": now, "mode": "SHADOW", "reason": "ACCOUNT_OR_MARKET_STALE"})
                 return
-            if model["algorithm"] == MULTI_VERSION:
-                from StrategyV41 import template
-
-                policy = template(strategy_v3_from_record(store.strategy("ACTIVE")))
-            else:
-                policy = adaptive_template(strategy_v3_from_record(store.strategy("ACTIVE")))
+            engine = algorithm_engine(model["algorithm"])
+            policy = template_for(engine, strategy_v3_from_record(store.strategy("ACTIVE")))
             policy = replace(policy, model_id=model["id"])
             offers = [dict(r) for r in c.execute("SELECT * FROM offers WHERE status='ACTIVE'")]
             credits = [dict(r) for r in c.execute("SELECT * FROM credits WHERE status='ACTIVE'")]
@@ -651,8 +639,8 @@ class ResearchJobs:
 
         raw = json.loads(book["book_json"])
         normalized = raw if not raw or isinstance(raw[0], dict) else parse_book(raw)
-        if policy.strategy_engine == MULTI_ENGINE:
-            from StrategyV41 import build_plan as multi_plan
+        if policy.strategy_engine != ENGINE:
+            multi_plan = engine_module(policy.strategy_engine).build_plan
             from decimal import Decimal as D
 
             frr = D(stat["frr_daily_rate"]) if stat and now - stat["mts"] <= policy.rest_stale_seconds * 1000 else None

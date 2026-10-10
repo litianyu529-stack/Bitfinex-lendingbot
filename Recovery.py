@@ -62,6 +62,8 @@ def recovery_category_for_reason(reason: str) -> str | None:
     value = str(reason or "")
     if value == "MARKET_DATA_STALE":
         return "MARKET_DATA"
+    if value == "ADAPTIVE_FRR_STALE":
+        return "ADAPTIVE_FRR_STALE"
     if value in {"ACCOUNT_AVAILABLE_BALANCE_UNKNOWN", "ACCOUNT_RECONCILIATION_MISMATCH"}:
         return "ACCOUNT_DATA"
     if value == "AMBIGUOUS_WALLET_TRANSFER":
@@ -71,3 +73,11 @@ def recovery_category_for_reason(reason: str) -> str | None:
     if value == "WORKER_BUILD_MISMATCH_UNVERIFIED":
         return "WORKER_BUILD"
     return None
+
+
+def resume_target(runtime, recovery):
+    """An inactive recovery's diagnostics never authorize a new resume target."""
+    target = recovery.get("targetMode") if recovery.get("active") else None
+    if target not in {"LIVE", "PAUSED", "REPLAY"}:
+        target = runtime.get("previous_mode") if runtime.get("safe_reason") else runtime.get("mode")
+    return target if target in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
