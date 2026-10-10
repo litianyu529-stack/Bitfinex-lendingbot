@@ -89,7 +89,7 @@ def fixture(tmp_path, monkeypatch, currency="USD"):
     return runtime, snapshot, account, model, clock, cancels
 
 
-def offer(runtime, snapshot, amount=150, rate=".00021", kind="LIMIT"):
+def offer(runtime, snapshot, amount=150, rate=".00021", kind="LIMIT", account=None):
     version = runtime.store.strategy("ACTIVE")["version_id"]
     row = dict(
         id=10,
@@ -116,6 +116,8 @@ def offer(runtime, snapshot, amount=150, rate=".00021", kind="LIMIT"):
     runtime.store.confirm_intent(intent["id"], 10)
     runtime.store.reconcile_offers([row], NOW)
     snapshot["offers"] = [row]
+    if account is not None:
+        account["managedOffers"] = snapshot["offers"]
     return row
 
 
@@ -160,7 +162,7 @@ def test_015_usdt_does_not_create_unexecutable_offer(tmp_path, monkeypatch):
 
 def test_waiting_orders_reprice_after_two_stable_confirmations_not_immediately(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
-    offer(runtime, snap)
+    offer(runtime, snap, account=account)
     account["wallet"] = D(0)
     first = integration.cycle(runtime, snap, account, {}, NOW, False)
     assert first["decisions"][0]["reason"] == "VALUE_GAIN" and cancels == []
@@ -174,7 +176,7 @@ def test_waiting_orders_reprice_after_two_stable_confirmations_not_immediately(t
 
 def test_dynamic_effective_frr_does_not_reset_executable_confirmation(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
-    offer(runtime, snap)
+    offer(runtime, snap, account=account)
     account["wallet"] = D(0)
     targets = []
 
@@ -202,7 +204,7 @@ def test_dynamic_effective_frr_does_not_reset_executable_confirmation(tmp_path, 
 
 def test_partial_quantity_change_resets_confirmation_and_hourly_budget_blocks(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
-    row = offer(runtime, snap, amount=183)
+    row = offer(runtime, snap, amount=183, account=account)
     account["wallet"] = D(0)
     integration.cycle(runtime, snap, account, {}, NOW, False)
     row["amount"] = D(150)
@@ -247,7 +249,7 @@ def test_journal_failure_never_calls_exchange(tmp_path, monkeypatch):
 
 def test_passive_expiry_cancel_barrier_returns_cash_without_unrelated_chain(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
-    row = offer(runtime, snap, rate=".0002")
+    row = offer(runtime, snap, rate=".0002", account=account)
     account["wallet"] = D(0)
     state = PassiveState(runtime.store)
     planrow = dict(
@@ -268,6 +270,7 @@ def test_passive_expiry_cancel_barrier_returns_cash_without_unrelated_chain(tmp_
     result = integration.cycle(runtime, snap, account, {}, NOW, False)
     assert cancels == [10] and result["decisions"][0]["reason"] == "LEASE_EXPIRED"
     snap["offers"] = []
+    account["managedOffers"] = []
     runtime.store.reconcile_offers([], NOW + 60000)
     advance(runtime, snap, clock)
     integration.cycle(runtime, snap, account, {}, clock[0], False)
@@ -311,7 +314,7 @@ def test_registry_models_and_old_engine_defaults_remain_isolated(tmp_path, monke
 
 def test_cancel_prepared_but_never_sent_is_restored_without_stalling(tmp_path, monkeypatch):
     runtime, snap, account, _, _, cancels = fixture(tmp_path, monkeypatch)
-    row = offer(runtime, snap)
+    row = offer(runtime, snap, account=account)
     version = runtime.store.strategy("ACTIVE")["version_id"]
     chain = runtime.store.ensure_reprice_chain(row, version, NOW)
     state = PassiveState(runtime.store)
@@ -324,7 +327,7 @@ def test_cancel_prepared_but_never_sent_is_restored_without_stalling(tmp_path, m
 
 def test_unknown_cancel_needs_repeated_account_reads_before_retry(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch)
-    offer(runtime, snap)
+    offer(runtime, snap, account=account)
     account["wallet"] = D(0)
     runtime.client.cancel_funding_offer_result = lambda *_: WriteResult(WriteOutcome.UNKNOWN, error="timeout")
     integration.cycle(runtime, snap, account, {}, NOW, False)
@@ -344,12 +347,13 @@ def test_unknown_cancel_needs_repeated_account_reads_before_retry(tmp_path, monk
 
 def test_confirmed_replacement_receipt_binds_after_crash_without_resubmitting(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch)
-    offer(runtime, snap)
+    offer(runtime, snap, account=account)
     account["wallet"] = D(0)
     integration.cycle(runtime, snap, account, {}, NOW, False)
     advance(runtime, snap, clock)
     integration.cycle(runtime, snap, account, {}, clock[0], False)
     snap["offers"] = []
+    account["managedOffers"] = []
     advance(runtime, snap, clock)
     runtime.store.reconcile_offers([], clock[0])
     account["wallet"] = D(150)
@@ -365,6 +369,7 @@ def test_confirmed_replacement_receipt_binds_after_crash_without_resubmitting(tm
     snap["offers"] = [
         dict(id=oid, period=2, amount=D(150), rate=D(".0002"), offer_type="LIMIT", managed=True, mts_created=clock[0])
     ]
+    account["managedOffers"] = snap["offers"]
     account["wallet"] = D(0)
     advance(runtime, snap, clock)
     result = integration.cycle(runtime, snap, account, {}, clock[0], False)
@@ -418,7 +423,7 @@ def test_lease_absence_requires_two_views_and_promote_releases_passive_budget(tm
 
 def test_cancel_time_fill_reduces_chain_cash_even_with_other_wallet_funds(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch)
-    row = offer(runtime, snap, amount=183)
+    row = offer(runtime, snap, amount=183, account=account)
     version = runtime.store.strategy("ACTIVE")["version_id"]
     chain = runtime.store.ensure_reprice_chain(row, version, NOW)
     state = PassiveState(runtime.store)
@@ -439,6 +444,7 @@ def test_cancel_time_fill_reduces_chain_cash_even_with_other_wallet_funds(tmp_pa
     )
     runtime.store.reconcile_offers([], NOW + 60000)
     snap["offers"] = []
+    account["managedOffers"] = []
     advance(runtime, snap, clock)
     account["wallet"] = D(313)  # includes cash unrelated to this source
     result = integration.cycle(runtime, snap, account, {}, clock[0], False)
@@ -477,3 +483,231 @@ def test_preflight_planning_uses_existing_private_passive_budget_and_stale_views
     ctx = integration.context(runtime.store, runtime.policy, snap["book"], snap["trades"], clock[0], runtime._stats)
     assert ctx["passiveStateError"]
     assert integration.plan(account, runtime.policy, {"adaptiveContext": ctx}, "preview")["blockReasons"]
+
+
+def incomplete_plan(account, policy, *_args):
+    return {
+        **core._base_result(account, policy),
+        "empty_reason": "VALUATION_INCOMPLETE",
+        "blockReasons": ["VALUATION_INCOMPLETE: computation budget exhausted"],
+    }
+
+
+def test_incomplete_valuation_blocks_only_this_cycle_and_retries_at_normal_interval(tmp_path, monkeypatch):
+    runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
+    calls = []
+
+    def bounded(*args):
+        calls.append(1)
+        return incomplete_plan(*args)
+
+    monkeypatch.setattr(core, "build_plan", bounded)
+    first = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert first["empty_reason"] == "VALUATION_INCOMPLETE" and first["blockReasons"]
+    assert not first["submitted"] and not first["plan"] and cancels == [] and runtime.client.calls == 0
+    assert runtime.store.runtime()["mode"] == "LIVE" and runtime.store.runtime()["safe_reason"] is None
+    clock[0] += 1000
+    second = integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert second["evaluationSkipped"] and second["plan"] == [] and calls == [1]
+    advance(runtime, snap, clock)
+    integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert calls == [1, 1] and runtime.store.runtime()["mode"] == "LIVE"
+
+
+def test_evaluation_interval_is_checked_before_full_plan_and_never_reuses_old_quotes(tmp_path, monkeypatch):
+    runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch)
+    calls = []
+
+    def empty(*args):
+        calls.append(1)
+        return {**core._base_result(args[0], args[1]), "empty_reason": "WAIT_FOR_VALUE"}
+
+    monkeypatch.setattr(core, "build_plan", empty)
+    integration.cycle(runtime, snap, account, {}, NOW, False)
+    runtime._adaptive_last_decisions = [{"action": "SUBMIT", "reason": "old executable quote"}]
+    clock[0] += 1000
+    skipped = integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert calls == [1] and skipped["plan"] == [] and skipped["submitted"] == []
+    assert skipped["decisions"] == [{"action": "WAIT", "reason": "EVALUATION_INTERVAL"}]
+    assert runtime.client.calls == 0
+
+
+@pytest.mark.parametrize("paused,resume", [(True, False), (False, True)])
+def test_paused_or_first_recovery_cycle_does_not_run_full_valuation(tmp_path, monkeypatch, paused, resume):
+    runtime, snap, account, _, _, _ = fixture(tmp_path, monkeypatch)
+    if paused:
+        runtime.store.pause_currency()
+    monkeypatch.setattr(core, "build_plan", lambda *_args: pytest.fail("no full valuation"))
+    result = integration.cycle(runtime, snap, account, {}, NOW, resume)
+    assert result["plan"] == [] and result["submitted"] == [] and result["recoveryResumeBarrier"] == resume
+    assert result["empty_reason"] == ("PAUSED" if paused else "RECOVERY_RESUME_BARRIER")
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("model", "ADAPTIVE_MODEL_NOT_QUALIFIED"),
+    ("frr", "ADAPTIVE_FRR_STALE"),
+    ("market", "MARKET_DATA_STALE"),
+])
+def test_interval_cannot_hide_real_model_or_market_failure(tmp_path, monkeypatch, failure, reason):
+    runtime, snap, account, _, _, _ = fixture(tmp_path, monkeypatch)
+    runtime._adaptive_at = NOW
+    if failure == "model":
+        runtime.policy = replace(runtime.policy, model_id="e" * 64)
+    elif failure == "frr":
+        runtime._stats[0]["mts"] = NOW - 61000
+    else:
+        snap["bookMts"] = NOW - 61000
+    monkeypatch.setattr(core, "build_plan", lambda *_args: pytest.fail("no full valuation"))
+    result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert result["blockReasons"] and not result["submitted"]
+    assert runtime.store.runtime()["safe_reason"] == reason
+
+
+def test_non_budget_model_error_remains_a_protected_pause(tmp_path, monkeypatch):
+    runtime, snap, account, _, _, _ = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(core, "build_plan", lambda *args: {
+        **core._base_result(args[0], args[1]),
+        "empty_reason": "MODEL_OR_DATA_UNAVAILABLE", "blockReasons": ["invalid future feature"],
+    })
+    integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert runtime.store.runtime()["safe_reason"] == "ADAPTIVE_DATA_UNAVAILABLE" and runtime.client.calls == 0
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_budget_failure_keeps_independent_floor_and_lease_safety_exits(tmp_path, monkeypatch, expired):
+    runtime, snap, account, _, _, cancels = fixture(tmp_path, monkeypatch)
+    row = offer(runtime, snap, rate=".0002" if expired else ".000001", account=account)
+    account["wallet"] = D(0)
+    if expired:
+        state = PassiveState(runtime.store)
+        lease = state.prepare(
+            {**row, "slice_index": 0}, "lease", runtime.store.strategy("ACTIVE")["version_id"],
+            NOW - 3600000, runtime.policy,
+        )
+        lease.update(offerId=10, status="ACTIVE")
+        state.persist()
+    runtime._adaptive_at = NOW
+    monkeypatch.setattr(core, "build_plan", incomplete_plan)
+    result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert result["canceledForReprice"] == [10] and cancels == [10] and not result["submitted"]
+    assert result["decisions"][0]["reason"] == ("LEASE_EXPIRED" if expired else "HARD_FLOOR")
+    assert runtime.store.runtime()["mode"] == "LIVE" and runtime.store.runtime()["safe_reason"] is None
+
+
+@pytest.mark.parametrize("phase", ["PREPARED", "SENDING"])
+def test_interval_preserves_pending_cancel_checks_before_valuation(tmp_path, monkeypatch, phase):
+    runtime, snap, account, _, _, cancels = fixture(tmp_path, monkeypatch)
+    row = offer(runtime, snap, account=account)
+    version = runtime.store.strategy("ACTIVE")["version_id"]
+    chain = runtime.store.ensure_reprice_chain(row, version, NOW)
+    state = PassiveState(runtime.store)
+    state.target(chain["chain_key"], dict(period=2, submitted_rate=".0002", offer_type="LIMIT"), NOW, NOW)
+    state.cancel_phase(chain["chain_key"], phase)
+    runtime.store.mark_reprice_pending(chain["chain_key"], core.ENGINE, D(".0002"), now_ms=NOW, source_offer_id=10)
+    runtime._adaptive_at = NOW
+    monkeypatch.setattr(core, "build_plan", lambda *_args: pytest.fail("no full valuation"))
+    result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert not result["submitted"] and cancels == [] and runtime.client.calls == 0
+    if phase == "PREPARED":
+        assert result["decisions"][0]["reason"] == "CANCEL_NOT_EFFECTIVE"
+    else:
+        assert runtime.store.runtime()["safe_reason"] == "AMBIGUOUS_CANCEL:10"
+
+
+def test_one_currency_budget_failure_does_not_change_other_currency_execution(tmp_path, monkeypatch):
+    usd, usd_snap, usd_account, _, _, _ = fixture(tmp_path, monkeypatch, "USD")
+    usdt, usdt_snap, usdt_account, _, _, _ = fixture(tmp_path, monkeypatch, "USDT")
+    original = core.build_plan
+    monkeypatch.setattr(
+        core, "build_plan",
+        lambda *args: incomplete_plan(*args) if args[1].currency == "USDT" else original(*args),
+    )
+    failed = integration.cycle(usdt, usdt_snap, usdt_account, {}, NOW, False)
+    success = integration.cycle(usd, usd_snap, usd_account, {}, NOW, False)
+    assert failed["empty_reason"] == "VALUATION_INCOMPLETE" and not failed["submitted"]
+    assert len(success["submitted"]) == 1 and usd.client.calls == 1
+    assert usd.store.runtime()["mode"] == usdt.store.runtime()["mode"] == "LIVE"
+
+
+@pytest.mark.parametrize("level", ["plan", "adjustment"])
+def test_incomplete_evaluation_breaks_consecutive_reprice_confirmations(tmp_path, monkeypatch, level):
+    runtime, snap, account, _, clock, cancels = fixture(tmp_path, monkeypatch)
+    offer(runtime, snap, account=account)
+    account["wallet"] = D(0)
+    phase = ["complete"]
+
+    def planned(*args):
+        if phase[0] == "incomplete" and level == "plan":
+            return incomplete_plan(*args)
+        return {**core._base_result(args[0], args[1]), "empty_reason": "WAIT_FOR_VALUE"}
+
+    def adjusted(*_args):
+        if phase[0] == "incomplete" and level == "adjustment":
+            return {"action": "KEEP", "reason": "VALUATION_INCOMPLETE", "blockReasons": ["budget exhausted"]}
+        return {
+            "action": "CANCEL", "reason": "VALUE_GAIN", "hard": False,
+            "targetType": "LIMIT", "targetPeriod": 2, "targetRate": D(".0002"),
+        }
+
+    monkeypatch.setattr(core, "build_plan", planned)
+    monkeypatch.setattr(core, "adjustment", adjusted)
+    integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert runtime._adaptive_confirmations[10]["count"] == 1 and not cancels
+    phase[0] = "incomplete"
+    advance(runtime, snap, clock)
+    integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert runtime._adaptive_confirmations == {} and not cancels
+    phase[0] = "complete"
+    advance(runtime, snap, clock)
+    integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert runtime._adaptive_confirmations[10]["count"] == 1 and not cancels
+    advance(runtime, snap, clock)
+    integration.cycle(runtime, snap, account, {}, clock[0], False)
+    assert cancels == [10]
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_adjustment_budget_failure_does_not_skip_later_safety_exit(tmp_path, monkeypatch, expired):
+    runtime, snap, account, _, _, cancels = fixture(tmp_path, monkeypatch)
+    first = offer(runtime, snap, account=account)
+    second = {**first, "id": 11, "rate": D(".0002" if expired else ".000001")}
+    second.update(submitted_rate=second["rate"], effective_rate=second["rate"], rate_real=second["rate"])
+    version = runtime.store.strategy("ACTIVE")["version_id"]
+    _, intent = runtime.store.reserve_intent(
+        {**second, "strategy_version": version, "slice_key": "second:short:balanced:0"}, D(1000)
+    )
+    runtime.store.confirm_intent(intent["id"], 11)
+    snap["offers"] = [first, second]
+    runtime.store.reconcile_offers(snap["offers"], NOW)
+    account.update(wallet=D(0), managedOffers=snap["offers"])
+    if expired:
+        state = PassiveState(runtime.store)
+        lease = state.prepare({**second, "slice_index": 1}, "lease", version, NOW - 3600000, runtime.policy)
+        lease.update(offerId=11, status="ACTIVE")
+        state.persist()
+    monkeypatch.setattr(core, "build_plan", lambda *args: core._base_result(args[0], args[1]))
+    checks = []
+
+    def adjusted(_policy, _model, row, *_args):
+        checks.append(row["id"])
+        return {"action": "KEEP", "reason": "VALUATION_INCOMPLETE", "blockReasons": ["budget exhausted"]}
+
+    monkeypatch.setattr(core, "adjustment", adjusted)
+    runtime._adaptive_confirmations = {999: {"count": 1}}
+    result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert checks == [10] and cancels == [11] and result["canceledForReprice"] == [11]
+    assert not result["submitted"] and runtime._adaptive_confirmations == {}
+    assert result["decisions"][-1]["reason"] == ("LEASE_EXPIRED" if expired else "HARD_FLOOR")
+    assert runtime.store.runtime()["mode"] == "LIVE" and runtime.store.runtime()["safe_reason"] is None
+
+
+def test_non_budget_adjustment_failure_keeps_protection(tmp_path, monkeypatch):
+    runtime, snap, account, _, _, cancels = fixture(tmp_path, monkeypatch)
+    offer(runtime, snap, account=account)
+    monkeypatch.setattr(core, "build_plan", lambda *args: core._base_result(args[0], args[1]))
+    monkeypatch.setattr(core, "adjustment", lambda *_args: {
+        "action": "KEEP", "reason": "MODEL_OR_DATA_UNAVAILABLE", "blockReasons": ["invalid future model"],
+    })
+    result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    assert not result["submitted"] and not cancels
+    assert runtime.store.runtime()["safe_reason"] == "ADAPTIVE_DATA_UNAVAILABLE"

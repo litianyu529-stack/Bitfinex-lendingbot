@@ -567,10 +567,14 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             current_frr is None or current_frr <= 0 or len(model.get("frrDays", [])) < 20
         ):
             raise ValueError("V4.2需要新鲜FRR及至少20天真实FRR历史")
-        market = base.CandidateMarket(trades, now_ms)
-        market.deadline = time.monotonic() + VALUATION_BUDGET_SECONDS
         minimum, budget = funding_minimum(), result["cap_limited_available"]
-        units = demand_units(book, trades, now_ms)
+        # Keep validating the frozen model even when no legal new order fits.
+        # Existing managed orders still need candidates for their repricing.
+        needs_valuation = budget >= minimum or bool(account.get("managedOffers"))
+        market = base.CandidateMarket(trades, now_ms) if needs_valuation else None
+        if market is not None:
+            market.deadline = time.monotonic() + VALUATION_BUDGET_SECONDS
+        units = demand_units(book, trades, now_ms) if needs_valuation else []
         terms = sorted(
             (
                 {
@@ -581,8 +585,8 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             )
             & set(range(2, policy.maximum_period + 1))
         )
-        candidates = []
-        for term in terms:
+        candidates, valued_quotes = [], set()
+        for term in terms if needs_valuation else []:
             rates = {
                 base.gross_floor(policy, term),
                 *(market.reference(term, 7 * base.DAY, q) for q in (0.25, 0.5, 0.75, 0.9)),
@@ -593,6 +597,10 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             )
             for rate in sorted({ceil_rate_tick(r) for r in rates if r >= base.gross_floor(policy, term)}):
                 for quote in previous.quotes(policy, term, rate, current_frr):
+                    quote_identity = (term, quote["display_type"], quote["submitted_rate"])
+                    if quote_identity in valued_quotes:
+                        continue
+                    valued_quotes.add(quote_identity)
                     eligible = _compatible_units(quote["display_type"], term, quote["rate"], units)
                     known = any(compatibility(quote["display_type"], r) == "KNOWN" for r in eligible)
                     calibrated = model.get("typeObservationCounts", {}).get(quote["display_type"], 0) >= 20

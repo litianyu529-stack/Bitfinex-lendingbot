@@ -130,7 +130,7 @@ def _fresh_before_write(runtime, snapshot, fallback_now):
         now,
         getattr(runtime, "_stats", ()),
     )
-    if not ctx.get("operationalReady"):
+    if not ctx.get("model") or not ctx.get("operationalReady"):
         runtime.store.enter_protected_pause("ADAPTIVE_MODEL_NOT_QUALIFIED")
         return False
     if ctx.get("passiveStateError"):
@@ -229,16 +229,18 @@ def _cycle_v42(runtime, snapshot, account, now, resume_barrier):
         ):
             leases.reconcile(snapshot["offers"], now)
         account = leases.augment(account)
-        result.update(plan(account, policy, {"adaptiveContext": ctx}, version))
+        # A skipped evaluation exposes current balances and readiness, with no
+        # executable cached plan. Model/freshness and durable cancel barriers
+        # remain checked before the expensive 120-day valuation.
+        result.update(core._base_result(account, policy))
+        result.update({k: ctx.get(k) for k in ("operationalReady", "operationalReportHash", "operationalBlockReasons")})
+        result["plan_hash"] = digest({"currency": policy.currency, "version": version, "account": account, "plan": []})
         if store.runtime()["mode"] != "LIVE" or resume_barrier:
             result["recoveryResumeBarrier"] = bool(resume_barrier)
+            result["empty_reason"] = "RECOVERY_RESUME_BARRIER" if resume_barrier else "PAUSED"
             return result
-        if not ctx["operationalReady"]:
-            result["blockReasons"] = ctx["operationalBlockReasons"]
-            store.enter_protected_pause("ADAPTIVE_MODEL_NOT_QUALIFIED")
-            return result
-        if result.get("blockReasons"):
-            store.enter_protected_pause("ADAPTIVE_FRR_STALE" if ctx["frr"] is None else "ADAPTIVE_DATA_UNAVAILABLE")
+        if not _fresh_before_write(runtime, snapshot, now):
+            result["blockReasons"] = ctx.get("operationalBlockReasons") or ["模型或行情未通过当前安全检查"]
             return result
         pending = store.pending_reprices(version)
         active_ids = {int(o.get("offer_id", o.get("id"))) for o in snapshot["offers"]}
@@ -269,14 +271,77 @@ def _cycle_v42(runtime, snapshot, account, now, resume_barrier):
                 store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{oid}")
             result["blockReasons"] = ["等待账户确认撤单，禁止提交替代单"]
             return result
+        cap_excess = max(D(0), result["existing_exposure"] - result["funding_cap"])
+        long_excess = max(
+            D(0),
+            sum((D(v) for p, v in account.get("exposureByPeriod", {}).items() if int(p) >= policy.long_from_days), D(0))
+            - D(account["total"]) * policy.long_max_share / 100,
+        )
+        floating_excess = max(
+            D(0),
+            D(account.get("existingExposure", {}).get("variable", 0))
+            - D(account["total"]) * policy.variable_max_share / 100,
+        )
+        from StrategyV41 import enabled
+
+        safety = {}
+        expired_leases = set()
+        for original in snapshot["offers"]:
+            if not original.get("managed"):
+                continue
+            oid = int(original.get("offer_id", original.get("id")))
+            term, kind = int(original["period"]), display_type(original)
+            raw = D(str(original.get("submitted_rate", original.get("rate", 0))))
+            rate = raw if kind == "LIMIT" else ctx["frr"] + raw
+            if (
+                not enabled(policy, kind)
+                or rate < gross_floor(policy, term)
+                or not 2 <= term <= policy.maximum_period
+                or int(original.get("flags", 0))
+            ):
+                safety[oid] = {"action": "CANCEL", "hard": True, "reason": "HARD_FLOOR"}
+            if (
+                cap_excess > 0
+                or long_excess > 0 and term >= policy.long_from_days
+                or floating_excess > 0 and original["offer_type"] == "FRRDELTAVAR"
+            ):
+                safety[oid] = {"action": "CANCEL", "hard": True, "reason": "CAP_EXCEEDED"}
+                quantity = D(original["amount"])
+                cap_excess = max(D(0), cap_excess - quantity)
+                long_excess = max(D(0), long_excess - quantity) if term >= policy.long_from_days else long_excess
+                floating_excess = (
+                    max(D(0), floating_excess - quantity)
+                    if original["offer_type"] == "FRRDELTAVAR" else floating_excess
+                )
+            lease = leases.lease_for(oid)
+            if lease and now >= int(lease["expiresAtMs"]):
+                expired_leases.add(oid)
         signature = digest({"account": account, "book": snapshot["book"], "trades": snapshot["trades"]})
         last = getattr(runtime, "_adaptive_at", 0)
-        if now - last < (60000 if signature == getattr(runtime, "_adaptive_signature", None) else 10000):
-            result["decisions"] = getattr(runtime, "_adaptive_last_decisions", []) or [
-                {"action": "WAIT", "reason": "EVALUATION_INTERVAL"}
-            ]
+        interval = 60000 if signature == getattr(runtime, "_adaptive_signature", None) else 10000
+        if now - last < interval and not (safety or expired_leases or pending):
+            result.update(
+                empty_reason="EVALUATION_INTERVAL", evaluationSkipped=True, nextEvaluationAtMs=last + interval,
+                decisions=[{"action": "WAIT", "reason": "EVALUATION_INTERVAL"}],
+            )
+            if getattr(runtime, "_adaptive_last_block_reasons", None):
+                result["blockReasons"] = runtime._adaptive_last_block_reasons
             return result
         runtime._adaptive_at, runtime._adaptive_signature = now, signature
+        result.update(plan(account, policy, {"adaptiveContext": ctx}, version))
+        incomplete = result.get("empty_reason") == "VALUATION_INCOMPLETE"
+        runtime._adaptive_last_block_reasons = result.get("blockReasons", [])
+        if result.get("blockReasons"):
+            if not incomplete:
+                store.enter_protected_pause("ADAPTIVE_FRR_STALE" if ctx["frr"] is None else "ADAPTIVE_DATA_UNAVAILABLE")
+                return result
+            # A bounded calculation is neither a corrupt model nor evidence for
+            # an executable quote. Retry later; only independent safety exits
+            # may cancel existing offers back to cash during this cycle.
+            result.update(plan=[], candidates=[], planned_amount=D(0), idle_amount=D(account["wallet"]))
+            runtime._adaptive_confirmations = {}
+            if not (safety or expired_leases):
+                return result
         confirmations = getattr(runtime, "_adaptive_confirmations", {})
         runtime._adaptive_confirmations = confirmations
         repo = ModelRepository(store.path, policy.currency)
@@ -302,17 +367,6 @@ def _cycle_v42(runtime, snapshot, account, now, resume_barrier):
         import time
 
         market.deadline = time.monotonic() + core.VALUATION_BUDGET_SECONDS
-        cap_excess = max(D(0), result["existing_exposure"] - result["funding_cap"])
-        long_excess = max(
-            D(0),
-            sum((D(v) for p, v in account.get("exposureByPeriod", {}).items() if int(p) >= policy.long_from_days), D(0))
-            - D(account["total"]) * policy.long_max_share / 100,
-        )
-        floating_excess = max(
-            D(0),
-            D(account.get("existingExposure", {}).get("variable", 0))
-            - D(account["total"]) * policy.variable_max_share / 100,
-        )
         for original in snapshot["offers"]:
             offer = dict(original)
             oid = int(offer.get("offer_id", offer.get("id")))
@@ -331,30 +385,32 @@ def _cycle_v42(runtime, snapshot, account, now, resume_barrier):
                     else ctx["frr"] + quote["submitted_rate"]
                 )
                 candidates = [quote] if quote["rate"] >= gross_floor(policy, quote["period"]) else []
-            decision = core.adjustment(
-                policy, ctx["model"], offer, candidates, snapshot["trades"], snapshot["book"], now, ctx["frr"], market
-            )
+            decision = safety.get(oid)
+            if decision is None and incomplete:
+                decision = (
+                    {"action": "CANCEL", "hard": True, "reason": "LEASE_EXPIRED"}
+                    if oid in expired_leases else {"action": "KEEP", "reason": "VALUATION_INCOMPLETE"}
+                )
+            if decision is None:
+                decision = core.adjustment(
+                    policy, ctx["model"], offer, candidates,
+                    snapshot["trades"], snapshot["book"], now, ctx["frr"], market,
+                )
             if decision.get("blockReasons"):
                 result["blockReasons"] = decision["blockReasons"]
-                return result
-            if offer.get("managed") and (
-                cap_excess > 0
-                or long_excess > 0
-                and int(offer["period"]) >= policy.long_from_days
-                or floating_excess > 0
-                and offer["offer_type"] == "FRRDELTAVAR"
-            ):
-                decision = {"action": "CANCEL", "hard": True, "reason": "CAP_EXCEEDED"}
-                cap_excess = max(D(0), cap_excess - D(offer["amount"]))
-                long_excess = (
-                    max(D(0), long_excess - D(offer["amount"]))
-                    if int(offer["period"]) >= policy.long_from_days
-                    else long_excess
+                confirmations.clear()
+                if decision.get("reason") != "VALUATION_INCOMPLETE":
+                    store.enter_protected_pause("ADAPTIVE_DATA_UNAVAILABLE")
+                    return result
+                incomplete = True
+                runtime._adaptive_last_block_reasons = decision["blockReasons"]
+                result.update(
+                    plan=[], candidates=[], planned_amount=D(0), idle_amount=D(account["wallet"]),
+                    empty_reason="VALUATION_INCOMPLETE",
                 )
-                floating_excess = (
-                    max(D(0), floating_excess - D(offer["amount"]))
-                    if offer["offer_type"] == "FRRDELTAVAR"
-                    else floating_excess
+                decision = (
+                    {"action": "CANCEL", "hard": True, "reason": "LEASE_EXPIRED"}
+                    if oid in expired_leases else {"action": "KEEP", "reason": "VALUATION_INCOMPLETE"}
                 )
             decision["offerId"] = oid
             chain = store.reprice_chain_for_offer(oid)
@@ -476,7 +532,7 @@ def _cycle_v42(runtime, snapshot, account, now, resume_barrier):
             runtime._pending_cancel_requested.add(oid)
             result["canceledForReprice"].append(oid)
         runtime._adaptive_last_decisions = result["decisions"]
-        if result["canceledForReprice"]:
+        if result["canceledForReprice"] or incomplete:
             return result
         if pending:
             # Safe lease expiry returns to cash. Never bind an unrelated later
