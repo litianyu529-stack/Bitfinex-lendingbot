@@ -1,6 +1,7 @@
 """Mock exchange regressions for durable V4.2 decision/execution barriers."""
 
 import json
+import configparser
 from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
@@ -20,6 +21,31 @@ from StateStore import LendingStateStore
 from StrategyV3 import StrategyPolicyV3, json_decimal
 
 NOW = 1900000000000
+
+
+@pytest.mark.parametrize("adoption", [False, True])
+def test_v42_adoption_choice_roundtrips_api_and_config_without_inheriting_legacy(adoption):
+    from Configuration import (
+        strategy_v3_api_values,
+        strategy_v3_from_api_payload,
+        strategy_v3_config_values,
+        strategy_v3_from_config,
+        strategy_v3_from_record,
+    )
+    from StrategyV3 import policy_v3_with_overrides
+
+    legacy = replace(core.template(StrategyPolicyV3()), strategy_engine="legacy_v3")
+    intended = replace(core.template(legacy), adopt_external_offers=adoption)
+    restored = strategy_v3_from_api_payload(strategy_v3_api_values(intended), base=legacy)
+    assert restored.adopt_external_offers is adoption
+    config = configparser.ConfigParser()
+    config["STRATEGY_V3"] = strategy_v3_config_values(restored)
+    assert strategy_v3_from_config(config, base=legacy).adopt_external_offers is adoption
+    assert not strategy_v3_from_api_payload({"strategy_engine": core.ENGINE}, base=legacy).adopt_external_offers
+    assert not policy_v3_with_overrides(legacy, {"strategy_engine": core.ENGINE}).adopt_external_offers
+    # Existing old-engine fixed behavior and persisted V4.2 choices remain readable.
+    assert strategy_v3_from_api_payload({"adopt_external_offers": False}, base=legacy).adopt_external_offers
+    assert strategy_v3_from_record({"policy": json_decimal(restored.__dict__)}).adopt_external_offers is adoption
 
 
 def fixture(tmp_path, monkeypatch, currency="USD"):

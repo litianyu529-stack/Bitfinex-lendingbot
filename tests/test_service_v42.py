@@ -1,6 +1,7 @@
 """Dashboard integration uses local stores and fake Workers exclusively."""
 
 import datetime
+import copy
 import json
 from dataclasses import replace
 from decimal import Decimal as D
@@ -237,3 +238,75 @@ def test_v42_worker_polls_events_every_ten_seconds_with_fake_coordinator(tmp_pat
     assert V4Service.run_worker(args, settings, context, Logger(context.status_path, 20)) == 0
     assert durations == [10] and not client.submissions
     assert stores["USD"].runtime()["mode"] == "PAUSED"
+
+
+def prepared_adoption_start(tmp_path, monkeypatch, adopt=False):
+    service, settings, stores, context, client = fixture_service(tmp_path)
+    store = stores["USD"]
+    policy = replace(template_for("adaptive_net_yield_v3", settings.policies["USD"]), adopt_external_offers=adopt)
+    version = store.save_strategy(json_decimal(policy.__dict__), "ACTIVE")
+    external = {
+        "id": 901, "currency": "USD", "amount": D(150), "rate": D(".0002"),
+        "period": 2, "offer_type": "LIMIT", "flags": 0, "status": "ACTIVE", "managed": False,
+    }
+    other = {**external, "id": 902}
+    store.reconcile_offers([external, other], client.now)
+    summary = {
+        "activeStrategyVersion": version, "policyHash": "unchanged", "accountDigest": "unchanged",
+        "externalAdoptionCandidates": json_decimal([external]) if adopt else [],
+    }
+    summary["externalAdoptionDigest"] = lendingbot._canonical_sha256(summary["externalAdoptionCandidates"])
+    refreshed = {"canStart": True, "profiles": {"USD": {"summary": summary}}}
+    service.tokens["confirmed"] = {
+        "expires": context.now() + 60, "currencies": ("USD",),
+        "digest": lendingbot.config_sha256(service.config_path), "build": lendingbot.worker_build_id(),
+        "profiles": copy.deepcopy(refreshed["profiles"]),
+    }
+    monkeypatch.setattr(service, "preflight", lambda *_args, **_kwargs: refreshed)
+    launches = []
+    monkeypatch.setattr(service, "_launch", lambda selected: launches.append(selected) or {"running": True})
+    return service, store, external, other, refreshed, launches
+
+
+def test_v42_default_start_does_not_adopt_external_ids(tmp_path, monkeypatch):
+    service, store, _, _, _, launches = prepared_adoption_start(tmp_path, monkeypatch)
+    assert service.start("confirmed", ["USD"])["running"]
+    assert launches == [("USD",)]
+    assert all(not row["managed"] for row in store.offers(active_only=True))
+    assert not store.intents()
+
+
+def test_v42_confirmed_start_adopts_only_explicit_ids_and_future_ids_stay_external(tmp_path, monkeypatch):
+    service, store, external, other, _, launches = prepared_adoption_start(tmp_path, monkeypatch, adopt=True)
+    service.start("confirmed", ["USD"])
+    assert launches == [("USD",)]
+    assert {row["offer_id"] for row in store.offers(active_only=True) if row["managed"]} == {901}
+    intent = store.intents()[0]
+    assert intent["exchange_offer_id"] == 901 and intent["resolution"] == "PREFLIGHT_ADOPTED"
+    store.reconcile_offers([external, other, {**external, "id": 903}], store._now_ms() + 31000)
+    assert {row["offer_id"] for row in store.offers(active_only=True) if row["managed"]} == {901}
+    assert len(store.intents()) == 1
+
+
+def test_changed_adoption_ids_reject_even_if_digest_was_not_updated(tmp_path, monkeypatch):
+    service, store, _, other, refreshed, launches = prepared_adoption_start(tmp_path, monkeypatch, adopt=True)
+    refreshed["profiles"]["USD"]["summary"]["externalAdoptionCandidates"] = json_decimal([other])
+    with pytest.raises(lendingbot.ConfigError, match="挂单集合"):
+        service.start("confirmed", ["USD"])
+    assert not launches and not store.intents()
+
+
+def test_recovery_launch_does_not_reuse_external_adoption_permission(tmp_path, monkeypatch):
+    service, settings, stores, context, _ = fixture_service(tmp_path)
+    policy = replace(template_for("adaptive_net_yield_v3", settings.policies["USD"]), adopt_external_offers=True)
+    store = stores["USD"]
+    store.save_strategy(json_decimal(policy.__dict__), "ACTIVE")
+    external = dict(id=901, currency="USD", amount=D(150), rate=D(".0002"), period=2, offer_type="LIMIT")
+    store.reconcile_offers([external], store._now_ms())
+    monkeypatch.setattr(lendingbot, "controlled_bot_running", lambda *_args: True)
+    monkeypatch.setattr(lendingbot.LiveProcessLock, "inspect", lambda *_args: {"metadata": {"v4": True}})
+    monkeypatch.setattr(lendingbot, "controlled_bot_status", lambda *_args: {"running": True})
+    monkeypatch.setattr(V4Service.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("no Worker process"))
+    service._launch(("USD",), recovering=True)
+    assert not store.intents() and not store.offers(active_only=True)[0]["managed"]
+    assert context.process_state.auto_restart_authorization["currencies"] == ["USD"]

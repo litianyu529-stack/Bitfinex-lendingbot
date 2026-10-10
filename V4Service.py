@@ -363,6 +363,7 @@ class V4DashboardService:
                 "operationalReportHash",
                 "accountDigest",
                 "externalAdoptionDigest",
+                "externalAdoptionCandidates",
                 "pendingCancellations",
             )
         }
@@ -388,6 +389,24 @@ class V4DashboardService:
                 for currency in selected
             ):
                 raise ConfigError("账户、策略或挂单集合发生变化，请重新预检")
+            stores = stores_for_profiles(load_profiles(self.config_path), self.context.now)
+            approvals = []
+            for currency in selected:
+                store = stores[currency]
+                active = store.strategy("ACTIVE")
+                summary = refreshed["profiles"][currency]["summary"]
+                if active is None or active["version_id"] != summary.get("activeStrategyVersion"):
+                    raise ConfigError("启动前正式策略发生变化，请重新预检")
+                if store.runtime().get("safe_manual"):
+                    raise ConfigError("存在需要人工处理的未决写入")
+                if strategy_v3_from_record(active).adopt_external_offers:
+                    approvals.append((store, summary.get("externalAdoptionCandidates") or [], active["version_id"]))
+            # Ownership authorization belongs to this single-use confirmation,
+            # never to the reusable Worker launch/recovery path. Persist only
+            # the exact rows shown in both matching preflight summaries.
+            for store, candidates, version in approvals:
+                if candidates:
+                    store.adopt_external_offers(candidates, version)
             return self._launch(selected)
 
     def _launch(self, selected, recovering=False):

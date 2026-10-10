@@ -314,11 +314,14 @@ def policy_v3_with_overrides(base, values):
             updates[name] = converter(values[name])
     if updates.get("strategy_engine", base.strategy_engine) != "adaptive_net_yield_v3":
         updates["adopt_external_offers"] = True
+    elif base.strategy_engine != "adaptive_net_yield_v3":
+        updates.setdefault("adopt_external_offers", False)
     return replace(base, **updates)
 
 
 def validate_policy_v3(policy, require_live_floors=False):
     from StrategyV4 import validate_adaptive
+
     validate_adaptive(policy)
     if policy.version not in {3, 4}:
         raise ValueError("strategy version must be 3 or 4")

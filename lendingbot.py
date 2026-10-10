@@ -1697,6 +1697,11 @@ def create_controlled_bot_preflight(config_path, client_factory=None, now=None, 
     return response
 
 
+def _require_single_currency_control(policy):
+    if policy.strategy_engine == "adaptive_net_yield_v3":
+        raise ConfigError("V4.2 必须使用 V4 币种预检和启动接口；旧单币启动不能授权接管外部挂单。")
+
+
 def consume_controlled_bot_preflight(config_path, preflight_id, now=None, context=None):
     context = process_context(config_path, context)
     state = context.process_state
@@ -1711,6 +1716,7 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
         raise ConfigError("策略配置在预检后发生变化，请重新运行预检")
     store, settings = v3_store_for_config(config_path)
     active, policy = ensure_active_strategy_v3(store, settings)
+    _require_single_currency_control(policy)
     if store.strategy("DRAFT") is not None or store.strategy("PENDING") is not None:
         raise ConfigError("预检后出现 DRAFT 或 PENDING 策略，请先应用或放弃并重新预检")
     if active["version_id"] != current.get("activeStrategyVersion"):
@@ -1757,6 +1763,9 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None, p
     with state.lock:
         if controlled_bot_running(config_path, context):
             raise ConfigError("机器人已在运行")
+        store, settings = v3_store_for_config(config_path)
+        _, policy = ensure_active_strategy_v3(store, settings)
+        _require_single_currency_control(policy)
         consume_controlled_bot_preflight(config_path, preflight_id, context=context)
         store, _ = v3_store_for_config(config_path)
         # A restart must never discard a durable recovery episode.  The new
@@ -1899,6 +1908,15 @@ def worker_supervisor_loop(config_path, status_path, context):
                 supervisor_tick(config_path, status_path, context)
                 continue
             store, _ = v3_store_for_config(config_path)
+            active = store.strategy("ACTIVE")
+            if active and strategy_v3_from_record(active).strategy_engine == "adaptive_net_yield_v3":
+                # A previous single-currency session cannot approve new external
+                # IDs or promote itself to V4.2 during an automatic recovery.
+                # A fresh V4 confirmation supplies the explicit currency/ID scope.
+                state.auto_restart_authorization = None
+                state.preflight = None
+                state.stop_reason = "v42_requires_v4_preflight"
+                continue
             recovery = store.recovery_status()
             status = controlled_bot_status(config_path, context)
             now_ms = int(context.now() * 1000)

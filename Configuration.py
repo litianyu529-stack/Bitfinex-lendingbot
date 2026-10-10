@@ -160,10 +160,17 @@ V3_CONFIG_FIELDS = tuple(
 )
 
 
+def strategy_input_fields(engine):
+    # V3/V4.0/V4.1 retain their fixed compatibility setting. V4.2 must
+    # preserve explicit one-preview adoption choices, including False.
+    return (*V3_CONFIG_FIELDS, "adopt_external_offers") if engine == "adaptive_net_yield_v3" else V3_CONFIG_FIELDS
+
+
 def strategy_v3_from_config(config, section="STRATEGY_V3", base=None):
     values = {}
     if config.has_section(section):
-        for field_name in V3_CONFIG_FIELDS:
+        engine = get_option(config, section, "strategy_engine", (base or StrategyPolicyV3()).strategy_engine)
+        for field_name in strategy_input_fields(engine):
             raw = get_option(config, section, field_name, None)
             if raw is None:
                 continue
@@ -201,7 +208,7 @@ def strategy_v3_from_config(config, section="STRATEGY_V3", base=None):
 
 def strategy_v3_config_values(policy):
     values = {}
-    for field_name in V3_CONFIG_FIELDS:
+    for field_name in strategy_input_fields(policy.strategy_engine):
         value = getattr(policy, field_name)
         if value is None:
             values[field_name] = ""
@@ -268,7 +275,10 @@ def _strategy_numeric_value(value, field_name):
 def strategy_v3_from_api_payload(payload, base=None):
     values = {}
     payload = payload or {}
-    for field_name in V3_CONFIG_FIELDS:
+    engine = payload.get("strategy_engine", (base or StrategyPolicyV3()).strategy_engine)
+    if engine == "adaptive_net_yield_v3":
+        values["adopt_external_offers"] = False
+    for field_name in strategy_input_fields(engine):
         if field_name not in payload:
             continue
         value = payload[field_name]
