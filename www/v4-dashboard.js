@@ -41,6 +41,7 @@ function adaptiveReasonLabel(reason) {
         HARD_FLOOR: "报价违反收益底线，安全调整", CAP_EXCEEDED: "超过资金上限，安全调整",
         EXTERNAL_OFFER: "外部挂单尚未接管", EVALUATION_INTERVAL: "等待下一评估周期",
         NO_BETTER_VALUE: "暂未发现更高净收益的可执行报价", WAIT_FOR_VALUE: "当前可执行报价的净收益优势不足",
+        WAIT_FOR_PASSIVE_EVIDENCE: "被动等待已满6小时，等待新的兼容成交证据",
         NO_AVAILABLE_BALANCE: "没有可用Funding余额", BELOW_MINIMUM: "余额低于最小订单金额",
         MARKET_BELOW_FLOOR: "市场参考报价低于收益底线", FUNDING_CAP_REACHED: "已达资金上限",
         FRR_DATA_UNAVAILABLE: "FRR数据未就绪，暂不执行", MODEL_UNAVAILABLE: "模型未就绪，暂不执行",

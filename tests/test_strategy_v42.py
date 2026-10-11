@@ -278,3 +278,200 @@ def test_quote_dedup_preserves_different_terms_types_and_native_rates(inputs, mo
     assert (2, "LIMIT", D(".0006")) in keys and (2, "LIMIT", D(".0007")) in keys
     assert (7, "LIMIT", D(".0008")) in keys
     assert not result.get("blockReasons") and result["plan"] == []
+
+
+def cash_chain_inputs(inputs, monkeypatch, known=False):
+    policy, model, trades, _, account = inputs
+    policy = replace(
+        policy, maximum_period=8, long_from_days=8,
+        **{field: kind == "LIMIT" for kind, field in core.FIELDS.items()},
+    )
+    trades = copy.deepcopy(trades)
+    trades[0]["amount"] = D(1)
+    account = {**account, "wallet": D(600), "passiveQuarantines": {
+        "old-price": dict(chainStartMs=NOW - 360 * 60000, closedAtMs=NOW - 2000, evidenceWatermark=[]),
+    }}
+    book = [dict(period=2, rate=D(".0006"), amount=D(-50 if known else -1000),
+                 demandType="FIXED" if known else "UNKNOWN")]
+    calls = []
+    baseline = fake_value(calls)
+
+    def quotes(_policy, period, _rate, _frr):
+        return [dict(rate=rate, submitted_rate=rate, offer_type="LIMIT", display_type="LIMIT")
+                for rate in (D(".0006"), D(".0004"))] if period == 2 else []
+
+    def value(*args, **kwargs):
+        result = baseline(*args, **kwargs)
+        result["cycleNetApr"] = float(args[3]) * 365
+        return result
+
+    monkeypatch.setattr(core.previous, "quotes", quotes)
+    monkeypatch.setattr(core, "value_candidate", value)
+    return policy, model, trades, book, account, calls
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_expired_cash_chain_selects_lower_executable_quote_not_blocked_high_quote(inputs, monkeypatch, known):
+    policy, model, trades, book, account, calls = cash_chain_inputs(inputs, monkeypatch, known)
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert not result.get("blockReasons")
+    assert result["planned_amount"] == 600 and result["idle_amount"] == 0
+    assert len(result["plan"]) == 1
+    row = result["plan"][0]
+    assert row["submitted_rate"] == D(".0004") and row["passive"]
+    assert row["evidenceWatermark"] == ["trade:1"]
+    assert row["submitted_rate"] >= base.gross_floor(policy, row["period"])
+    assert calls[-1][2:4] == (D(".0004"), D(600))
+    assert not any(rate == D(".0006") and amount > 150 for _, _, rate, amount, _ in calls)
+    if not known:
+        assert all(rate != D(".0006") for _, _, rate, _, _ in calls)
+    # KNOWN demand under the minimum becomes passive and must pass the same
+    # cash-chain gate as an initially passive low-confidence quote.
+    assert all(c["passive"] == (not known) for c in result["candidates"])
+
+
+@pytest.mark.parametrize("fault", ["historic", "already_seen", "latest_close", "book_only", "incompatible", "type"])
+def test_expired_cash_chain_without_independent_compatible_trade_keeps_real_cash(inputs, monkeypatch, fault):
+    policy, model, trades, book, account, calls = cash_chain_inputs(inputs, monkeypatch)
+    if fault == "historic":
+        trades[0]["mts"] = NOW - 2000  # A token at the closure boundary is not newer.
+    elif fault == "already_seen":
+        account["passiveQuarantines"]["other-price"] = dict(
+            chainStartMs=NOW - 1000, closedAtMs=NOW - 1500, evidenceWatermark=["trade:1"],
+        )
+    elif fault == "latest_close":
+        account["passiveQuarantines"]["other-price"] = dict(
+            chainStartMs=NOW - 1000, closedAtMs=NOW - 500, evidenceWatermark=[],
+        )
+    elif fault == "book_only":
+        trades[0]["mts"] = NOW - 3000
+        book[0].update(id=99, firstSeenMs=NOW - 500)
+    elif fault == "incompatible":
+        trades[0]["period"] = 7
+    else:
+        trades[0]["demandType"] = "FRR"
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert not result.get("blockReasons")
+    assert not result["plan"] and result["planned_amount"] == 0
+    assert result["idle_amount"] == account["wallet"]
+    assert not calls  # Unexecutable passive quotes never spend the valuation budget.
+    assert result["empty_reason"] == "WAIT_FOR_PASSIVE_EVIDENCE"
+    assert any("6小时" in reason and "新成交证据" in reason for reason in result["diagnostics"])
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_normal_demand_exhaustion_rechecks_passive_cash_gate_on_later_allocation(inputs, monkeypatch, fresh):
+    policy, model, trades, book, account, calls = cash_chain_inputs(inputs, monkeypatch, known=True)
+    book[0]["amount"] = D(-300)
+    if not fresh:
+        trades[0]["mts"] = NOW - 3000
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    normal = [r for r in result["plan"] if not r["passive"]]
+    assert len(normal) == 1 and normal[0]["amount"] == 300
+    assert normal[0]["submitted_rate"] == D(".0006")
+    passive = [r for r in result["plan"] if r["passive"]]
+    if fresh:
+        assert len(passive) == 1 and passive[0]["amount"] == 300
+        assert passive[0]["submitted_rate"] == D(".0004")
+        assert result["planned_amount"] == 600 and result["idle_amount"] == 0
+    else:
+        assert not passive and result["planned_amount"] == 300 and result["idle_amount"] == 300
+        assert any("6小时" in reason for reason in result["diagnostics"])
+    assert not any(rate == D(".0006") and amount > 150 for _, _, rate, amount, _ in calls)
+
+
+def test_expired_cash_chain_does_not_block_known_normal_demand(inputs, monkeypatch):
+    policy, model, trades, book, account, _ = cash_chain_inputs(inputs, monkeypatch, known=True)
+    trades[0]["mts"] = NOW - 3000
+    book[0]["amount"] = D(-1000)
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert result["planned_amount"] == account["wallet"]
+    assert all(not row["passive"] and row["submitted_rate"] == D(".0006") for row in result["plan"])
+
+
+def test_passive_cash_chain_is_account_local_and_missing_legacy_clock_preserves_compatibility(inputs, monkeypatch):
+    policy, model, trades, book, account, _ = cash_chain_inputs(inputs, monkeypatch)
+    trades[0]["mts"] = NOW - 3000
+    blocked = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert not blocked["plan"]
+    legacy_account = copy.deepcopy(account)
+    del legacy_account["passiveQuarantines"]["old-price"]["chainStartMs"]
+    compatible = core.build_plan(legacy_account, policy, model, book, trades, NOW, "active")
+    assert compatible["planned_amount"] == 600
+    assert compatible["plan"][0]["submitted_rate"] == D(".0006")
+    usd_model = core.fit_model("USD", trades, now_ms=NOW)
+    usd_policy = replace(policy, currency="USD", model_id=usd_model["id"])
+    usd_account = {**account, "passiveQuarantines": {}}
+    independent = core.build_plan(usd_account, usd_policy, usd_model, book, trades, NOW, "active")
+    assert independent["planned_amount"] == 600
+    assert independent["plan"][0]["submitted_rate"] == D(".0006")
+    assert not core.build_plan(account, policy, model, book, trades, NOW, "active")["plan"]
+
+
+@pytest.mark.parametrize("mode", ["reject", "accept", "invalid_reference"])
+def test_blocked_short_quote_remains_economic_reference_without_becoming_executable(inputs, monkeypatch, mode):
+    policy, model, trades, book, account, _ = cash_chain_inputs(inputs, monkeypatch)
+    policy = replace(policy, maximum_period=60, long_from_days=31)
+    trades.append(dict(id=999, mts=NOW - 1000, period=14, rate=D(".0005"), amount=D(1000)))
+    calls, markets = [], []
+    baseline = fake_value(calls)
+
+    def quotes(_policy, period, _rate, _frr):
+        rates = (D(".0006"), D(".0004")) if period == 2 else (D(".0005"),) if period == 60 else ()
+        return [dict(rate=rate, submitted_rate=rate, offer_type="LIMIT", display_type="LIMIT") for rate in rates]
+
+    def value(*args, **kwargs):
+        result = baseline(*args, **kwargs)
+        markets.append(id(kwargs["market"]))
+        if args[2] == 60:
+            result.update(cycleNetApr=0.30, conservativeNetApr=0.12)
+        elif args[3] == D(".0006"):
+            result["conservativeNetApr"] = 0.11 if mode == "accept" else 0.13
+            if mode == "invalid_reference":
+                result["typeBlockReason"] = "无效参考收益"
+        return result
+
+    monkeypatch.setattr(core.previous, "quotes", quotes)
+    monkeypatch.setattr(core, "value_candidate", value)
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert not result.get("blockReasons") and result["planned_amount"] == 600
+    assert len(set(markets)) == 1  # References share the original decision cache and deadline.
+    blocked_reference = [call for call in calls if call[2] == D(".0006")]
+    assert len(blocked_reference) == 1 and blocked_reference[0][3] == 150
+    assert all(c["submitted_rate"] != D(".0006") for c in result["candidates"])
+    assert all(row["submitted_rate"] != D(".0006") for row in result["plan"])
+    if mode == "reject":
+        # 12% beats executable short's 10% + 0.5pp, but fails the original
+        # blocked short reference of 13% + 0.5pp. The long quote stays out.
+        assert all(c["period"] < 31 for c in result["candidates"])
+        assert result["plan"][0]["period"] == 2
+    else:
+        assert result["plan"][0]["period"] == 60
+
+
+@pytest.mark.parametrize("long_fault", ["no_new_evidence", "type_floor"])
+def test_without_legal_long_candidate_never_values_blocked_short_reference(inputs, monkeypatch, long_fault):
+    policy, model, trades, book, account, _ = cash_chain_inputs(inputs, monkeypatch)
+    policy = replace(policy, maximum_period=60, long_from_days=31)
+    if long_fault == "type_floor":
+        trades.append(dict(id=999, mts=NOW - 1000, period=14, rate=D(".0005"), amount=D(1000)))
+    calls = []
+    baseline = fake_value(calls)
+
+    def quotes(_policy, period, _rate, _frr):
+        rates = (D(".0006"), D(".0004")) if period == 2 else (D(".0005"),) if period == 60 else ()
+        return [dict(rate=rate, submitted_rate=rate, offer_type="LIMIT", display_type="LIMIT") for rate in rates]
+
+    def value(*args, **kwargs):
+        result = baseline(*args, **kwargs)
+        if args[2] == 60:
+            result["typeBlockReason"] = "FRR保守持有收益低于净年化底线"
+        return result
+
+    monkeypatch.setattr(core.previous, "quotes", quotes)
+    monkeypatch.setattr(core, "value_candidate", value)
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active")
+    assert not result.get("blockReasons") and result["planned_amount"] == 600
+    assert all(row["period"] == 2 for row in result["plan"])
+    assert all(rate != D(".0006") for _, _, rate, _, _ in calls)
+    assert any(period == 60 for period, _, _, _, _ in calls) == (long_fault == "type_floor")

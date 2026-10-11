@@ -593,6 +593,21 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
         if market is not None:
             market.deadline = time.monotonic() + VALUATION_BUDGET_SECONDS
         units = demand_units(book, trades, now_ms) if needs_valuation else []
+        quarantines = account.get("passiveQuarantines", {})
+        closed = list(quarantines.values()) if isinstance(quarantines, dict) else []
+        cash_chain_expired = bool(closed) and now_ms >= min(
+            int(q.get("chainStartMs", now_ms)) for q in closed
+        ) + MAX_PASSIVE_MINUTES * 60000
+        # Match the execution gate: returned wallet principal retains the
+        # oldest waiting chain, and only compatible trades after the latest
+        # closure can authorize another passive quote. Book refreshes do not.
+        fresh_cash_evidence = set()
+        if cash_chain_expired:
+            observed = set().union(*(set(q.get("evidenceWatermark", [])) for q in closed))
+            fresh_cash_evidence = independent_evidence(
+                trades, [], now_ms, max(int(q.get("closedAtMs", 0)) for q in closed)
+            ) - observed
+        passive_cash_blocked = False
         terms = sorted(
             (
                 {
@@ -604,6 +619,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             & set(range(2, policy.maximum_period + 1))
         )
         candidates, valued_quotes = [], set()
+        blocked_short_specs = []
         for term in terms if needs_valuation else []:
             rates = {
                 base.gross_floor(policy, term),
@@ -619,6 +635,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
                     if quote_identity in valued_quotes:
                         continue
                     valued_quotes.add(quote_identity)
+                    _check_budget(market.deadline)
                     eligible = _compatible_units(quote["display_type"], term, quote["rate"], units)
                     known = any(compatibility(quote["display_type"], r) == "KNOWN" for r in eligible)
                     calibrated = model.get("typeObservationCounts", {}).get(quote["display_type"], 0) >= 20
@@ -629,12 +646,33 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
                         evidenceWatermark=sorted(r["evidenceId"] for r in eligible if r["evidenceId"]),
                         demandCompatibility="KNOWN" if known else "UNKNOWN",
                     )
+                    if (
+                        quote["passive"]
+                        and cash_chain_expired
+                        and not set(quote["evidenceWatermark"]) & fresh_cash_evidence
+                    ):
+                        passive_cash_blocked = True
+                        if term <= 7:
+                            blocked_short_specs.append((term, dict(quote)))
+                        continue
                     value = value_candidate(
                         policy, model, term, quote["rate"], minimum, trades, book, now_ms, quote=quote, market=market
                     )
                     if not value.get("typeBlockReason"):
                         candidates.append(value)
-        short = max((c["conservativeNetApr"] for c in candidates if c["period"] <= 7), default=0)
+        short_references = [c["conservativeNetApr"] for c in candidates if c["period"] <= 7]
+        if any(c["period"] >= policy.long_from_days for c in candidates):
+            # Execution eligibility must not weaken the existing long-term
+            # premium comparison. Blocked short quotes are economic references
+            # only, and remain absent from executable candidates and the plan.
+            for term, quote in blocked_short_specs:
+                _check_budget(market.deadline)
+                reference = value_candidate(
+                    policy, model, term, quote["rate"], minimum, trades, book, now_ms, quote=quote, market=market
+                )
+                if not reference.get("typeBlockReason"):
+                    short_references.append(reference["conservativeNetApr"])
+        short = max(short_references, default=0)
         candidates = [
             c for c in candidates if c["period"] < policy.long_from_days or c["conservativeNetApr"] > short + 0.005
         ]
@@ -646,7 +684,6 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             (D(v) for p, v in account.get("exposureByPeriod", {}).items() if int(p) >= policy.long_from_days), D(0)
         )
         variable_used = D(account.get("existingExposure", {}).get("variable", 0))
-        quarantines = account.get("passiveQuarantines", {})
         allocated = {}
         rejected_passive = set()
         while budget >= minimum and slots:
@@ -660,23 +697,26 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
                 fresh = set(c.get("evidenceWatermark", [])) & independent_evidence(trades, book, now_ms, after) - set(
                     quarantine.get("evidenceWatermark", [])
                 )
-                if (
-                    c.get("typeBlockReason")
-                    or key in rejected_passive
-                    or (c.get("passive") and quarantine and not fresh)
-                ):
+                if c.get("typeBlockReason") or key in rejected_passive:
                     continue
                 compatible = _compatible_units(c["display_type"], c["period"], c["rate"], units)
                 capacity = budget if c.get("passive") else sum((r["amount"] for r in compatible), D(0))
                 if capacity < minimum:
-                    if quarantine and not fresh:
-                        continue
                     # Exhausted immediate demand does not reserve cash in the
                     # all-funds allocation mode. The remainder is a waiting
                     # quote, with no claim that observed demand will fill it.
                     c = {**c, "passive": True, "leaseMinutes": policy.passive_wait_minutes,
                          "demandCompatibility": "UNKNOWN"}
                     capacity = budget
+                if (
+                    c.get("passive")
+                    and cash_chain_expired
+                    and not set(c.get("evidenceWatermark", [])) & fresh_cash_evidence
+                ):
+                    passive_cash_blocked = True
+                    continue
+                if c.get("passive") and quarantine and not fresh:
+                    continue
                 if c["period"] >= policy.long_from_days:
                     capacity = min(capacity, max(D(0), D(account["total"]) * policy.long_max_share / 100 - long_used))
                 if c["floatingRate"]:
@@ -768,6 +808,10 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
         result["idle_amount"] = D(account["wallet"]) - result["planned_amount"]
         result["target_slice_count"] = len(result["plan"])
         result["empty_reason"] = None if result["plan"] else "WAIT_FOR_VALUE"
+        if passive_cash_blocked and result["idle_amount"] > 0:
+            if not result["plan"]:
+                result["empty_reason"] = "WAIT_FOR_PASSIVE_EVIDENCE"
+            result["diagnostics"].append("被动等待已满6小时；剩余资金需结束之后兼容的新成交证据")
         if result["idle_amount"] > 0:
             result["diagnostics"].append("余额、收益底线、共享需求上界、长期/浮动上限或被动租约预算限制")
     except (ValueError, KeyError, ArithmeticError) as exc:
