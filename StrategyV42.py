@@ -330,6 +330,14 @@ def _continuation(seed, currency, paths, floor_rate, net_fee, kind, curve, amoun
 
 
 def _future_inputs(policy, model, market, book, amount, current_frr, trades=()):
+    # The continuation baseline and observed anchors stay fixed within one
+    # decision. Reuse only fully evaluated paths, never an executable plan.
+    kind = next((k for k in TYPES if previous.enabled(policy, k)), "NONE")
+    cache_key = (model["id"], policy.currency, base.gross_floor(policy, 2), base.fee(policy),
+                 kind, float(amount), float(current_frr or 0))
+    cache = getattr(market, "future_inputs_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
     days = tuple(float(r["rate"]) for r in model["days"] if D(str(r["rate"])) > 0)
     # Historical observations are joined by date, not by list position. An
     # absent FRR day can only inherit a previously observed value, never a
@@ -353,7 +361,6 @@ def _future_inputs(policy, model, market, book, amount, current_frr, trades=()):
             volumes_by_day[day] = volumes_by_day.get(day, 0) + float(row["amount"])
     volumes = tuple(volumes_by_day.get(int(r["mts"]) // base.DAY, 0) for r in model["days"] if D(str(r["rate"])) > 0)
     current = float(market.reference(2, base.DAY) or market.reference(2, 7 * base.DAY) or D(str(days[-1])))
-    kind = next((k for k in TYPES if previous.enabled(policy, k)), "NONE")
     typed = getattr(market, "typed_markets", {})
     if kind not in typed:
         typed[kind] = base.CandidateMarket(
@@ -390,6 +397,8 @@ def _future_inputs(policy, model, market, book, amount, current_frr, trades=()):
         )
     finally:
         _valuation_deadline.reset(token)
+    cache[cache_key] = (paths, continuation)
+    market.future_inputs_cache = cache
     return paths, continuation
 
 
@@ -451,11 +460,20 @@ def value_candidate(
     _check_budget(deadline)
     curve = _holding_curve(model, kind, period)
     seed = int(base.digest({"seed": model["pathSeed"], "currency": policy.currency})[:12], 16)
+    uniform_key = (seed, len(paths))
+    uniforms = getattr(market, "valuation_uniforms", {})
+    if uniform_key not in uniforms:
+        pairs = []
+        for index in range(len(paths)):
+            rng = random.Random(seed + index + 10000)
+            pairs.append((rng.random(), rng.random()))
+        uniforms[uniform_key] = tuple(pairs)
+        market.valuation_uniforms = uniforms
     interests, waits, holds, cycle_interests, cycle_times, holding_aprs = [], [], [], [], [], []
     for index, path in enumerate(paths):
         _check_budget(deadline, index)
-        rng = random.Random(seed + index + 10000)
-        wait = residual_wait(hs, age_minutes, rng.random(), flow, amount, queue, max(0, limit - cancel_minutes))
+        wait_uniform, hold_uniform = uniforms[uniform_key][index]
+        wait = residual_wait(hs, age_minutes, wait_uniform, flow, amount, queue, max(0, limit - cancel_minutes))
         start = (cancel_minutes + wait) / 60 if wait is not None else None
         if start is None:
             # An expired lease actually returns cash. An ordinary KEEP does not.
@@ -467,7 +485,7 @@ def value_candidate(
             cycle_interests.append(0.0)
             cycle_times.append(max(1 / 3600, (cancel_minutes + limit) / 60))
             continue
-        hold = _hold(curve, period, rng.random(), stress)
+        hold = _hold(curve, period, hold_uniform, stress)
         end = min(HOURS, start + hold)
         first = _earned(
             kind, float(quote["submitted_rate"]), float(rate), path, start, end, 1 - float(base.fee(policy))
@@ -682,6 +700,10 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             long_used += amount if c["period"] >= policy.long_from_days else 0
             variable_used += amount if c["floatingRate"] else 0
             passive_used = passive_used or c.get("passive", False)
+            if passive_used and all(candidate.get("passive") for candidate in candidates):
+                # No further order can fit the one-passive-order limit. Keep
+                # the already valued quote and avoid a redundant full sweep.
+                break
             # All candidates see the same remaining shared UNKNOWN budget.
             book = [*book, dict(rate=c["rate"], period=c["period"], amount=amount)]
             for candidate in candidates:

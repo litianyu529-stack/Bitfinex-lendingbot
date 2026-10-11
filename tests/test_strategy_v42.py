@@ -128,6 +128,43 @@ def fake_value(calls):
     return value
 
 
+def test_decision_local_path_reuse_preserves_full_candidate_value(inputs, monkeypatch):
+    policy, model, trades, book, _ = inputs
+    market = base.CandidateMarket(trades, NOW)
+    first = core.value_candidate(policy, model, 2, D(".0004"), D(150), trades, book, NOW, market=market)
+    expected = core.value_candidate(policy, model, 7, D(".0005"), D(150), trades, book, NOW)
+    continuation = core._continuation
+    calls = []
+
+    def counted(*args):
+        calls.append(args)
+        return continuation(*args)
+
+    monkeypatch.setattr(core, "_continuation", counted)
+    actual = core.value_candidate(policy, model, 7, D(".0005"), D(150), trades, book, NOW, market=market)
+    assert actual == expected and not calls
+    assert first["pathInterests"] != actual["pathInterests"]
+    core.value_candidate(policy, model, 7, D(".0005"), D(151), trades, book, NOW, market=market)
+    assert len(calls) == 1
+    market.deadline = 0
+    with pytest.raises(core.ValuationIncomplete):
+        core.value_candidate(policy, model, 7, D(".0005"), D(150), trades, book, NOW, market=market)
+
+
+def test_all_passive_candidates_stop_after_one_legal_order(inputs, monkeypatch):
+    policy, model, trades, _, account = inputs
+    account["wallet"] = D(600)
+    book = [dict(period=2, rate=D(".0006"), amount=D(-1000))]
+    calls = []
+    monkeypatch.setattr(core, "value_candidate", fake_value(calls))
+    with funding_sizing(D(150)):
+        result = core.build_plan(account, policy, model, book, trades, NOW, "active", D(".0005"))
+    assert len(result["plan"]) == 1 and result["planned_amount"] == D(150)
+    assert result["idle_amount"] == D(450)
+    assert all(c["passive"] for c in result["candidates"])
+    assert {call[-1] for call in calls} == {1}
+
+
 @pytest.mark.parametrize("over_cap", [False, True])
 def test_managed_offer_still_gets_candidates_without_executable_cash(inputs, monkeypatch, over_cap):
     policy, model, trades, book, account = inputs
