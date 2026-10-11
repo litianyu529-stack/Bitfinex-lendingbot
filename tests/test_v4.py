@@ -212,7 +212,7 @@ def test_usdt_wallet_and_ledger_requests_use_ust(monkeypatch):
     assert calls[1][1]["currency"] == calls[1][1]["currency_to"] == "UST"
 
 
-def test_usdt_requires_own_floors_and_absolute_cap(tmp_path):
+def test_legacy_usdt_requires_own_floors_and_absolute_cap(tmp_path):
     path, settings = configuration(tmp_path, usdt=False)
     assert settings.enabled_currencies == ("USD",)
     assert settings.policies["USD"].short_floor_apr == D("0.01")
@@ -223,6 +223,18 @@ def test_usdt_requires_own_floors_and_absolute_cap(tmp_path):
     config.read(path, encoding="utf-8")
     config.remove_section("STRATEGY_V4_USDT")
     assert build_settings(lendingbot.parse_args([]), config).enabled_currencies == ("USD",)
+
+
+@pytest.mark.parametrize("cap", [None, D("0"), D("360")])
+def test_v42_usdt_absolute_cap_is_optional(cap):
+    selected = replace(policy("USDT"), strategy_engine="adaptive_net_yield_v3", max_lend_amount=cap)
+    validate_policy_v3(selected, require_live_floors=True)
+    with pytest.raises(ValueError, match="max_lend_percent"):
+        validate_policy_v3(replace(selected, max_lend_percent=D("101")), require_live_floors=True)
+    with pytest.raises(ValueError, match="max_lend_amount"):
+        validate_policy_v3(replace(selected, max_lend_amount=D("-1")), require_live_floors=True)
+    with pytest.raises(ValueError, match="floors must be positive"):
+        validate_policy_v3(replace(selected, short_floor_apr=None), require_live_floors=True)
 
 
 def test_shared_database_path_is_rejected(tmp_path):

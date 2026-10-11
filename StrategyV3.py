@@ -341,6 +341,7 @@ def validate_policy_v3(policy, require_live_floors=False):
     if (
         require_live_floors
         and policy.currency == "USDT"
+        and policy.strategy_engine != "adaptive_net_yield_v3"
         and (policy.max_lend_amount is None or policy.max_lend_amount <= 0)
     ):
         raise ValueError("USDT LIVE requires a positive absolute funding cap")
