@@ -561,7 +561,7 @@ def _base_result(account, policy):
         empty_reason=None,
         modelId=policy.model_id,
         allocationModel=VERSION,
-        allocationBasis="资金循环效率及120天悲观收益保护",
+        allocationBasis="全量可用资金报价；资金循环效率及120天调价保护",
         pool_allocation={},
         target_offer_amounts={},
         current_offer_amounts={},
@@ -632,11 +632,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
                     value = value_candidate(
                         policy, model, term, quote["rate"], minimum, trades, book, now_ms, quote=quote, market=market
                     )
-                    if (
-                        value["expectedFillProbability"] > 0
-                        and value["cycleNetApr"] > 0
-                        and value["p10IdleInterestGain"] >= 0
-                    ):
+                    if not value.get("typeBlockReason"):
                         candidates.append(value)
         short = max((c["conservativeNetApr"] for c in candidates if c["period"] <= 7), default=0)
         candidates = [
@@ -650,12 +646,9 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             (D(v) for p, v in account.get("exposureByPeriod", {}).items() if int(p) >= policy.long_from_days), D(0)
         )
         variable_used = D(account.get("existingExposure", {}).get("variable", 0))
-        states = account.get("passiveLeaseStates", [])
-        passive_used = any(
-            bool(s.get("active", True)) for s in (states.values() if isinstance(states, dict) else states)
-        )
         quarantines = account.get("passiveQuarantines", {})
         allocated = {}
+        rejected_passive = set()
         while budget >= minimum and slots:
             _check_budget(market.deadline)
             selected = None
@@ -668,13 +661,22 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
                     quarantine.get("evidenceWatermark", [])
                 )
                 if (
-                    c["expectedFillProbability"] <= 0
-                    or c["cycleNetApr"] <= 0
-                    or (c.get("passive") and (passive_used or quarantine and not fresh))
+                    c.get("typeBlockReason")
+                    or key in rejected_passive
+                    or (c.get("passive") and quarantine and not fresh)
                 ):
                     continue
                 compatible = _compatible_units(c["display_type"], c["period"], c["rate"], units)
-                capacity = minimum if c.get("passive") else sum((r["amount"] for r in compatible), D(0))
+                capacity = budget if c.get("passive") else sum((r["amount"] for r in compatible), D(0))
+                if capacity < minimum:
+                    if quarantine and not fresh:
+                        continue
+                    # Exhausted immediate demand does not reserve cash in the
+                    # all-funds allocation mode. The remainder is a waiting
+                    # quote, with no claim that observed demand will fill it.
+                    c = {**c, "passive": True, "leaseMinutes": policy.passive_wait_minutes,
+                         "demandCompatibility": "UNKNOWN"}
+                    capacity = budget
                 if c["period"] >= policy.long_from_days:
                     capacity = min(capacity, max(D(0), D(account["total"]) * policy.long_max_share / 100 - long_used))
                 if c["floatingRate"]:
@@ -687,9 +689,25 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             if selected is None:
                 break
             c, key, compatible, capacity = selected
-            amount = min(minimum, budget, capacity)
-            if not c.get("passive") and 0 < budget - amount < minimum and capacity >= budget:
+            amount = min(budget, capacity) if c.get("passive") else min(minimum, budget, capacity)
+            if 0 < budget - amount < minimum and capacity >= budget:
                 amount = budget
+            if c.get("passive"):
+                # A full-balance waiting order needs its actual-size queue and
+                # cashflow estimate, not the minimum block's fill probability.
+                valued = value_candidate(
+                    policy, model, c["period"], c["rate"], amount + allocated.get(key, (None, D(0)))[1],
+                    trades, book, now_ms,
+                    quote=c, market=market,
+                )
+                if (
+                    valued.get("typeBlockReason")
+                    or (valued["period"] >= policy.long_from_days
+                        and valued["conservativeNetApr"] <= short + 0.005)
+                ):
+                    rejected_passive.add(key)
+                    continue
+                c = valued
             allocated[key] = (c, allocated.get(key, (None, D(0)))[1] + amount)
             remaining = amount
             for unit in compatible:
@@ -699,10 +717,7 @@ def build_plan(account, policy, model, book, trades, now_ms, strategy_version, c
             budget -= amount
             long_used += amount if c["period"] >= policy.long_from_days else 0
             variable_used += amount if c["floatingRate"] else 0
-            passive_used = passive_used or c.get("passive", False)
-            if passive_used and all(candidate.get("passive") for candidate in candidates):
-                # No further order can fit the one-passive-order limit. Keep
-                # the already valued quote and avoid a redundant full sweep.
+            if budget < minimum:
                 break
             # All candidates see the same remaining shared UNKNOWN budget.
             book = [*book, dict(rate=c["rate"], period=c["period"], amount=amount)]
@@ -816,7 +831,7 @@ def adjustment(policy, model, offer, candidates, trades, book, now_ms, current_f
         )
 
         def executable_replacement(c):
-            quoted_amount = min(amount, funding_minimum()) if c.get("passive") else amount
+            quoted_amount = amount
             result = value_candidate(
                 policy,
                 model,
@@ -830,21 +845,6 @@ def adjustment(policy, model, offer, candidates, trades, book, now_ms, current_f
                 quote=c,
                 market=market,
             )
-            remainder = amount - quoted_amount
-            if remainder > 0:
-                # A passive replacement cannot absorb the old order's tail.
-                # Unallocated cash earns zero, and remains occupied through
-                # the horizon; do not simulate an illegal sub-minimum loan.
-                occupied = float(quoted_amount) * sum(result["firstCycleHours"]) + float(remainder) * HOURS * base.PATHS
-                score = sum(result["firstCycleInterests"]) * 365 * 24 / max(occupied, 1e-12)
-                result.update(
-                    cycleNetApr=score,
-                    cycleEfficiencyNetApr=score,
-                    conservativeNetApr=base.quantile(result["pathInterests"], 0.1)
-                    * 365
-                    / (float(amount) * base.HORIZON),
-                    unallocatedCash=remainder,
-                )
             return result
 
         choices = [executable_replacement(c) for c in candidates]

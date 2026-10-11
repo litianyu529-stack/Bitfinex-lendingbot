@@ -128,17 +128,17 @@ def advance(runtime, snapshot, clock, minutes=1):
 
 
 @pytest.mark.parametrize("currency", ["USD", "USDT"])
-def test_real_core_small_passive_plan_and_private_lease_survive_restart(tmp_path, monkeypatch, currency):
+def test_real_core_full_passive_plan_and_private_lease_survive_restart(tmp_path, monkeypatch, currency):
     runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch, currency)
     result = integration.cycle(runtime, snap, account, {}, NOW, False)
-    assert len(result["submitted"]) == 1 and result["submitted"][0]["amount"] == 150
-    assert result["idle_amount"] == 163 and runtime.client.calls == 1
+    assert len(result["submitted"]) == 1 and result["submitted"][0]["amount"] == 313
+    assert result["idle_amount"] == 0 and runtime.client.calls == 1
     lease = next(iter(PassiveState(runtime.store).value["leases"].values()))
     assert lease["offerId"] == result["submitted"][0]["offerId"] and lease["expiresAtMs"] == NOW + 3600000
     snap["offers"] = [
         dict(
             offer_id=lease["offerId"],
-            amount=D(150),
+            amount=D(313),
             rate=D(".0002"),
             period=2,
             offer_type="LIMIT",
@@ -146,8 +146,8 @@ def test_real_core_small_passive_plan_and_private_lease_survive_restart(tmp_path
             mts_created=NOW,
         )
     ]
-    account["wallet"] -= 150
-    account["existingExposure"] = dict(total=D(150), variable=D(0))
+    account["wallet"] -= 313
+    account["existingExposure"] = dict(total=D(313), variable=D(0))
     advance(runtime, snap, clock)
     integration.cycle(runtime, snap, account, {}, clock[0], False)
     assert runtime.client.calls == 1
@@ -285,7 +285,8 @@ def test_private_lease_checksum_missing_intent_and_evidence_watermark(tmp_path):
     policy = StrategyPolicyV3()
     row = dict(period=2, submitted_rate=".0002", amount=150, pool="short", layer="balanced", slice_index=0)
     lease = state.prepare(row, "a", "4", NOW, policy)
-    assert state.prepare(row, "b", "4", NOW, policy) is lease
+    assert state.prepare(row, "a", "4", NOW, policy) is lease
+    assert state.prepare(row, "b", "4", NOW, policy) is not lease
     assert state.renew(lease, NOW + 3600000, ["trade:1"], policy)
     assert not state.renew(lease, NOW + 3700000, ["trade:1"], policy)
     assert not state.renew(lease, NOW + 6 * 3600000, ["trade:2"], policy)
@@ -466,9 +467,11 @@ def test_new_read_defaults_never_rehash_frozen_old_active(engine):
     assert base.digest(_normalization_payload(strategy_v3_from_record(record), record)) == before
 
 
-def test_preflight_planning_uses_existing_private_passive_budget_and_stale_views_preserve_it(tmp_path, monkeypatch):
+def test_preflight_uses_remaining_balance_and_stale_views_preserve_private_lease(tmp_path, monkeypatch):
     runtime, snap, account, _, clock, _ = fixture(tmp_path, monkeypatch)
     result = integration.cycle(runtime, snap, account, {}, NOW, False)
+    account["wallet"] = D(0)
+    account["existingExposure"] = dict(total=D(313), variable=D(0))
     lease = next(iter(PassiveState(runtime.store).value["leases"].values()))
     ctx = integration.context(runtime.store, runtime.policy, snap["book"], snap["trades"], NOW, runtime._stats)
     planned = integration.plan(account, runtime.policy, {"adaptiveContext": ctx}, "preflight")

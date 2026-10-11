@@ -70,7 +70,7 @@ def test_template_model_frozen_and_currency_isolation(currency):
     before = copy.deepcopy(model)
     r = core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))
     assert model == before and not r.get("blockReasons")
-    assert len(r["plan"]) <= 1 and r["planned_amount"] <= 150
+    assert len(r["plan"]) == 1 and r["planned_amount"] == account["wallet"]
     wrong = core.build_plan(
         account,
         replace(p, currency="USDT" if currency == "USD" else "USD"),
@@ -124,7 +124,7 @@ def test_four_types_quotes_floors_and_cold_start_not_own_sample_blocked(kind):
     p = replace(p, **{field: typ == kind for typ, field in core.FIELDS.items()}, variable_max_share=D(100))
     result = core.build_plan(account, p, model, book, trades, NOW, "test", D(".0006"))
     assert not result.get("blockReasons")
-    assert result["plan"] and result["planned_amount"] == 150
+    assert result["plan"] and result["planned_amount"] == account["wallet"]
     assert all(row["display_type"] == kind and row["passive"] for row in result["plan"])
     assert all(row["effective_rate"] >= base.gross_floor(p, row["period"]) for row in result["plan"])
     assert all(c["confidence"] == "LOW" for c in result["candidates"])
@@ -145,20 +145,20 @@ def test_unknown_capacity_is_shared_and_known_fixed_not_frr_and_delete_not_deman
     # Only one observed unit (the book), no duplicate historical tape capacity.
     trades[0]["mts"] = NOW - 3600001
     result = core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))
-    assert result["planned_amount"] <= 300  # 150 shared normal unit + at most one 150 forecast lease.
+    assert result["planned_amount"] == account["wallet"]
     assert sum(r["amount"] for r in result["plan"] if not r["passive"]) <= 150
     assert sum(r["passive"] for r in result["plan"]) <= 1
 
 
-def test_passive_one_minimum_no_remainder_existing_lease_and_quarantine():
+def test_passive_full_balance_existing_lease_and_quarantine():
     p, model, trades, book, account = setup()
     account["wallet"] = D(280)
     first = core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))
-    assert first["planned_amount"] == 150 and first["idle_amount"] == 130
+    assert first["planned_amount"] == 280 and first["idle_amount"] == 0
     row = first["plan"][0]
     assert row["leaseMinutes"] == 60 and row["evidenceWatermark"] == ["trade:0"]
     account["passiveLeaseStates"] = [dict(active=True, expiresAtMs=NOW + 60000)]
-    assert not core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))["plan"]
+    assert core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))["planned_amount"] == 280
     account.pop("passiveLeaseStates")
     # Quarantine every candidate to prevent choosing another equal-price period.
     account["passiveQuarantines"] = {
@@ -171,6 +171,32 @@ def test_passive_one_minimum_no_remainder_existing_lease_and_quarantine():
     assert not core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))["plan"]
     trades[0]["mts"] = NOW - 500
     assert core.build_plan(account, p, model, book, trades, NOW, "test", D(".0002"))["plan"]
+
+
+@pytest.mark.parametrize("currency", ["USD", "USDT"])
+def test_full_balance_can_wait_at_floor_without_predicted_immediate_fill(currency):
+    p, model, trades, book, account = setup(currency, rate=".00001")
+    p = replace(p, **{field: kind == "LIMIT" for kind, field in core.FIELDS.items()})
+    result = core.build_plan(account, p, model, book, trades, NOW, "full-balance", D(".00001"))
+    assert not result.get("blockReasons") and result["planned_amount"] == account["wallet"]
+    assert result["idle_amount"] == 0 and len(result["plan"]) == 1
+    order = result["plan"][0]
+    assert order["passive"] and order["effective_rate"] >= base.gross_floor(p, order["period"])
+    assert all(c["expectedFillProbability"] == 0 for c in result["candidates"])
+
+
+def test_full_balance_fallback_preserves_known_quote_quarantine():
+    p, model, trades, book, account = setup(calibrated=True)
+    trades[0]["mts"] = NOW - 3600001
+    book[0].update(amount=D(-50), demandType="LIMIT")
+    first = core.build_plan(account, p, model, book, trades, NOW, "full-balance", D(".0002"))
+    assert first["planned_amount"] == account["wallet"]
+    account["passiveQuarantines"] = {
+        core.quote_key(p.currency, c): dict(closedAtMs=NOW, evidenceWatermark=c["evidenceWatermark"])
+        for c in first["candidates"]
+    }
+    blocked = core.build_plan(account, p, model, book, trades, NOW, "full-balance", D(".0002"))
+    assert blocked["plan"] == []
 
 
 def test_caps_minimum_slots_long_boundary_and_frr_missing():
@@ -410,7 +436,7 @@ def test_path_starts_at_observed_point_and_matched_wait_handles_tail():
     assert core._matched_hour(prefix, 2879, 1, [0] * 8, 1) is None
 
 
-def test_passive_replacement_uses_minimum_and_zero_interest_cash_tail(monkeypatch):
+def test_passive_replacement_values_the_entire_order(monkeypatch):
     p, model, trades, book, _ = setup()
     amounts = []
 
@@ -435,8 +461,8 @@ def test_passive_replacement_uses_minimum_and_zero_interest_cash_tail(monkeypatc
         period=2, rate=D(".0003"), submitted_rate=D(".0003"), offer_type="LIMIT", display_type="LIMIT", passive=True
     )
     decision = core.adjustment(p, model, offer, [candidate], trades, book, NOW)
-    assert amounts == [D(183), D(150)]
-    assert decision["action"] == "KEEP" and decision["cycleEfficiencyGain"] < 0
+    assert amounts == [D(183), D(183)]
+    assert decision["action"] == "CANCEL" and decision["cycleEfficiencyGain"] > 0
 
 
 def test_multi_block_allocation_freezes_renewal_basis_and_finishes_within_budget():

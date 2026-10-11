@@ -151,7 +151,7 @@ def test_decision_local_path_reuse_preserves_full_candidate_value(inputs, monkey
         core.value_candidate(policy, model, 7, D(".0005"), D(150), trades, book, NOW, market=market)
 
 
-def test_all_passive_candidates_stop_after_one_legal_order(inputs, monkeypatch):
+def test_passive_candidates_allocate_and_value_full_available_balance(inputs, monkeypatch):
     policy, model, trades, _, account = inputs
     account["wallet"] = D(600)
     book = [dict(period=2, rate=D(".0006"), amount=D(-1000))]
@@ -159,10 +159,45 @@ def test_all_passive_candidates_stop_after_one_legal_order(inputs, monkeypatch):
     monkeypatch.setattr(core, "value_candidate", fake_value(calls))
     with funding_sizing(D(150)):
         result = core.build_plan(account, policy, model, book, trades, NOW, "active", D(".0005"))
-    assert len(result["plan"]) == 1 and result["planned_amount"] == D(150)
-    assert result["idle_amount"] == D(450)
+    assert len(result["plan"]) == 1 and result["planned_amount"] == D(600)
+    assert result["idle_amount"] == 0
     assert all(c["passive"] for c in result["candidates"])
     assert {call[-1] for call in calls} == {1}
+    assert calls[-1][3] == D(600)
+
+
+def test_revalued_frr_floor_block_cannot_receive_next_allocation(inputs, monkeypatch):
+    policy, model, trades, _, account = inputs
+    policy = replace(policy, maximum_period=8, long_from_days=8, variable_max_share=D(100))
+    account["wallet"] = D(1000)
+    book = [
+        dict(period=2, rate=D(".0006"), amount=D(-150), demandType="FIXED"),
+        dict(period=2, rate=D(".0006"), amount=D(-10000), demandType="FRR"),
+    ]
+    calls = []
+    baseline = fake_value(calls)
+
+    def quotes(*args):
+        return [
+            dict(rate=D(".0004"), submitted_rate=D(".0004"), offer_type="LIMIT", display_type="LIMIT"),
+            dict(rate=D(".0005"), submitted_rate=D(0), offer_type="FRRDELTAVAR", display_type="FRR"),
+        ]
+
+    def value(*args, **kwargs):
+        result = baseline(*args, **kwargs)
+        is_limit = result["display_type"] == "LIMIT"
+        reevaluated = len(args[6]) > len(book)
+        result["cycleNetApr"] = (0 if reevaluated else 0.2) if is_limit else 0.1
+        if reevaluated and not is_limit:
+            result.update(expectedFillProbability=0, typeBlockReason="FRR保守持有收益低于净年化底线")
+        return result
+
+    monkeypatch.setattr(core.previous, "quotes", quotes)
+    monkeypatch.setattr(core, "value_candidate", value)
+    result = core.build_plan(account, policy, model, book, trades, NOW, "active", D(".0005"))
+    assert any(call[1] == "FRR" and call[-1] > len(book) for call in calls)
+    assert result["planned_amount"] == account["wallet"]
+    assert all(row["display_type"] == "LIMIT" for row in result["plan"])
 
 
 @pytest.mark.parametrize("over_cap", [False, True])
@@ -195,8 +230,8 @@ def test_frr_valued_once_per_phase_and_same_executable_plan(inputs, monkeypatch)
     monkeypatch.setattr(core, "value_candidate", fake_value(calls))
     with funding_sizing(D(150)):
         result = core.build_plan(account, policy, model, book, trades, NOW, "active", D(".0005"))
-    assert Counter(call[-1] for call in calls) == {2: 2, 3: 2}
-    assert Counter((call[0], call[-1]) for call in calls) == {(2, 2): 1, (7, 2): 1, (2, 3): 1, (7, 3): 1}
+    assert Counter(call[-1] for call in calls) == {2: 2}
+    assert Counter((call[0], call[-1]) for call in calls) == {(2, 2): 1, (7, 2): 1}
     assert len(result["candidates"]) == 2 and len(result["plan"]) == 1
     assert result["planned_amount"] == D(150)
     order = result["plan"][0]
