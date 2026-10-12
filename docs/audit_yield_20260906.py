@@ -10,7 +10,7 @@ from statistics import median
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from StateStore import LendingStateStore  # noqa: E402 - project import after path bootstrap
+from StateStore import LendingStateStore  # noqa: E402 -- repository-local audit entry point
 
 DAY = 86400000
 c = sqlite3.connect((ROOT / ".state/lendingbot-v3.sqlite3").as_uri() + "?mode=ro", uri=True)
@@ -200,8 +200,8 @@ for p in (2, 7, 14, 30, 120):
     )
 out["order_states"] = rows("SELECT state,count(*) AS n FROM order_intents GROUP BY state")
 out["curve_counts"] = rows(
-    "SELECT pricing_curve_version,count(*) AS n,min(created_at_ms) AS first_ms,"
-    "max(created_at_ms) AS last_ms FROM order_intents GROUP BY pricing_curve_version"
+    "SELECT pricing_curve_version,count(*) AS n,min(created_at_ms) AS first_ms,max(created_at_ms) AS last_ms "
+    "FROM order_intents GROUP BY pricing_curve_version"
 )
 c.rollback()
 c.close()

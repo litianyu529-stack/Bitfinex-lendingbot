@@ -20,7 +20,7 @@ from StrategyV3 import (
     replay_strategy_v3,
     validate_policy_v3,
 )
-from bitfinex import BitfinexApiError, currency_to_symbol
+from bitfinex import BitfinexApiError
 
 
 D = Decimal
@@ -77,7 +77,6 @@ def backfill_public_market_data(
     minimum_interval_seconds=4.1,
     rate_limiter=None,
     retry_sleeper=time.sleep,
-    currency="USD",
 ):
     """Page public fUSD trades/stats without any authenticated or write call."""
     days = int(days)
@@ -89,46 +88,41 @@ def backfill_public_market_data(
     stats_limit = min(250, limit)
     limiter = rate_limiter or PublicRateLimiter(minimum_interval_seconds)
 
+    existing_trades = store.market_trades(start, now)
+    existing_trade_coverage = _coverage(existing_trades)
     trade_cursor = start
-    gaps, boundaries, seen = [], [], set()
+    if existing_trade_coverage["earliestMs"] is not None and existing_trade_coverage["earliestMs"] <= start + DAY_MS:
+        trade_cursor = int(existing_trade_coverage["latestMs"]) + 1
     trade_pages = 0
     while trade_cursor < now:
         raw = _public_read(
-            lambda: client.funding_trades(
-                currency_to_symbol(currency), start=trade_cursor, end=now, limit=limit, sort=1
-            ),
+            lambda: client.funding_trades("fUSD", start=trade_cursor, end=now, limit=limit, sort=1),
             limiter,
             retry_sleeper,
         )
         parsed = parse_funding_trades(raw)
-        fresh = [row for row in parsed if str(row["id"]) not in seen]
-        # Monotonic timestamp pagination only overlaps the previous boundary.
-        # Do not retain millions of historical IDs in memory.
-        seen = {str(row["id"]) for row in parsed}
         store.upsert_market_trades(parsed)
         trade_pages += 1
         if len(raw or []) < limit:
             break
         if not parsed:
             raise RuntimeError("funding trade page contained no usable cursor")
-        next_cursor = max(int(row["mts"]) for row in parsed)
-        boundaries.append({"fromMs": trade_cursor, "throughMs": next_cursor, "uniqueIds": len(fresh)})
+        next_cursor = max(int(row["mts"]) for row in parsed) + 1
         if next_cursor <= trade_cursor:
-            gaps.append(
-                {"atMs": trade_cursor, "reason": "timestamp page boundary saturated; ID pagination unavailable"}
-            )
-            break
+            raise RuntimeError("funding trade pagination cursor did not advance")
         trade_cursor = next_cursor
 
     # Funding stats are returned newest-first by the public history endpoint, so
     # page backwards by end timestamp.  Upserts make restart/repetition idempotent.
+    existing_stats = store.funding_stats(start, now)
+    existing_stats_coverage = _coverage(existing_stats)
     stats_cursor = now
+    if existing_stats_coverage["latestMs"] is not None and existing_stats_coverage["latestMs"] >= now - 15 * 60 * 1000:
+        stats_cursor = int(existing_stats_coverage["earliestMs"]) - 1
     stats_pages = 0
     while stats_cursor >= start:
         raw = _public_read(
-            lambda: client.funding_stats(
-                currency_to_symbol(currency), start=start, end=stats_cursor, limit=stats_limit
-            ),
+            lambda: client.funding_stats("fUSD", start=start, end=stats_cursor, limit=stats_limit),
             limiter,
             retry_sleeper,
         )
@@ -144,27 +138,19 @@ def backfill_public_market_data(
             raise RuntimeError("funding stats pagination cursor did not move backwards")
         stats_cursor = next_cursor
 
-    # Coverage metadata never materializes multi-million-row history lists.
-    with store.read_connection() as connection:
-
-        def summary(table):
-            row = connection.execute(
-                f"SELECT count(*),min(mts),max(mts) FROM {table} WHERE mts>=? AND mts<=?", (start, now)
-            ).fetchone()
-            return {"count": row[0], "earliestMs": row[1], "latestMs": row[2]}
-
-        trade_coverage = summary("market_trades")
-        stats_coverage = summary("funding_stats")
+    trades = store.market_trades(start, now)
+    stats = store.funding_stats(start, now)
+    trade_coverage = _coverage(trades)
+    stats_coverage = _coverage(stats)
     tolerance = DAY_MS
     complete = bool(
-        not gaps
-        and trade_coverage["earliestMs"] is not None
+        trade_coverage["earliestMs"] is not None
         and trade_coverage["earliestMs"] <= start + tolerance
         and stats_coverage["earliestMs"] is not None
         and stats_coverage["earliestMs"] <= start + tolerance
     )
-    coverage = {
-        "symbol": currency_to_symbol(currency),
+    return {
+        "symbol": "fUSD",
         "requestedDays": days,
         "startMs": start,
         "endMs": now,
@@ -173,19 +159,11 @@ def backfill_public_market_data(
         "trades": trade_coverage,
         "stats": stats_coverage,
         "complete": complete,
-        "gaps": gaps,
-        "tradePageBoundaries": boundaries,
         "bookHistory": {
             "backfillable": False,
             "note": "Historical order-book snapshots are unavailable; minute snapshots begin at deployment.",
         },
     }
-    from pathlib import Path
-
-    directory = Path(store.path).resolve().parent / "research" / currency
-    directory.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(str(directory / "public-coverage.json"), json.dumps(coverage, sort_keys=True))
-    return coverage
 
 
 def _policy_id(policy):
@@ -277,9 +255,8 @@ def _window_metrics(policy, trades, stats, principal, start_ms, end_ms):
         "netAprPercent": D(result["actualNetAprPercent"]),
         "utilizationPercent": D(result["estimatedUtilizationPercent"]),
         "fillCount": len(fills),
-        "averageWaitMinutes": None,
-        "cancellationRatePercent": None,
-        "timingEvidence": "旧聚合回放不具有逐订单等待与撤单证据；请使用V4事件回放",
+        "averageWaitMinutes": D("0") if fills else elapsed_days * D("1440"),
+        "cancellationRatePercent": D("0"),
         "longOccupancyPercent": D("0") if not fills else D(len(long_fills)) * D("100") / D(len(fills)),
         "sampleCount": int(result["sampleCount"]),
     }
@@ -388,7 +365,7 @@ def evaluate_strategies(store, active_policy, principal, days=90, now_ms=None):
     result = {
         "schemaVersion": 1,
         "generatedAtMs": now,
-        "symbol": currency_to_symbol(active_policy.currency),
+        "symbol": "fUSD",
         "principal": principal,
         "methodology": {
             "split": "chronological 60-day train / 15-day validation / 15-day test",

@@ -1,14 +1,12 @@
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
-from Currency import normalize_currency, require_currency
 
 from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
 from Recovery import (
@@ -16,7 +14,6 @@ from Recovery import (
     RECOVERY_REQUIRED_SNAPSHOTS,
     recovery_category_for_reason,
     recovery_delay_seconds,
-    resume_target,
 )
 
 
@@ -24,15 +21,10 @@ D = Decimal
 RUNTIME_MODES = {"PAUSED", "LIVE", "REPLAY", "APPLYING"}
 OPEN_INTENT_STATES = {"PLANNED", "SUBMITTING", "AMBIGUOUS"}
 AUTO_RECOVERABLE_PAUSE_REASONS = {
-    "ADAPTIVE_FRR_STALE",
     "MARKET_DATA_STALE",
     "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN",
     "ACCOUNT_RECONCILIATION_MISMATCH",
     "AMBIGUOUS_WALLET_TRANSFER",
-}
-NON_RECOVERABLE_PAUSE_REASONS = {
-    "ADAPTIVE_DATA_UNAVAILABLE", "ADAPTIVE_MODEL_NOT_QUALIFIED", "ADAPTIVE_JOURNAL_FAILED",
-    "EXECUTION_BARRIER_UNAVAILABLE",
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
 EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
@@ -86,49 +78,13 @@ def slice_pool_layer(slice_key):
 
 
 class LendingStateStore:
-    def __init__(self, path, clock=time.time, currency="USD", config_path=None):
-        self.config_path = config_path
+    def __init__(self, path, clock=time.time):
         self.path = os.path.abspath(path)
-        self.currency = require_currency(currency)
         self.clock = clock
         os.makedirs(os.path.dirname(self.path) or os.getcwd(), exist_ok=True)
         self._lock = threading.RLock()
-        self._check_existing_currency()
         self._backup_before_schema_migration()
         self._initialize()
-
-    def _check_existing_currency(self):
-        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
-            return
-        connection = sqlite3.connect(self.path)
-        try:
-            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if "schema_meta" in tables:
-                row = connection.execute("SELECT value FROM schema_meta WHERE key='currency'").fetchone()
-                if row is not None and row[0] != self.currency:
-                    raise StateStoreError("state database belongs to another currency")
-                version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
-                if version is not None and int(version[0]) > 17:
-                    raise StateStoreError("state database schema is newer than this application")
-            for table in ("offers", "credits", "order_intents", "funding_trades", "ledger_entries"):
-                if table not in tables:
-                    continue
-                columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-                if "currency" in columns:
-                    currencies = connection.execute(f"SELECT DISTINCT currency FROM {table}").fetchall()
-                    if any(normalize_currency(row[0]) != self.currency for row in currencies):
-                        raise StateStoreError("state database contains another currency")
-            # Unlabelled databases were USD-only, including their public market history.
-            if tables and self.currency != "USD" and "schema_meta" in tables:
-                row = connection.execute("SELECT value FROM schema_meta WHERE key='currency'").fetchone()
-                if row is None:
-                    raise StateStoreError("unlabelled legacy databases belong to USD")
-        finally:
-            connection.close()
-
-    def _validate_currency_rows(self, rows):
-        if any(normalize_currency(row.get("currency", self.currency)) != self.currency for row in rows):
-            raise StateStoreError("cannot write another currency into this state database")
 
     def _now_ms(self):
         return int(self.clock() * 1000)
@@ -144,7 +100,9 @@ class LendingStateStore:
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version >= 17:
+        if version > 16:
+            raise StateStoreError("state database schema is newer than V3.5; use the offline rollback migration")
+        if version >= 16:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -154,8 +112,6 @@ class LendingStateStore:
         while os.path.exists(backup_path):
             backup_path = os.path.join(backup_dir, f"schema-v{version}-{stamp}-{suffix}.sqlite3")
             suffix += 1
-        if self.config_path and os.path.isfile(self.config_path):
-            shutil.copy2(self.config_path, backup_path + ".cfg")
         source = sqlite3.connect(self.path)
         target = sqlite3.connect(backup_path)
         try:
@@ -194,6 +150,34 @@ class LendingStateStore:
                 connection.close()
 
     def _initialize(self):
+        # Dashboard reads construct stores too. Re-running all migrations under
+        # a write lock on every poll can starve the actual lending worker.
+        connection = self._connect()
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+            ).fetchone()
+            if exists:
+                ready = dict(connection.execute("SELECT key,value FROM schema_meta").fetchall())
+                boundary_needs_evidence = (
+                    ready.get("schema_version") == "16"
+                    and ready.get("v35_initialization_complete") == "1"
+                    and "release_0.3.5_boundary_evidence_at_ms" not in ready
+                    and connection.execute(
+                        "SELECT 1 FROM order_intents WHERE pricing_curve_version IN "
+                        "('EXACT_TERM_EXPLORATION_V2','EXACT_TERM_EXPLORATION_V3','EXACT_TERM_EXPLORATION_V4') "
+                        "LIMIT 1"
+                    ).fetchone() is not None
+                )
+                if (
+                    ready.get("schema_version") == "16"
+                    and ready.get("v35_initialization_complete") == "1"
+                    and "release_0.3.5_activated_at_ms" in ready
+                    and not boundary_needs_evidence
+                ):
+                    return
+        finally:
+            connection.close()
         statements = [
             """CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
@@ -570,20 +554,15 @@ class LendingStateStore:
             self._migrate_v15_exact_reprice_replacements(connection)
             self._migrate_v16_fixed_landing_rate(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '17')
-                   ON CONFLICT(key) DO UPDATE SET value='17'"""
-            )
-            connection.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('currency', ?)", (self.currency,))
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('release_4.0.0_started_at_ms', ?)",
-                (str(self._now_ms()),),
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '16')
+                   ON CONFLICT(key) DO UPDATE SET value='16'"""
             )
             self._initialize_v35_release_boundary(connection, self._now_ms())
             connection.execute(
                 """INSERT OR IGNORE INTO income_sync_state(
                     currency, status, updated_at_ms
-                ) VALUES(?, 'PENDING', ?)""",
-                (self.currency, self._now_ms()),
+                ) VALUES('USD', 'PENDING', ?)""",
+                (self._now_ms(),),
             )
             connection.execute(
                 """INSERT OR IGNORE INTO consolidation_state(singleton, state, updated_at_ms)
@@ -601,6 +580,7 @@ class LendingStateStore:
                 ) VALUES(1, 'PAUSED', NULL, ?)""",
                 (self._now_ms(),),
             )
+            connection.execute("INSERT OR REPLACE INTO schema_meta VALUES('v35_initialization_complete','1')")
 
     @staticmethod
     def _initialize_v35_release_boundary(connection, now_ms):
@@ -892,47 +872,6 @@ class LendingStateStore:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
         return dict(row)
 
-    def pause_currency(self, reason="dashboard_pause"):
-        """Revoke LIVE recovery without deleting evidence of an uncertain write."""
-        with self.transaction(immediate=True) as connection:
-            row = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
-            connection.execute(
-                "UPDATE runtime_state SET mode='PAUSED', previous_mode='PAUSED', updated_at_ms=? WHERE singleton=1",
-                (self._now_ms(),),
-            )
-            connection.execute(
-                "UPDATE recovery_state SET target_mode='PAUSED', origin_mode='PAUSED', resume_pending_cycle=0 "
-                "WHERE singleton=1"
-            )
-            if not row["safe_reason"]:
-                connection.execute("UPDATE recovery_state SET active=0 WHERE singleton=1")
-            connection.execute(
-                "INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms) VALUES(?,'PAUSED',?,?)",
-                (row["mode"], reason, self._now_ms()),
-            )
-        return self.runtime()
-
-    def authorize_live_after_preflight(self, revalidated_adaptive=False):
-        """Keep uncertainty while setting an explicitly confirmed resume destination."""
-        row = self.runtime()
-        if row["safe_manual"]:
-            raise StateStoreError("manual unresolved writes require resolution before LIVE")
-        recovery = self.recovery_status()
-        adaptive_revalidated = (
-            revalidated_adaptive
-            and not recovery["active"]
-            and row["safe_reason"] in {
-                "ADAPTIVE_DATA_UNAVAILABLE", "ADAPTIVE_MODEL_NOT_QUALIFIED", "ADAPTIVE_JOURNAL_FAILED"
-            }
-        )
-        if (row["safe_reason"] or recovery["active"]) and not adaptive_revalidated:
-            with self.transaction(immediate=True) as connection:
-                connection.execute("UPDATE runtime_state SET previous_mode='LIVE' WHERE singleton=1")
-                connection.execute("UPDATE recovery_state SET origin_mode='LIVE', target_mode='LIVE' WHERE singleton=1")
-        else:
-            self.set_mode("LIVE", "v4_preflight_confirmed")
-        return self.runtime()
-
     @staticmethod
     def _recovery_payload(row):
         value = dict(row)
@@ -992,13 +931,7 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
             current = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            if (
-                runtime["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS
-                and not current["active"]
-                and category != "WORKER_EXIT"
-            ):
-                return self._recovery_payload(current)
-            origin = str(origin_mode or resume_target(dict(runtime), self._recovery_payload(current))).upper()
+            origin = str(origin_mode or runtime["previous_mode"] or runtime["mode"] or "PAUSED").upper()
             target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
             if target not in {"LIVE", "PAUSED", "REPLAY"}:
                 target = "PAUSED"
@@ -1070,9 +1003,6 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
             if not row["active"] or row["manual_required"]:
-                return {"resumed": False, "recovery": self._recovery_payload(row)}
-            runtime = connection.execute("SELECT safe_reason FROM runtime_state WHERE singleton=1").fetchone()
-            if runtime["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS:
                 return {"resumed": False, "recovery": self._recovery_payload(row)}
             last = row["last_probe_at_ms"]
             count = int(row["successful_snapshots"] or 0)
@@ -1177,10 +1107,7 @@ class LendingStateStore:
             current = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             previous = current["previous_mode"] if current["safe_reason"] else current["mode"]
             sticky_manual = bool(manual or current["safe_manual"])
-            sticky_barrier = current["safe_reason"] in NON_RECOVERABLE_PAUSE_REASONS
-            safe_reason = (
-                current["safe_reason"] if sticky_barrier or (sticky_manual and current["safe_manual"]) else str(reason)
-            )
+            safe_reason = current["safe_reason"] if sticky_manual and current["safe_manual"] else str(reason)
             connection.execute(
                 """UPDATE runtime_state
                    SET mode = 'PAUSED', previous_mode = ?, safe_reason = ?, safe_manual = ?,
@@ -1193,7 +1120,7 @@ class LendingStateStore:
                     "INSERT INTO mode_events(from_mode, to_mode, reason, created_at_ms) VALUES(?, 'PAUSED', ?, ?)",
                     (current["mode"], str(reason), now),
                 )
-        category = None if sticky_barrier else recovery_category_for_reason(reason)
+        category = recovery_category_for_reason(reason)
         if category is not None:
             self.begin_recovery(
                 category,
@@ -1320,7 +1247,6 @@ class LendingStateStore:
         return self.runtime()
 
     def save_strategy(self, policy_payload, status="PENDING"):
-        self._validate_currency_rows([policy_payload])
         status = str(status).upper()
         if status not in {"DRAFT", "PENDING", "ACTIVE", "ARCHIVED"}:
             raise StateStoreError("invalid strategy status")
@@ -2076,24 +2002,7 @@ class LendingStateStore:
             "after": self.period_activity(activated, currency, now + 1),
         }
 
-    def release_comparison_v4(self, now_ms=None):
-        now = int(now_ms if now_ms is not None else self._now_ms())
-        with self.read_connection() as connection:
-            row = connection.execute("SELECT value FROM schema_meta WHERE key='release_4.0.0_started_at_ms'").fetchone()
-        activated = int(row[0])
-        elapsed = max(0, now - activated)
-        return {
-            "version": "4.0.0",
-            "label": "V4",
-            "activatedAtMs": activated,
-            "boundarySource": "FIRST_V4_START",
-            "comparisonDurationMs": elapsed,
-            "before": self.period_activity(activated - elapsed, self.currency, activated),
-            "after": self.period_activity(activated, self.currency, now + 1),
-        }
-
     def reserve_intent(self, order, wallet_available):
-        self._validate_currency_rows([order])
         fingerprint = order.get("fingerprint") or order_intent_fingerprint(
             order.get("currency", "USD"),
             order["amount"],
@@ -3009,7 +2918,6 @@ class LendingStateStore:
         return None if result is None else dict(result)
 
     def reconcile_offers(self, offers, seen_at_ms=None):
-        self._validate_currency_rows(offers)
         seen_at = int(seen_at_ms if seen_at_ms is not None else self._now_ms())
         ids = []
         with self.transaction(immediate=True) as connection:
@@ -3097,7 +3005,6 @@ class LendingStateStore:
             return [dict(row) for row in connection.execute(query).fetchall()]
 
     def adopt_external_offers(self, offers, strategy_version):
-        self._validate_currency_rows(offers)
         """Persist explicit preflight-approved ownership without touching the exchange."""
         adopted = []
         now = self._now_ms()
@@ -3278,7 +3185,6 @@ class LendingStateStore:
         return None if row is None else row["last_reprice"]
 
     def reconcile_credits(self, credits, seen_at_ms=None):
-        self._validate_currency_rows(credits)
         seen_at = int(seen_at_ms if seen_at_ms is not None else self._now_ms())
         ids = []
         with self.transaction(immediate=True) as connection:
@@ -3537,7 +3443,6 @@ class LendingStateStore:
         return len(active)
 
     def upsert_offer_history(self, offers):
-        self._validate_currency_rows(offers)
         with self.transaction(immediate=True) as connection:
             for offer in offers or []:
                 managed = (
@@ -3569,7 +3474,6 @@ class LendingStateStore:
                 )
 
     def upsert_credit_history(self, credits):
-        self._validate_currency_rows(credits)
         with self.transaction(immediate=True) as connection:
             for credit in credits or []:
                 managed = False
@@ -3739,7 +3643,6 @@ class LendingStateStore:
             )
 
     def upsert_income_ledgers(self, rows, category=28):
-        self._validate_currency_rows(rows)
         """Store authoritative interest ledger rows, keyed by Bitfinex ledger ID."""
         with self.transaction(immediate=True) as connection:
             for row in rows or []:
@@ -3866,7 +3769,7 @@ class LendingStateStore:
             reprices = connection.execute(
                 "SELECT COUNT(*) AS count FROM reprice_events WHERE created_at_ms >= ?", (start,)
             ).fetchone()["count"]
-            waits = self._funding_wait_records(connection, self.currency, start, now + 1)
+            waits = self._funding_wait_records(connection, "USD", start, now + 1)
             closures = connection.execute(
                 "SELECT * FROM credit_closures WHERE closed_at_ms >= ? ORDER BY closed_at_ms",
                 (start,),
@@ -3891,7 +3794,7 @@ class LendingStateStore:
             "closedCreditCount": len(closures),
             "returnsByPoolAndType": {key: _decimal_text(value) for key, value in sorted(attributed.items())},
         }
-        ledger_interest = self.realized_income(self.currency, None if window_days is None else start, now)
+        ledger_interest = self.realized_income("USD", None if window_days is None else start, now)
         if not rows:
             return {
                 "windowDays": window_days,
@@ -3918,7 +3821,7 @@ class LendingStateStore:
             idle_time += max(D("0"), total - utilized) * duration_days
         # APR is estimated only for the period where principal samples exist.
         # The displayed realized income can cover a wider ledger interval.
-        apr_interest = self.realized_income(self.currency, max(start, int(rows[0]["mts"])), now)
+        apr_interest = self.realized_income("USD", max(start, int(rows[0]["mts"])), now)
         sample_from = int(rows[0]["mts"])
         sample_to = int(rows[-1]["mts"])
         sample_days = D(max(0, sample_to - sample_from)) / D("86400000")

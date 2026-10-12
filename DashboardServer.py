@@ -11,7 +11,7 @@ import secrets
 from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 
 MAX_BODY_BYTES = 64 * 1024
@@ -45,7 +45,6 @@ class DashboardApplication:
     replay_from_store: Callable[..., dict]
     create_preflight: Callable[..., dict]
     start_controlled: Callable[..., dict]
-    v4_service: Any = None
 
 
 def load_static_snapshot(directory, build_id, csrf_token, build_placeholder, csrf_placeholder):
@@ -167,11 +166,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
         try:
             if app is None:
                 raise RuntimeError("Dashboard application is not configured")
-            if self._handle_v4_get(app, path):
-                return
             if path == "/api/health":
-                from Lifecycle import status as lifecycle_status
-
                 self._send_json(
                     {
                         "ok": True,
@@ -182,7 +177,6 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                         "projectRoot": app.project_root,
                         "configPath": os.path.abspath(self.config_path),
                         "time": app.timestamp(),
-                        "lifecycle": lifecycle_status(self.app_context) if self.app_context is not None else None,
                     }
                 )
                 return
@@ -214,8 +208,6 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             if app is None:
                 raise RuntimeError("Dashboard application is not configured")
             self._validate_write_request()
-            if self._handle_v4_post(app, path):
-                return
             if path == "/api/config":
                 self._read_json_body()
                 self._send_json(
@@ -289,140 +281,6 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self._send_api_error(exc.code, exc, status=exc.status, details=exc.details)
         except Exception as exc:
             self._send_api_error("REQUEST_REJECTED", exc, status=400)
-
-    def _handle_v4_get(self, app, path):
-        if path not in {
-            "/api/config/v4",
-            "/api/status/v4",
-            "/api/runtime/v4",
-            "/api/stats/v4",
-            "/api/control/v4/status",
-            "/api/research/v4/status",
-        }:
-            return False
-        from Currency import require_currency
-
-        service = app.v4_service
-        query = parse_qs(urlparse(self.path).query)
-        currency = query.get("currency", [None])[0]
-        if path in {"/api/runtime/v4", "/api/stats/v4"}:
-            result = service.runtime() if path == "/api/runtime/v4" else service.statistics()
-            result = result[require_currency(currency)] if currency is not None else {"currencies": result}
-        else:
-            currency = require_currency(currency)
-            if path == "/api/config/v4":
-                result = service.config(currency)
-            elif path == "/api/research/v4/status":
-                result = service.research.status(currency)
-            elif path == "/api/status/v4":
-                result = service.status(currency)
-            else:
-                result = dict(app.controlled_status(self.config_path, self.app_context))
-                result["workerRunning"] = result["running"]
-                status = service.status(currency)
-                result["running"] = result["running"] and (
-                    status["operationMode"] == "LIVE"
-                    or status["recovery"].get("targetMode") == "LIVE"
-                    and status["recovery"]["active"]
-                )
-        self._send_json({"ok": True, **result})
-        return True
-
-    def _handle_v4_post(self, app, path):
-        routes = {
-            "/api/config/v4",
-            "/api/control/v4/preflight",
-            "/api/control/v4/start",
-            "/api/control/v4/stop",
-            "/api/runtime/v4/mode",
-            "/api/runtime/v4/resolve-ambiguous",
-            "/api/strategy/v4/preview",
-            "/api/strategy/v4/draft",
-            "/api/strategy/v4/apply",
-            "/api/strategy/v4/discard",
-            "/api/research/v4/evaluate",
-            "/api/research/v4/prepare",
-            "/api/research/v4/shadow/start",
-            "/api/research/v4/shadow/stop",
-            "/api/research/v4/cancel",
-            "/api/research/v4/resume",
-        }
-        if path not in routes:
-            return False
-        from Currency import funding_sizing, require_currency
-        from RuntimeV4 import FundingWriteGate
-
-        payload = self._read_json_body()
-        service = app.v4_service
-        if path == "/api/control/v4/stop":
-            self._send_json({"ok": True, "bot": service.stop()})
-            return True
-        currency = require_currency(payload.get("currency"))
-        if path.startswith("/api/research/v4/"):
-            if path.endswith(("/cancel", "/stop")):
-                result = service.research.stop(currency)
-            else:
-                kind = (
-                    service.research.status(currency).get("kind", "evaluate")
-                    if path.endswith("/resume")
-                    else "shadow"
-                    if path.endswith("/start")
-                    else "prepare"
-                    if path.endswith("/prepare")
-                    else "evaluate"
-                )
-                result = service.research.start(
-                    currency,
-                    kind,
-                    resume=path.endswith("/resume"),
-                    engine=payload.get("engine", "adaptive_net_yield_v1"),
-                )
-        elif path == "/api/config/v4":
-            result = service.settings(payload)
-        elif path == "/api/control/v4/preflight":
-            result = service.preflight(payload.get("currencies") or [currency])
-        elif path == "/api/control/v4/start":
-            result = {"bot": service.start(payload.get("preflightId"), payload.get("currencies") or [currency])}
-        elif path == "/api/runtime/v4/mode":
-            if payload.get("mode") == "PAUSED":
-                result = {"runtime": service.pause(currency)}
-            elif payload.get("mode") == "REPLAY":
-                replay = app.replay_from_store(self.config_path, context=self.app_context, currency=currency, v4=True)
-                store, _ = app.store_for_config(self.config_path, currency)
-                result = {"runtime": store.runtime(), "replay": replay}
-            else:
-                raise ApiRequestError("LIVE 需预检；模式接口仅接受 PAUSED、REPLAY", "LIVE_PREFLIGHT_REQUIRED")
-        elif path == "/api/runtime/v4/resolve-ambiguous":
-            store, _ = app.store_for_config(self.config_path, currency)
-            result = store.resolve_ambiguous_intent(
-                payload.get("intentId"),
-                exchange_offer_id=payload.get("exchangeOfferId"),
-                close=bool(payload.get("confirmAbsent", False)),
-            )
-        else:
-            actions = {
-                "preview": app.strategy_preview,
-                "draft": app.save_strategy_draft,
-                "apply": app.apply_strategy_draft,
-                "discard": app.discard_strategy_draft,
-            }
-            action = path.rsplit("/", 1)[-1]
-            payload = {**payload, "strategyV3": payload.get("strategyV4", payload.get("strategyV3", {}))}
-            if action == "discard":
-                result = actions[action](self.config_path, app_context=self.app_context, currency=currency, v4=True)
-            else:
-                _, settings = app.store_for_config(self.config_path, currency)
-                gate = FundingWriteGate(service._client(settings), {}, self.app_context.now)
-                with funding_sizing(gate.minimum(currency)):
-                    result = actions[action](
-                        self.config_path,
-                        payload,
-                        app_context=self.app_context,
-                        currency=currency,
-                        **({"v4": True} if action in {"preview", "draft"} else {}),
-                    )
-        self._send_json({"ok": True, **result})
-        return True
 
     def _handle_mode(self, app, payload):
         target = str(payload.get("mode", "")).strip().upper()

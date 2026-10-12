@@ -9,12 +9,11 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import replace
+import traceback
 from decimal import Decimal, getcontext
 from http.server import ThreadingHTTPServer
 
-from bitfinex import Bitfinex, BitfinexApiError, currency_to_symbol
-from Currency import funding_minimum
+from bitfinex import Bitfinex, BitfinexApiError
 from Logger import Logger
 from AppContext import AppContext
 from ExchangeModels import parse_funding_stats, parse_funding_trades, parse_loan_rows
@@ -29,9 +28,9 @@ from RuntimeV3 import (
     parse_wallet_rows_v3,
 )
 from MarketDataStream import BitfinexMarketDataHub, websocket_dependency_available
-from Recovery import WORKER_HEARTBEAT_TIMEOUT_MS, classify_runtime_error, resume_target
-import Lifecycle
+from Recovery import WORKER_HEARTBEAT_TIMEOUT_MS, classify_runtime_error
 from StrategyV3 import (
+    USD_ORDER_CHUNK,
     build_market_signals_v3,
     gross_daily_floor,
     json_decimal,
@@ -117,23 +116,13 @@ WORKER_BUILD_FILES = (
     "StateStore.py",
     "StrategyV3.py",
     "StrategyResearch.py",
-    "StrategyV4.py",
-    "StrategyV41.py",
-    "OperationalV41.py",
-    "ResearchV4.py",
-    "ReplayV4.py",
-    "AdaptiveRuntime.py",
     "WriteRecovery.py",
     "Recovery.py",
-    "Currency.py",
-    "RuntimeV4.py",
-    "V4Service.py",
 )
 DASHBOARD_ASSET_FILES = (
     os.path.join("www", "lendingbot.html"),
     os.path.join("www", "lendingbot.js"),
     os.path.join("www", "v3-dashboard.js"),
-    os.path.join("www", "v4-dashboard.js"),
     os.path.join("www", "lendingbot.css"),
 )
 DASHBOARD_BUILD_FILES = WORKER_BUILD_FILES + DASHBOARD_ASSET_FILES
@@ -272,9 +261,6 @@ def parse_args(argv=None):
     parser.add_argument("--dashboard", action="store_true", help="start only the local web dashboard")
     parser.add_argument("--live", action="store_true", help="submit and cancel real Bitfinex funding offers")
     parser.add_argument("--confirmed-preflight", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--currency", choices=["USD", "USDT"], default="USD", help="currency for offline research")
-    parser.add_argument("--currencies", help="LIVE selection: USD,USDT (defaults to enabled currencies)")
-    parser.add_argument("--v4-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument(
         "--migrate-legacy", action="store_true", help="offline one-time migration of legacy ownership state"
@@ -311,23 +297,17 @@ def load_v3_account_context(client, store, now_ms):
     """Read the live account shape without changing exchange or local state."""
     basis = {"source": "REAL_ACCOUNT", "timestamp": int(now_ms), "stale": False, "warnings": []}
     try:
-        wallets = parse_wallet_rows_v3(client.wallets(), currency=store.currency)
+        wallets = parse_wallet_rows_v3(client.wallets())
         try:
-            offers = parse_offer_rows_v3(
-                client.active_funding_offers(currency_to_symbol(store.currency)), currency=store.currency
-            )
+            offers = parse_offer_rows_v3(client.active_funding_offers("fUSD"))
         except AttributeError:
             offers = []
         try:
-            credits = parse_credit_rows_v3(
-                client.active_funding_credits(currency_to_symbol(store.currency)), currency=store.currency
-            )
+            credits = parse_credit_rows_v3(client.active_funding_credits("fUSD"))
         except AttributeError:
             credits = []
         try:
-            loans = parse_loan_rows(
-                client.active_funding_loans(currency_to_symbol(store.currency)), currency=store.currency
-            )
+            loans = parse_loan_rows(client.active_funding_loans("fUSD"))
         except AttributeError:
             loans = []
     except Exception as exc:
@@ -345,7 +325,7 @@ def load_v3_account_context(client, store, now_ms):
             wallets = [
                 {
                     "wallet_type": "funding",
-                    "currency": store.currency,
+                    "currency": "USD",
                     "balance": Decimal(sample["total_principal"]),
                     "available": Decimal(sample["wallet_available"]),
                     "unsettled_interest": Decimal("0"),
@@ -368,7 +348,7 @@ def load_v3_account_context(client, store, now_ms):
         credit["layer"] = (stored or {}).get("layer")
         credit["display_type"] = v3_credit_display_type({**credit, **(stored or {})})
     snapshot = {"wallets": wallets, "offers": offers, "credits": credits, "loans": loans}
-    return LendingRuntimeV3._account(snapshot, store.currency), snapshot, basis
+    return LendingRuntimeV3._account(snapshot), snapshot, basis
 
 
 def provider_funding_rows(snapshot):
@@ -391,7 +371,7 @@ def proposed_external_adoption(account_snapshot, policy):
     }
     if policy.adopt_external_offers:
         for offer in simulated["offers"]:
-            if offer.get("currency") != policy.currency or offer.get("managed"):
+            if offer.get("currency") != "USD" or offer.get("managed"):
                 continue
             candidates.append({**offer, "display_type": v3_offer_display_type(offer)})
             offer["managed"] = True
@@ -399,41 +379,28 @@ def proposed_external_adoption(account_snapshot, policy):
             offer["layer"] = offer.get("layer") or "balanced"
             offer["display_type"] = v3_offer_display_type(offer)
     candidates.sort(key=lambda row: int(row["id"]))
-    return LendingRuntimeV3._account(simulated, policy.currency), simulated, candidates
+    return LendingRuntimeV3._account(simulated), simulated, candidates
 
 
 def load_v3_market_context(client, policy, now_ms):
     warnings = []
     try:
-        book = parse_book_v3(client.funding_book(currency_to_symbol(policy.currency), 250))
+        book = parse_book_v3(client.funding_book("fUSD", 250))
     except Exception as exc:
         book = []
         warnings.append(f"Funding Book 不可用：{exc}")
     try:
         trades = parse_funding_trades(
-            client.funding_trades(
-                currency_to_symbol(policy.currency), start=now_ms - 7 * 86_400_000, end=now_ms, limit=10000, sort=-1
-            )
+            client.funding_trades("fUSD", start=now_ms - 7 * 86_400_000, end=now_ms, limit=10000, sort=-1)
         )
     except Exception as exc:
         trades = []
         warnings.append(f"Funding Trades 不可用：{exc}")
     try:
-        stats = parse_funding_stats(
-            client.funding_stats(
-                currency_to_symbol(policy.currency), start=now_ms - 7 * 86_400_000, end=now_ms, limit=250
-            )
-        )
+        stats = parse_funding_stats(client.funding_stats("fUSD", start=now_ms - 7 * 86_400_000, end=now_ms, limit=250))
     except Exception as exc:
         stats = []
         warnings.append(f"Funding Stats 不可用：{exc}")
-    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        from ExchangeModels import current_frr_observation
-
-        try:
-            stats.append(current_frr_observation(client, currency_to_symbol(policy.currency), now_ms))
-        except Exception as exc:
-            warnings.append(f"当前 FRR 不可用：{exc}")
     return book, trades, stats, build_market_signals_v3(book, trades, stats, policy, now_ms), warnings
 
 
@@ -505,47 +472,13 @@ def strategy_v3_preview(
     now_ms=None,
     issue_token=True,
     app_context=None,
-    currency="USD",
-    v4=False,
-):
-    from Currency import funding_sizing, usdt_minimum
-
-    context = process_context(config_path, app_context, client_factory=client_factory)
-    _, settings = v3_store_for_config(config_path, currency)
-    factory = client_factory or context.client_factory or Bitfinex
-    client = factory(settings.api_key, settings.api_secret)
-    minimum = usdt_minimum(client.ticker("tUSTUSD")[0]) if currency == "USDT" else Decimal("150")
-    with funding_sizing(minimum):
-        return _strategy_v3_preview(
-            config_path,
-            payload,
-            lambda *_args: client,
-            now_ms,
-            issue_token,
-            context,
-            currency,
-            v4,
-        )
-
-
-def _strategy_v3_preview(
-    config_path,
-    payload,
-    client_factory=None,
-    now_ms=None,
-    issue_token=True,
-    app_context=None,
-    currency="USD",
-    v4=False,
 ):
     app_context = process_context(config_path, app_context, client_factory=client_factory)
     _prune_strategy_tokens(app_context.now())
     client_factory = client_factory or app_context.client_factory or Bitfinex
-    store, settings = v3_store_for_config(config_path, currency)
+    store, settings = v3_store_for_config(config_path)
     active, active_policy = ensure_active_strategy_v3(store, settings)
-    policy = strategy_v3_from_api_payload(
-        payload.get("strategyV3", {}), base=replace(active_policy, version=4) if v4 else active_policy
-    )
+    policy = strategy_v3_from_api_payload(payload.get("strategyV3", {}), base=active_policy)
     proposed_version = (
         active["version_id"]
         if strategy_v3_semantically_equal(policy, active_policy)
@@ -557,19 +490,13 @@ def _strategy_v3_preview(
     account, planned_snapshot, adoption_candidates = proposed_external_adoption(account_snapshot, policy)
     book, trades, stats, signals, warnings = load_v3_market_context(client, policy, now)
     warnings = [*basis["warnings"], *warnings]
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        from AdaptiveRuntime import context
-
-        signals["adaptiveContext"] = context(store, policy, book, trades, now, stats)
     result = LendingRuntimeV3._build_plan(account, policy, signals, proposed_version)
-    current_frr = signals.get("adaptiveContext", {}).get("frr")
-    signals.pop("adaptiveContext", None)
     if not policy_v3_to_json(policy)["floorsConfigured"]:
         warnings.append("三个最低净年化尚未全部填写；允许预览，但 LIVE 将被阻止。")
     proposed_record = {"version_id": proposed_version, "policy": json_decimal(policy.__dict__)}
     incompatible = []
     for offer in planned_snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy, current_frr)
+        violations = v3_offer_violations(offer, policy)
         if violations:
             incompatible.append({**json_decimal(offer), "violations": violations})
     non_changeable_credits = []
@@ -579,7 +506,7 @@ def _strategy_v3_preview(
             non_changeable_credits.append({**json_decimal(credit), "violations": violations})
     account_digest = _account_context_digest(account, account_snapshot)
     response = {
-        "currency": currency,
+        "currency": "USD",
         "principal": status_decimal(account["total"]),
         "available": status_decimal(account["wallet"]),
         "accountSnapshot": basis,
@@ -589,7 +516,7 @@ def _strategy_v3_preview(
         "policy": strategy_v3_api_values(policy),
         "orderSizing": order_sizing_payload(),
         "periodSelection": json_decimal(signals.get("periodSelection", {})),
-        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, currency)),
+        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, "USD")),
         "signals": json_decimal(signals),
         "plan": json_decimal(result),
         "fundingLimit": {
@@ -605,9 +532,7 @@ def _strategy_v3_preview(
         "ratioRebalanceCancellations": json_decimal(
             LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
         ),
-        "replay": {"state": "RESEARCH_REQUIRED", "note": "收益资格通过异步研究评估；即时预览不证明收益"}
-        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3")
-        else replay_strategy_v3(policy, trades, stats, account["total"], book, now),
+        "replay": replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
         "buildId": dashboard_build_id(),
@@ -620,15 +545,11 @@ def _strategy_v3_preview(
             "expiresAt": issued_at + PREFLIGHT_TTL_SECONDS,
             "buildId": dashboard_build_id(),
             "configPath": os.path.abspath(config_path),
-            "currency": currency,
-            "v4": v4,
             "activeVersion": active["version_id"],
             "proposedVersion": proposed_version,
             "policyHash": _canonical_sha256(policy.__dict__),
             "accountDigest": account_digest,
             "planHash": result["plan_hash"],
-            "modelHash": result.get("modelId"),
-            "operationalReportHash": result.get("operationalReportHash"),
         }
         with strategy_token_lock:
             strategy_preview_tokens[token] = context
@@ -638,12 +559,10 @@ def _strategy_v3_preview(
     return response
 
 
-def v3_store_for_config(config_path, currency="USD"):
+def v3_store_for_config(config_path):
     config, _ = read_config(config_path)
     settings = build_settings(parse_args(["--config", config_path]), config)
-    validate_settings(settings)
-    settings = config_layer.settings_for_currency(settings, currency)
-    return LendingStateStore(settings.state_db_file, currency=currency, config_path=config_path), settings
+    return LendingStateStore(settings.state_db_file), settings
 
 
 def v3_strategy_diff(left, right):
@@ -688,33 +607,7 @@ def v3_credit_violations(credit, policy):
     return violations
 
 
-def v3_offer_violations(offer, policy, current_frr=None):
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        from StrategyV4 import gross_floor
-
-        period = int(offer.get("period") or 0)
-        effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
-        kind = v3_offer_display_type(offer)
-        if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3") and kind in (
-            "FRR",
-            "FRR_DELTA_FIXED",
-            "FRR_DELTA_VARIABLE",
-        ):
-            if current_frr is not None:
-                effective = current_frr + Decimal(str(offer.get("rate") or 0))
-            elif not offer.get("rate_real"):
-                effective = None
-        return [
-            reason
-            for reason, invalid in (
-                ("disabled_type", not LendingRuntimeV3._display_type_enabled(policy, v3_offer_display_type(offer))),
-                ("hidden_disabled", bool(int(offer.get("flags") or 0))),
-                ("period_not_allowed", not 2 <= period <= policy.maximum_period),
-                ("below_new_floor", effective is not None and effective < gross_floor(policy, period)),
-                ("rate_unavailable", effective is None),
-            )
-            if invalid
-        ]
+def v3_offer_violations(offer, policy):
     pool = offer.get("pool") or pool_for_period(int(offer.get("period") or 0))
     display_type = v3_offer_display_type(offer)
     hidden = bool(int(offer.get("flags") or 0) & 64) or bool(offer.get("hidden"))
@@ -734,14 +627,12 @@ def v3_offer_violations(offer, policy, current_frr=None):
     return violations
 
 
-def runtime_v3_payload(config_path, context=None, currency="USD"):
+def runtime_v3_payload(config_path, context=None):
     context = process_context(config_path, context)
     _prune_strategy_tokens(context.now())
-    store, settings = v3_store_for_config(config_path, currency)
+    store, settings = v3_store_for_config(config_path)
     market_snapshot = None
-    if context.process_state.market_hub is not None and context.process_state.market_hub.symbol == currency_to_symbol(
-        currency
-    ):
+    if context.process_state.market_hub is not None:
         market_snapshot = json_decimal(context.process_state.market_hub.snapshot())
     runtime = store.runtime()
     active, active_policy = ensure_active_strategy_v3(store, settings)
@@ -766,8 +657,8 @@ def runtime_v3_payload(config_path, context=None, currency="USD"):
         "strategyDiff": v3_strategy_diff(active, proposed),
         "incompatibleOffers": incompatible,
         "marketSnapshot": market_snapshot,
-        "realizedIncome": store.realized_income_summary(currency),
-        "incomeHistorySync": store.income_history_sync_payload(currency),
+        "realizedIncome": store.realized_income_summary("USD"),
+        "incomeHistorySync": store.income_history_sync_payload("USD"),
     }
 
 
@@ -780,38 +671,26 @@ def stats_v3_payload(store):
             "90d": store.statistics(90),
             "all": store.statistics(None),
         },
-        "realizedIncome": store.realized_income_summary(store.currency),
-        "incomeHistorySync": store.income_history_sync_payload(store.currency),
+        "realizedIncome": store.realized_income_summary("USD"),
+        "incomeHistorySync": store.income_history_sync_payload("USD"),
     }
 
 
-def save_strategy_v3_draft(config_path, payload, app_context=None, currency="USD", v4=False):
+def save_strategy_v3_draft(config_path, payload, app_context=None):
     now = app_context.now if app_context is not None else time.time
     _prune_strategy_tokens(now())
-    store, settings = v3_store_for_config(config_path, currency)
+    store, settings = v3_store_for_config(config_path)
     active, active_policy = ensure_active_strategy_v3(store, settings)
-    policy = strategy_v3_from_api_payload(
-        payload.get("strategyV3", {}), base=replace(active_policy, version=4) if v4 else active_policy
-    )
+    policy = strategy_v3_from_api_payload(payload.get("strategyV3", {}), base=active_policy)
     token = str(payload.get("previewToken") or "")
     with strategy_token_lock:
         context = strategy_preview_tokens.pop(token, None)
-    if not context or context.get("currency", "USD") != currency or now() > context["expiresAt"]:
+    if not context or now() > context["expiresAt"]:
         raise ApiRequestError("策略预览已过期，请重新计算", "PREVIEW_STALE", 409)
     if context["buildId"] != dashboard_build_id() or context["configPath"] != os.path.abspath(config_path):
         raise ApiRequestError("Dashboard build 或配置路径已变化，请重新计算", "PREVIEW_STALE", 409)
     if active["version_id"] != context["activeVersion"] or _canonical_sha256(policy.__dict__) != context["policyHash"]:
         raise ApiRequestError("ACTIVE 或拟议策略已变化，请重新计算", "PREVIEW_STALE", 409)
-    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        from OperationalV41 import status as operational_status
-        from ResearchV4 import ModelRepository
-
-        repo = ModelRepository(store.path, currency)
-        model = repo.load(policy.model_id, int(now() * 1000))
-        if operational_status(repo, model, int(now() * 1000))["operationalReportHash"] != context.get(
-            "operationalReportHash"
-        ):
-            raise ApiRequestError("运行验收报告已变化，请重新预览", "PREVIEW_STALE", 409)
     if strategy_v3_semantically_equal(policy, active_policy):
         return {
             "versionId": active["version_id"],
@@ -851,11 +730,11 @@ def save_strategy_v3_draft(config_path, payload, app_context=None, currency="USD
     }
 
 
-def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_context=None, currency="USD"):
+def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_context=None):
     app_context = process_context(config_path, app_context, client_factory=client_factory)
     _prune_strategy_tokens(app_context.now())
     client_factory = client_factory or app_context.client_factory or Bitfinex
-    store, settings = v3_store_for_config(config_path, currency)
+    store, settings = v3_store_for_config(config_path)
     active, _ = ensure_active_strategy_v3(store, settings)
     draft = store.strategy("DRAFT")
     if draft is None:
@@ -864,59 +743,28 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     token = str(payload.get("applyToken") or "")
     with strategy_token_lock:
         context = strategy_apply_tokens.pop(token, None)
-    if (
-        not context
-        or context.get("currency", "USD") != currency
-        or context.get("configPath") != os.path.abspath(config_path)
-        or app_context.now() > context["expiresAt"]
-    ):
+    if not context or app_context.now() > context["expiresAt"]:
         raise ApiRequestError("应用确认已过期，请重新预览并保存草稿", "PREVIEW_STALE", 409)
     if context["buildId"] != dashboard_build_id() or context["activeVersion"] != active["version_id"]:
         raise ApiRequestError("Dashboard build 或 ACTIVE 已变化，请重新预览", "PREVIEW_STALE", 409)
     if draft_version != draft["version_id"] or context["draftVersionId"] != draft["version_id"]:
         raise ApiRequestError("待应用草稿与已确认版本不一致", "PREVIEW_STALE", 409)
     draft_policy = strategy_v3_from_record(draft)
-    if any(
-        r.get("policy", {}).get("strategy_engine") in (
-            "adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"
-        )
-        for r in (draft, active)
-    ) and (store.runtime()["mode"] == "LIVE" or store.recovery_status()["active"]):
-        raise ApiRequestError("先暂停该币种并完成恢复，再应用自适应策略", "CURRENCY_PAUSE_REQUIRED", 409)
     refreshed = strategy_v3_preview(
         config_path,
         {"strategyV3": strategy_v3_api_values(draft_policy)},
         client_factory=client_factory,
         issue_token=False,
         app_context=app_context,
-        currency=currency,
-        v4=context.get("v4", False),
     )
-    if (
-        draft_policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
-        and not refreshed["plan"].get("operationalReady")
-    ):
-        raise ApiRequestError("V4.1 模型尚未通过运行验收，请先快速准备模型", "MODEL_NOT_OPERATIONAL", 409)
-    if (
-        refreshed["accountDigest"] != context["accountDigest"]
-        or refreshed["plan"]["plan_hash"] != context["planHash"]
-        or refreshed["plan"].get("modelId") != context.get("modelHash")
-        or refreshed["plan"].get("operationalReportHash") != context.get("operationalReportHash")
-    ):
+    if refreshed["accountDigest"] != context["accountDigest"] or refreshed["plan"]["plan_hash"] != context["planHash"]:
         raise ApiRequestError(
             "账户或计划已变化，请检查新预览后再次确认",
             "PREVIEW_STALE",
             409,
             details={"preview": refreshed},
         )
-    if store.runtime()["mode"] == "LIVE" or (
-        controlled_bot_running(config_path, app_context)
-        and (
-            not context.get("v4", False)
-            or store.recovery_status().get("targetMode") == "LIVE"
-            and store.recovery_status()["active"]
-        )
-    ):
+    if controlled_bot_running(config_path, app_context) or store.runtime()["mode"] == "LIVE":
         strategy = store.promote_draft_to_pending()
         return {"status": "PENDING", "strategy": strategy}
     store.promote_draft_to_pending()
@@ -925,14 +773,14 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     return {"status": "ACTIVE", "strategy": strategy}
 
 
-def discard_strategy_v3_draft(config_path, app_context=None, currency="USD", v4=False):
+def discard_strategy_v3_draft(config_path, app_context=None):
     app_context = process_context(config_path, app_context)
-    store, _ = v3_store_for_config(config_path, currency)
+    store, _ = v3_store_for_config(config_path)
     discarded = []
     with app_context.process_state.lock:
         draft = store.strategy("DRAFT")
         pending = store.strategy("PENDING")
-        running = controlled_bot_running(config_path, app_context) and not v4
+        running = controlled_bot_running(config_path, app_context)
         runtime = store.runtime()
         if pending is not None and draft is None and (running or runtime["mode"] == "LIVE"):
             raise ApiRequestError(
@@ -954,10 +802,10 @@ def discard_strategy_v3_draft(config_path, app_context=None, currency="USD", v4=
     }
 
 
-def replay_v3_from_store(config_path, now_ms=None, context=None, currency="USD", v4=False):
+def replay_v3_from_store(config_path, now_ms=None, context=None):
     context = process_context(config_path, context)
-    store, settings = v3_store_for_config(config_path, currency)
-    if store.runtime()["mode"] == "LIVE" or (not v4 and controlled_bot_running(config_path, context)):
+    store, settings = v3_store_for_config(config_path)
+    if store.runtime()["mode"] == "LIVE" or controlled_bot_running(config_path, context):
         raise ConfigError("必须先暂停 LIVE 才能进入 REPLAY")
     store.set_mode("REPLAY", "dashboard_replay")
     now = int(now_ms if now_ms is not None else context.now() * 1000)
@@ -1266,19 +1114,7 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
         if process is not None:
             return_code = process.poll()
         if process is not None and return_code is not None:
-            Lifecycle.record(context, "WORKER_EXITED", pid=process.pid, returnCode=return_code,
-                             reason=state.stop_reason or "unknown")
             cleanup_controlled_bot_handle(context)
-        lifecycle = Lifecycle.status(context)
-        latest = lifecycle.get("latest")
-        data_age = None
-        try:
-            published = read_status_payload(context.status_path)
-            updated = published.get("last_update")
-            if updated:
-                data_age = context.now() - datetime.datetime.strptime(updated, "%Y-%m-%d %H:%M:%S").timestamp()
-        except (OSError, ValueError, TypeError):
-            pass
         return {
             "running": running,
             "pid": process.pid if internal_running else (external or {}).get("pid"),
@@ -1293,11 +1129,6 @@ def controlled_bot_status(config_path=DEFAULT_CONFIG, context=None):
                 or (external and external.get("buildMismatch"))
             ),
             "watchdogAuthorized": bool(state.auto_restart_authorization),
-            "lifecycle": lifecycle,
-            "lastLifecycleEvent": ({"kind": latest["event"], "atMs": latest["atMs"],
-                                    "reason": latest.get("reason")} if latest else None),
-            "sourceFresh": bool(running and data_age is not None and 0 <= data_age <= 60),
-            "dataAgeSeconds": data_age,
             **({"stateError": external["stateError"]} if external and external.get("stateError") else {}),
         }
 
@@ -1326,7 +1157,7 @@ def permission_enabled(permissions, scope, access):
     return bool(permissions.get(scope, {}).get(access, False))
 
 
-def evaluate_live_preflight(config_path, client_factory=None, context=None, currency="USD"):
+def evaluate_live_preflight(config_path, client_factory=None, context=None):
     """Perform the single V3 preflight used by both dashboard and live child."""
     context = process_context(config_path, context, client_factory=client_factory)
     client_factory = client_factory or context.client_factory or Bitfinex
@@ -1339,15 +1170,13 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
     try:
         config, _ = read_config(config_path)
         settings = build_settings(parse_args(["--config", config_path, "--live", "--no-server"]), config)
-        validate_settings(settings)
-        settings = config_layer.settings_for_currency(settings, currency)
-        store = LendingStateStore(settings.state_db_file, currency=currency, config_path=config_path)
+        store = LendingStateStore(settings.state_db_file)
         active, policy = ensure_active_strategy_v3(store, settings)
         validate_policy_v3(policy, require_live_floors=True)
         add_check("config", "V3 策略配置", True, f"SQLite ACTIVE {active['version_id']} 有效")
     except Exception as exc:
         add_check("config", "V3 策略配置", False, str(exc))
-        return {"checks": checks, "warnings": warnings, "summary": {"strategyVersion": policy.version}}
+        return {"checks": checks, "warnings": warnings, "summary": {"strategyVersion": 3}}
 
     draft = store.strategy("DRAFT")
     pending = store.strategy("PENDING")
@@ -1365,7 +1194,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
                 "message": "配置文件中的 V3 镜像与 SQLite ACTIVE 不一致；本次预检和实盘只使用 ACTIVE。",
             }
         )
-    add_check("v3_usd_only", "V3 币种范围", settings.currencies == [currency], f"当前预检币种 {currency}")
+    add_check("v3_usd_only", "V3 币种范围", settings.currencies == ["USD"], "V3 仅允许 currencies = USD")
     add_check(
         "v3_websocket_dependency",
         "WebSocket 运行库",
@@ -1379,7 +1208,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         return {
             "checks": checks,
             "warnings": warnings,
-            "summary": {"strategyVersion": policy.version, "activeStrategyVersion": active["version_id"]},
+            "summary": {"strategyVersion": 3, "activeStrategyVersion": active["version_id"]},
         }
     try:
         permissions = parse_key_permissions(client.key_permissions())
@@ -1389,7 +1218,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         return {
             "checks": checks,
             "warnings": warnings,
-            "summary": {"strategyVersion": policy.version, "activeStrategyVersion": active["version_id"]},
+            "summary": {"strategyVersion": 3, "activeStrategyVersion": active["version_id"]},
         }
 
     wallets_read = permission_enabled(permissions, "wallets", "read")
@@ -1442,63 +1271,15 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
     for message in basis["warnings"]:
         warnings.append({"code": "ACCOUNT_SNAPSHOT_WARNING", "message": message})
     book, trades, stats, signals, market_warnings = load_v3_market_context(client, policy, now)
-    add_check(
-        "book_usd", f"{currency} Funding 市场", bool(book), "Funding Book 可用" if book else "Funding Book 没有可用报价"
-    )
+    add_check("book_usd", "USD Funding 市场", bool(book), "Funding Book 可用" if book else "Funding Book 没有可用报价")
     for message in market_warnings:
         warnings.append({"code": "MARKET_DATA_WARNING", "message": message})
 
-    if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        from AdaptiveRuntime import context as adaptive_context, eligible
-
-        signals["adaptiveContext"] = adaptive_context(store, policy, book, trades, now, stats)
-        model = signals["adaptiveContext"]["model"]
-        qualified = eligible(store, model)
-        operational = signals["adaptiveContext"]
-        add_check(
-            "adaptive_model",
-            (
-                "自适应模型运行验收"
-                if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
-                else "自适应模型研究资格"
-            ),
-            (
-                operational["operationalReady"]
-                if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
-                else qualified
-            ),
-            (
-                "冻结模型已通过运行验收；收益研究单独展示"
-                if operational["operationalReady"]
-                else "；".join(operational["operationalBlockReasons"])
-            )
-            if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
-            else "冻结模型已通过收益研究"
-            if qualified
-            else "模型缺失、损坏或研究数据不足；禁止实盘启动",
-        )
-        if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3") and not qualified:
-            warnings.append(
-                {
-                    "code": "RESEARCH_NOT_VALIDATED",
-                    "message": "运行模型尚未证明收益优于旧策略；缺少自身样本的类型使用低置信度市场先验。",
-                }
-            )
     result = LendingRuntimeV3._build_plan(account, policy, signals, active["version_id"])
-    current_frr = signals.get("adaptiveContext", {}).get("frr")
-    if policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-        reasons = result.get("blockReasons", [])
-        add_check(
-            "adaptive_market_data",
-            "自适应 FRR与模型数据",
-            not reasons,
-            "FRR与模型数据可用于规划" if not reasons else "；".join(reasons),
-        )
-    signals.pop("adaptiveContext", None)
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy, current_frr)
+        violations = v3_offer_violations(offer, policy)
         if not violations:
             continue
         item = {**json_decimal(offer), "display_type": v3_offer_display_type(offer), "violations": violations}
@@ -1511,10 +1292,10 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
 
     if account["wallet"] <= 0:
         warnings.append(
-            {"code": "NO_AVAILABLE_BALANCE", "message": f"{currency} 当前没有可用资金；仍可先撤销不兼容的机器人挂单。"}
+            {"code": "NO_AVAILABLE_BALANCE", "message": "USD 当前没有可用资金；仍可先撤销不兼容的机器人挂单。"}
         )
-    elif account["wallet"] < funding_minimum():
-        warnings.append({"code": "BELOW_MINIMUM", "message": f"{currency} 可用余额低于最低单笔金额。"})
+    elif account["wallet"] < USD_ORDER_CHUNK:
+        warnings.append({"code": "BELOW_MINIMUM", "message": "USD 可用余额低于 V3 最低单笔金额。"})
     if incompatible_managed:
         warnings.append(
             {
@@ -1527,8 +1308,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
             {
                 "code": "EXTERNAL_ADOPTION_REQUIRES_CONFIRMATION",
                 "message": (
-                    f"预检确认后将接管 {len(adoption_candidates)} 笔外部 {currency} Funding 挂单；"
-                    "集合变化会使确认失效。"
+                    f"预检确认后将接管 {len(adoption_candidates)} 笔外部 USD Funding 挂单；集合变化会使确认失效。"
                 ),
             }
         )
@@ -1570,7 +1350,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         if enabled
     ]
     summary = {
-        "strategyVersion": policy.version,
+        "strategyVersion": 3,
         "buildId": worker_build_id(),
         "strategySource": "SQLITE_ACTIVE",
         "activeStrategyVersion": active["version_id"],
@@ -1580,11 +1360,9 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         "policy": strategy_v3_api_values(policy),
         "orderSizing": order_sizing_payload(),
         "periodSelection": json_decimal(signals.get("periodSelection", {})),
-        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, currency)),
+        "periodActivity": json_decimal(store.period_activity(now - 86_400_000, "USD")),
         "accountSnapshot": basis,
-        "accountDigest": _account_context_digest(
-            LendingRuntimeV3._account(original_snapshot, currency), original_snapshot
-        ),
+        "accountDigest": _account_context_digest(LendingRuntimeV3._account(original_snapshot), original_snapshot),
         "account": json_decimal(account),
         "fundingPools": {
             pool: {
@@ -1605,13 +1383,6 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None, curr
         "targetSlices": result["target_slice_count"],
         "actualSlices": len(result["plan"]),
         "planHash": result["plan_hash"],
-        "modelHash": result.get("modelId"),
-        "operationalReportHash": result.get("operationalReportHash"),
-        "operationalReady": result.get("operationalReady", False),
-        "eligibleForLiveCandidate": qualified
-        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3")
-        else False,
-        "strategyEngine": policy.strategy_engine,
         "strategyPlan": json_decimal(result["plan"]),
         "pendingCancellations": incompatible_managed,
         "externalIncompatibilities": incompatible_external,
@@ -1697,11 +1468,6 @@ def create_controlled_bot_preflight(config_path, client_factory=None, now=None, 
     return response
 
 
-def _require_single_currency_control(policy):
-    if policy.strategy_engine == "adaptive_net_yield_v3":
-        raise ConfigError("V4.2 必须使用 V4 币种预检和启动接口；旧单币启动不能授权接管外部挂单。")
-
-
 def consume_controlled_bot_preflight(config_path, preflight_id, now=None, context=None):
     context = process_context(config_path, context)
     state = context.process_state
@@ -1716,7 +1482,6 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
         raise ConfigError("策略配置在预检后发生变化，请重新运行预检")
     store, settings = v3_store_for_config(config_path)
     active, policy = ensure_active_strategy_v3(store, settings)
-    _require_single_currency_control(policy)
     if store.strategy("DRAFT") is not None or store.strategy("PENDING") is not None:
         raise ConfigError("预检后出现 DRAFT 或 PENDING 策略，请先应用或放弃并重新预检")
     if active["version_id"] != current.get("activeStrategyVersion"):
@@ -1763,9 +1528,6 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None, p
     with state.lock:
         if controlled_bot_running(config_path, context):
             raise ConfigError("机器人已在运行")
-        store, settings = v3_store_for_config(config_path)
-        _, policy = ensure_active_strategy_v3(store, settings)
-        _require_single_currency_control(policy)
         consume_controlled_bot_preflight(config_path, preflight_id, context=context)
         store, _ = v3_store_for_config(config_path)
         # A restart must never discard a durable recovery episode.  The new
@@ -1788,8 +1550,6 @@ def start_controlled_bot(config_path, status_path, preflight_id, context=None, p
             "--no-server",
             "--live",
             "--confirmed-preflight",
-            "--currencies",
-            "USD",
             "--json",
             status_path,
             "--jsonsize",
@@ -1839,12 +1599,6 @@ def stop_controlled_bot(
     state = context.process_state
     with state.lock:
         state.preflight = None
-        authorization = state.auto_restart_authorization or {}
-        metadata = LiveProcessLock.inspect(context.live_lock_path).get("metadata") or {}
-        if not preserve_authorization and (authorization.get("v4") or metadata.get("v4")):
-            for currency in ("USD", "USDT"):
-                store, _ = v3_store_for_config(config_path, currency)
-                store.pause_currency("dashboard_stop")
         if not preserve_authorization:
             state.auto_restart_authorization = None
         process = state.process
@@ -1853,8 +1607,6 @@ def stop_controlled_bot(
         if not internal_running and external is None:
             cleanup_controlled_bot_handle(context)
             return controlled_bot_status(config_path, context)
-        Lifecycle.record(context, "WORKER_STOP_REQUESTED", reason=reason,
-                         pid=process.pid if internal_running else (external or {}).get("pid"))
         if external is not None:
             if external.get("stateError"):
                 raise ConfigError(external["stateError"])
@@ -1869,7 +1621,6 @@ def stop_controlled_bot(
             if external_live_process(config_path, context) is not None:
                 raise ConfigError("实盘进程未在超时时间内释放单实例锁")
             state.stop_reason = reason
-            Lifecycle.record(context, "WORKER_STOPPED", pid=pid, reason=reason)
             return controlled_bot_status(config_path, context)
         process.terminate()
         try:
@@ -1879,7 +1630,6 @@ def stop_controlled_bot(
             process.wait(timeout=5)
         cleanup_controlled_bot_handle(context)
         state.stop_reason = reason
-        Lifecycle.record(context, "WORKER_STOPPED", pid=process.pid, reason=reason, returnCode=process.poll())
         return controlled_bot_status(config_path, context)
 
 
@@ -1902,21 +1652,7 @@ def worker_supervisor_loop(config_path, status_path, context):
         if not authorization:
             continue
         try:
-            if authorization.get("v4"):
-                from V4Service import supervisor_tick
-
-                supervisor_tick(config_path, status_path, context)
-                continue
             store, _ = v3_store_for_config(config_path)
-            active = store.strategy("ACTIVE")
-            if active and strategy_v3_from_record(active).strategy_engine == "adaptive_net_yield_v3":
-                # A previous single-currency session cannot approve new external
-                # IDs or promote itself to V4.2 during an automatic recovery.
-                # A fresh V4 confirmation supplies the explicit currency/ID scope.
-                state.auto_restart_authorization = None
-                state.preflight = None
-                state.stop_reason = "v42_requires_v4_preflight"
-                continue
             recovery = store.recovery_status()
             status = controlled_bot_status(config_path, context)
             now_ms = int(context.now() * 1000)
@@ -1931,7 +1667,7 @@ def worker_supervisor_loop(config_path, status_path, context):
                 if now_ms - baseline < WORKER_HEARTBEAT_TIMEOUT_MS:
                     continue
                 runtime = store.runtime()
-                target = resume_target(runtime, recovery)
+                target = recovery.get("targetMode") or runtime.get("previous_mode") or runtime["mode"]
                 if target not in {"LIVE", "PAUSED", "REPLAY"}:
                     target = "LIVE"
                 if runtime["mode"] != "PAUSED":
@@ -2024,8 +1760,6 @@ def make_dashboard_handler(directory, config_path, status_path, build_id=None, c
     Handler.csrf_token = csrf_token
     Handler.app_context = context
     Handler.dashboard_started_at = timestamp()
-    from V4Service import V4DashboardService
-
     Handler.application = DashboardApplication(
         project_root=os.path.abspath(os.path.dirname(__file__)),
         service_id=DASHBOARD_SERVICE_ID,
@@ -2045,7 +1779,6 @@ def make_dashboard_handler(directory, config_path, status_path, build_id=None, c
         replay_from_store=replay_v3_from_store,
         create_preflight=create_controlled_bot_preflight,
         start_controlled=start_controlled_bot,
-        v4_service=V4DashboardService(config_path, status_path, context),
     )
     return Handler
 
@@ -2082,12 +1815,10 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
             state.market_hub.start()
         server = ThreadingHTTPServer((host, port), handler)
         state.dashboard_server = server
-        Lifecycle.record(context, "DASHBOARD_STARTED", pid=os.getpid())
         try:
             log.log(f"网页控制台已启动：http://{host}:{port}/lendingbot.html")
             server.serve_forever()
         finally:
-            Lifecycle.record(context, "DASHBOARD_STOPPED", pid=os.getpid(), reason="server_closed")
             server.server_close()
             if state.dashboard_server is server:
                 state.dashboard_server = None
@@ -2096,7 +1827,6 @@ def start_web_server(log, config_path, status_path, context=None, raise_errors=F
                 state.supervisor_thread.join(timeout=5)
                 state.supervisor_thread = None
     except Exception as exc:
-        Lifecycle.record(context, "DASHBOARD_FAILED", pid=os.getpid(), reason=type(exc).__name__)
         log.log(f"网页控制台启动失败：{exc}")
         if raise_errors:
             raise
@@ -2132,7 +1862,7 @@ def publish_safe_status(log, store, exc):
     current = store.runtime()
     if decision.retryable:
         recovery = store.recovery_status()
-        origin = resume_target(current, recovery)
+        origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
         if current["mode"] != "PAUSED":
             runtime = store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
         else:
@@ -2200,14 +1930,12 @@ def migrate_legacy_state(context, store):
 
 def run_offline_commands(args, settings, context):
     ensure_offline_database_access(context)
-    store = LendingStateStore(context.state_db_path, clock=context.now, currency=args.currency, config_path=args.config)
+    store = LendingStateStore(context.state_db_path, clock=context.now)
     results = {}
     if args.migrate_legacy:
         results["legacyMigration"] = migrate_legacy_state(context, store)
     if args.backfill_market_data:
-        results["marketBackfill"] = backfill_public_market_data(
-            Bitfinex("", ""), store, days=args.research_days, currency=args.currency
-        )
+        results["marketBackfill"] = backfill_public_market_data(Bitfinex("", ""), store, days=args.research_days)
     if args.evaluate_strategy:
         _, active_policy = ensure_active_strategy_v3(store, settings)
         report = evaluate_strategies(
@@ -2216,9 +1944,7 @@ def run_offline_commands(args, settings, context):
             Decimal(str(args.principal)),
             days=args.research_days,
         )
-        report_path = os.path.join(
-            context.project_root, "docs", f"strategy-validation-report-{args.currency.lower()}.json"
-        )
+        report_path = os.path.join(context.project_root, "docs", "strategy-validation-report.json")
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         write_research_report(report_path, report)
         results["strategyEvaluation"] = {
@@ -2260,8 +1986,6 @@ def main(argv=None):
 
     context = build_app_context(args, settings)
     if offline_requested:
-        settings = config_layer.settings_for_currency(settings, args.currency)
-        context = replace(context, state_db_path=os.path.abspath(settings.state_db_file))
         try:
             return run_offline_commands(args, settings, context)
         except (ConfigError, StateStoreError, ValueError, RuntimeError, BitfinexApiError) as exc:
@@ -2306,16 +2030,116 @@ def main(argv=None):
             log.log("已退出")
         return exit_code
 
-    if args.live:
-        from V4Service import run_worker
-
+    normalization = normalize_current_active_strategy(args.config)
+    if normalization["changed"]:
+        log.log(f"V3 ACTIVE 已规范化：{normalization['fromVersion']} -> {normalization['versionId']}")
+    log.log("欢迎使用 Bitfinex 自动放贷机器人（实盘运行）")
+    preflight = evaluate_live_preflight(args.config)
+    failed_checks = [check for check in preflight["checks"] if check["status"] == "fail"]
+    if failed_checks:
+        for check in failed_checks:
+            log.log(f"实盘预检失败：{check['label']} — {check['detail']}")
+        return 1
+    for warning in preflight["warnings"]:
+        log.log("实盘预检警告：" + warning["message"])
+    if not args.confirmed_preflight:
         try:
-            return run_worker(args, settings, context, log)
-        except (ConfigError, StateStoreError, ValueError, BitfinexApiError) as exc:
-            log.log(f"V4 启动失败：{exc}")
+            confirmation = input("只读预检已通过。输入 LIVE 确认本次实盘启动：").strip()
+        except (EOFError, KeyboardInterrupt):
+            confirmation = ""
+        if confirmation != "LIVE":
+            log.log("未完成人工确认，保持 PAUSED。")
             return 1
+    live_lock = LiveProcessLock(context.live_lock_path)
+    if not live_lock.acquire(args.config, {"role": "live_worker", "service": "mika-lending-worker-v3"}):
+        log.log("实盘启动被拒绝：另一个机器人进程已持有单实例锁。")
+        return 1
+    log.log("实盘预检通过，开始同步账户并执行策略。")
+    client = Bitfinex(settings.api_key, settings.api_secret)
+    state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
+    _, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
+    # Preserve a durable protected PAUSED across process restarts so bootstrap can reconcile
+    # the uncertain exchange write from authoritative account data. Normal
+    # PAUSED starts still transition directly to LIVE after the confirmed preflight.
+    if not state_store_v3.runtime().get("safe_reason") and not state_store_v3.recovery_status().get("active"):
+        state_store_v3.set_mode("LIVE", "live_preflight_confirmed")
+    runtime_v3 = LendingRuntimeV3(
+        client,
+        active_policy,
+        state_store_v3,
+        log=log,
+        auto_transfer_wallets=(settings.transfer_from_wallets if "USD" in settings.transferable_currencies else ()),
+        on_policy_activated=lambda policy, _version: mirror_active_strategy_v3(args.config, policy),
+        clock=context.now,
+    )
 
-    return 1
+    if settings.web_server:
+        thread = threading.Thread(
+            target=start_web_server,
+            args=(log, args.config, settings.json_file, context),
+            daemon=True,
+        )
+        thread.start()
+
+    sleep_time = settings.sleep_active
+    deferred_recovery_error = None
+    try:
+        while True:
+            if deferred_recovery_error is not None:
+                try:
+                    publish_safe_status(log, state_store_v3, deferred_recovery_error)
+                except Exception as persist_exc:
+                    if not classify_runtime_error(persist_exc).retryable:
+                        return 1
+                    time.sleep(30)
+                    continue
+                deferred_recovery_error = None
+                # Persisting recovery is a read-only cycle. Strategy writes are
+                # deferred until a later normal cycle.
+                time.sleep(30)
+                continue
+            try:
+                runtime_v3.cycle()
+                sleep_time = 30 if state_store_v3.recovery_status()["active"] else settings.sleep_active
+                if settings.once:
+                    break
+                time.sleep(sleep_time)
+            except Exception as exc:
+                log.log("错误：" + str(exc))
+                decision = classify_runtime_error(exc)
+                try:
+                    publish_safe_status(log, state_store_v3, exc)
+                except Exception as persist_exc:
+                    if decision.retryable and classify_runtime_error(persist_exc).retryable:
+                        deferred_recovery_error = exc
+                    else:
+                        return 1
+                print(timestamp())
+                print(traceback.format_exc())
+                if settings.once:
+                    return 1
+                if deferred_recovery_error is None:
+                    try:
+                        if state_store_v3.recovery_status()["manualRequired"]:
+                            return 1
+                    except Exception as status_exc:
+                        if decision.retryable and classify_runtime_error(status_exc).retryable:
+                            deferred_recovery_error = exc
+                        else:
+                            return 1
+                sleep_time = 30
+                time.sleep(sleep_time)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        runtime_v3.shutdown()
+        if not state_store_v3.runtime().get("safe_reason"):
+            state_store_v3.set_mode("PAUSED", "live_process_stopped")
+        if settings.web_server:
+            stop_web_server(log, context)
+        live_lock.release()
+        log.log("已退出")
+    return 0
 
 
 if __name__ == "__main__":

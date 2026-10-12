@@ -1,13 +1,12 @@
 from decimal import Decimal
 
-from Currency import normalize_currency
-
 
 D = Decimal
 
 
 def _currency(value):
-    return normalize_currency(value or "USD")
+    symbol = str(value or "USD").upper()
+    return symbol[1:] if symbol.startswith("F") else symbol
 
 
 def parse_book(rows):
@@ -31,7 +30,7 @@ def parse_book(rows):
 
 def parse_wallet_rows(rows, currency="USD"):
     result = []
-    wanted = normalize_currency(currency)
+    wanted = str(currency).upper()
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 3:
             continue
@@ -59,7 +58,7 @@ def parse_wallet_rows(rows, currency="USD"):
 
 def parse_offer_rows(rows, currency="USD"):
     result = []
-    wanted = normalize_currency(currency)
+    wanted = str(currency).upper()
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 16:
             continue
@@ -91,7 +90,7 @@ def parse_offer_rows(rows, currency="USD"):
 
 def _parse_active_funding_rows(rows, currency="USD", funding_state="credit"):
     result = []
-    wanted = normalize_currency(currency)
+    wanted = str(currency).upper()
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 13:
             continue
@@ -132,7 +131,7 @@ def parse_loan_rows(rows, currency="USD"):
 
 def parse_funding_trade_history(rows, currency="USD"):
     result = []
-    wanted = normalize_currency(currency)
+    wanted = str(currency).upper()
     for row in rows or []:
         if not isinstance(row, (list, tuple)) or len(row) < 7:
             continue
@@ -173,27 +172,6 @@ def parse_funding_trades(rows):
             continue
         trades.append({"id": str(row[0]), "mts": mts, "amount": amount, "rate": rate, "period": period})
     return sorted(trades, key=lambda item: item["mts"])
-
-
-def current_frr_observation(client, symbol, observed_at_ms):
-    """Funding ticker index 0 is current daily FRR, observed locally now.
-
-    Historical statistics carry their original timestamps; never relabel those
-    rows as fresh quotes. The ticker provides no exchange observation timestamp.
-    """
-    row = client.ticker(symbol)
-    if not isinstance(row, (list, tuple)) or len(row) < 13:
-        raise ValueError("Funding ticker 格式无效")
-    rate = D(str(row[0]))
-    if not rate.is_finite() or rate <= 0:
-        raise ValueError("当前 FRR 必须为正有限数")
-    return {
-        "mts": int(observed_at_ms),
-        "frr_daily_rate": rate,
-        "source": "FUNDING_TICKER",
-        "observedAtMs": int(observed_at_ms),
-        "exchangeTimestampAvailable": False,
-    }
 
 
 def parse_funding_stats(rows):

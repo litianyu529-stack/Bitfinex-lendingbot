@@ -10,23 +10,9 @@ python -m compileall -q -f .
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 python -m pytest -q `
-    --cov=Currency `
-    --cov=RuntimeV4 `
-    --cov=V4Service `
     --cov=RuntimeV3 `
     --cov=StateStore `
     --cov=StrategyV3 `
-    --cov=StrategyV4 `
-    --cov=StrategyV41 `
-    --cov=StrategyV42 `
-    --cov=AdaptiveExecutionState `
-    --cov=AdaptiveEngines `
-    --cov=ExecutionSafety `
-    --cov=Lifecycle `
-    --cov=AdaptiveRuntime `
-    --cov=OperationalV41 `
-    --cov=ResearchV4 `
-    --cov=ReplayV4 `
     --cov=WriteRecovery `
     --cov=Recovery `
     --cov-branch `
@@ -39,28 +25,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m coverage report --include=StrategyV3.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-python -m coverage report --include=StrategyV4.py --fail-under=90
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-python -m coverage report --include=StrategyV41.py --fail-under=90
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-python -m coverage report --include=StrategyV42.py --fail-under=90
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-python -m coverage report --include=OperationalV41.py --fail-under=90
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
 python -m coverage report --include=Recovery.py --fail-under=90
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 node --check www/lendingbot.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 node --check www/v3-dashboard.js
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-node --check www/v4-dashboard.js
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-node --test tests/dashboard-v4.test.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 git diff --check

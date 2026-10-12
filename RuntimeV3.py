@@ -2,12 +2,10 @@ import threading
 import time
 from decimal import ROUND_DOWN
 
-from Currency import funding_minimum, normalize_currency
-
-from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol, validate_funding_payload
+from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
 from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
-from Recovery import classify_runtime_error, resume_target
+from Recovery import classify_runtime_error
 from StateStore import InsufficientReservedBalance
 from ExchangeModels import (
     extract_submitted_offer_id,
@@ -28,6 +26,7 @@ from StrategyV3 import (
     POOLS,
     SATOSHI,
     StrategyPolicyV3,
+    USD_ORDER_CHUNK,
     build_market_signals_v3,
     build_strategy_plan_v3,
     ceil_rate_tick,
@@ -52,18 +51,18 @@ MAX_FUNDING_SUBMISSIONS_PER_WINDOW = 60
 
 def order_sizing_payload():
     return {
-        "chunkBaseAmount": format(funding_minimum(), "f"),
+        "chunkBaseAmount": format(USD_ORDER_CHUNK, "f"),
         "remainderPolicy": "EVENLY_DISTRIBUTE",
         "maxSubmissionsPer60Seconds": MAX_FUNDING_SUBMISSIONS_PER_WINDOW,
     }
 
 
-def _active_lending_rows(credits, loans, currency="USD"):
+def _active_lending_rows(credits, loans):
     """Return provider-side funding exactly once across credit/loan states."""
 
     merged = {}
     for row in [*(credits or []), *(loans or [])]:
-        if normalize_currency(row.get("currency") or "USD") != currency:
+        if str(row.get("currency") or "USD").upper() != "USD":
             continue
         # Bitfinex SIDE=-1 is borrower exposure and is not an asset in this
         # funding wallet. Historical/local rows predate SIDE and default to 0.
@@ -149,7 +148,7 @@ def build_active_credit_dashboard(credits, total_principal, policy, now_ms):
     records = []
     rows = []
     for raw in credits or []:
-        if normalize_currency(raw.get("currency") or "USD") != policy.currency:
+        if str(raw.get("currency") or "USD").upper() != "USD":
             continue
         if str(raw.get("status") or "").upper() == "CLOSED":
             continue
@@ -269,7 +268,7 @@ def parse_ledger_rows_v3(rows):
             result.append(
                 {
                     "id": int(row[0]),
-                    "currency": normalize_currency(row[1]),
+                    "currency": str(row[1]).upper(),
                     "wallet": None if row[2] is None else str(row[2]).lower(),
                     "mts": int(row[3]),
                     "amount": D(str(row[5])),
@@ -295,14 +294,13 @@ class LendingRuntimeV3:
         clock=time.time,
     ):
         self.client = client
-        self.currency = normalize_currency(policy.currency)
         self.policy = validate_policy_v3(policy)
         self.store = store
         self.log = log
         self.hub = hub or BitfinexMarketDataHub(
             client.api_key,
             client.api_secret,
-            symbol=currency_to_symbol(self.currency),
+            symbol="fUSD",
             store=store,
             fallback_seconds=policy.ws_fallback_seconds,
             rest_stale_seconds=policy.rest_stale_seconds,
@@ -480,9 +478,9 @@ class LendingRuntimeV3:
         """Backfill ledgers without making a statistics outage a trading outage."""
         while not self._income_sync_stop.is_set():
             try:
-                state = self.store.income_sync_state(self.currency)
+                state = self.store.income_sync_state("USD")
                 self.sync_income_history_once()
-                updated = self.store.income_sync_state(self.currency)
+                updated = self.store.income_sync_state("USD")
                 if updated["status"] == "COMPLETE":
                     wait_seconds = 900
                 elif state.get("next_end_ms") == updated.get("next_end_ms"):
@@ -491,8 +489,8 @@ class LendingRuntimeV3:
                     # Stay below the documented authenticated endpoint rate limit.
                     wait_seconds = 0.75
             except Exception as exc:
-                self.store.update_income_sync_state(self.currency, status="ERROR", error=str(exc)[:500])
-                self._log(f"{self.currency} 历史收益同步失败（不影响交易）：{exc}")
+                self.store.update_income_sync_state("USD", status="ERROR", error=str(exc)[:500])
+                self._log(f"USD 历史收益同步失败（不影响交易）：{exc}")
                 wait_seconds = 60
             self._income_sync_stop.wait(wait_seconds)
 
@@ -500,21 +498,19 @@ class LendingRuntimeV3:
         """Fetch one historical page or one incremental page; safe to resume."""
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         limit = min(2500, max(1, int(page_limit)))
-        state = self.store.income_sync_state(self.currency)
+        state = self.store.income_sync_state("USD")
         if state["status"] == "COMPLETE":
             start = max(0, int(state.get("last_success_ms") or now) - 60_000)
-            rows = self.client.ledgers(self.currency, start=start, end=now, limit=limit, wallet="funding", category=28)
+            rows = self.client.ledgers("USD", start=start, end=now, limit=limit, wallet="funding", category=28)
             parsed = [
-                row
-                for row in parse_ledger_rows_v3(rows)
-                if row["currency"] == self.currency and row["wallet"] == "funding"
+                row for row in parse_ledger_rows_v3(rows) if row["currency"] == "USD" and row["wallet"] == "funding"
             ]
             self.store.upsert_income_ledgers(parsed, category=28)
             earliest = state.get("earliest_mts")
             if parsed:
                 earliest = min([row["mts"] for row in parsed] + ([earliest] if earliest is not None else []))
             return self.store.update_income_sync_state(
-                self.currency,
+                "USD",
                 status="COMPLETE",
                 earliest_mts=earliest,
                 last_success_ms=now,
@@ -522,11 +518,9 @@ class LendingRuntimeV3:
             )
 
         end = int(state.get("next_end_ms") or now)
-        self.store.update_income_sync_state(self.currency, status="BACKFILLING", error=None)
-        rows = self.client.ledgers(self.currency, end=end, limit=limit, wallet="funding", category=28)
-        parsed = [
-            row for row in parse_ledger_rows_v3(rows) if row["currency"] == self.currency and row["wallet"] == "funding"
-        ]
+        self.store.update_income_sync_state("USD", status="BACKFILLING", error=None)
+        rows = self.client.ledgers("USD", end=end, limit=limit, wallet="funding", category=28)
+        parsed = [row for row in parse_ledger_rows_v3(rows) if row["currency"] == "USD" and row["wallet"] == "funding"]
         self.store.upsert_income_ledgers(parsed, category=28)
         earliest = state.get("earliest_mts")
         if parsed:
@@ -535,7 +529,7 @@ class LendingRuntimeV3:
         completed = len(rows or []) < limit
         if completed:
             return self.store.update_income_sync_state(
-                self.currency,
+                "USD",
                 status="COMPLETE",
                 next_end_ms=None,
                 earliest_mts=earliest,
@@ -544,13 +538,13 @@ class LendingRuntimeV3:
                 error=None,
             )
         if not parsed:
-            raise BitfinexApiError(f"income history page contained no usable {self.currency} funding ledgers")
+            raise BitfinexApiError("income history page contained no usable USD funding ledgers")
         next_end = min(row["mts"] for row in parsed) - 1
         previous_end = state.get("next_end_ms")
         if previous_end is not None and next_end >= int(previous_end):
             raise BitfinexApiError("income history cursor did not move backwards")
         return self.store.update_income_sync_state(
-            self.currency,
+            "USD",
             status="BACKFILLING",
             next_end_ms=next_end,
             earliest_mts=earliest,
@@ -560,7 +554,7 @@ class LendingRuntimeV3:
 
     def sync_rest(self, include_history=False, now_ms=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
-        symbol = currency_to_symbol(self.currency)
+        symbol = currency_to_symbol("USD")
         raw_book = self.client.funding_book(symbol, 250)
         # The public endpoint applies ``limit`` before we build the short market
         # windows.  On busy markets an ascending seven-day query can therefore
@@ -572,7 +566,7 @@ class LendingRuntimeV3:
         raw_wallets = self.client.wallets()
         if self.auto_transfer_wallets and self.store.runtime()["mode"] == "LIVE":
             transferred = False
-            for wallet in parse_wallet_rows_v3(raw_wallets, currency=self.currency):
+            for wallet in parse_wallet_rows_v3(raw_wallets):
                 if (
                     wallet["wallet_type"] not in self.auto_transfer_wallets
                     or wallet.get("available") is None
@@ -585,19 +579,19 @@ class LendingRuntimeV3:
                     "transfer_between_wallets",
                     wallet["wallet_type"],
                     "funding",
-                    self.currency,
+                    "USD",
                     format(wallet["available"], "f"),
                 )
                 if result.outcome == WriteOutcome.CONFIRMED:
                     transferred = True
-                    self._log(f"{self.currency} 已从 {wallet['wallet_type']} 钱包自动转入 funding：{result.response}")
+                    self._log(f"USD 已从 {wallet['wallet_type']} 钱包自动转入 funding：{result.response}")
                 elif result.outcome == WriteOutcome.UNKNOWN:
                     # A complete wallet snapshot makes retrying this sweep
                     # idempotent: an already-transferred source balance is zero.
                     self.store.enter_protected_pause("AMBIGUOUS_WALLET_TRANSFER")
                     raise BitfinexAmbiguousWriteError(result.error)
                 else:
-                    self._log(f"{self.currency} 自动转入被明确拒绝：{result.error}")
+                    self._log(f"USD 自动转入被明确拒绝：{result.error}")
             if transferred:
                 raw_wallets = self.client.wallets()
         raw_offers = self.client.active_funding_offers(symbol)
@@ -609,17 +603,10 @@ class LendingRuntimeV3:
         book = parse_book_v3(raw_book)
         trades = parse_funding_trades(raw_trades)
         self._stats = parse_funding_stats(raw_stats)
-        if self.policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-            from ExchangeModels import current_frr_observation
-
-            observation = current_frr_observation(self.client, symbol, now)
-            if now_ms is None:
-                observation["mts"] = observation["observedAtMs"] = int(self.clock() * 1000)
-            self._stats.append(observation)
-        offers = parse_offer_rows_v3(raw_offers, currency=self.currency)
-        credits = parse_credit_rows_v3(raw_credits, currency=self.currency)
-        loans = parse_loan_rows_v3(raw_loans, currency=self.currency)
-        active_lending = _active_lending_rows(credits, loans, self.currency)
+        offers = parse_offer_rows_v3(raw_offers)
+        credits = parse_credit_rows_v3(raw_credits)
+        loans = parse_loan_rows_v3(raw_loans)
+        active_lending = _active_lending_rows(credits, loans)
         previously_managed = {int(row["offer_id"]) for row in self.store.offers(active_only=True) if row["managed"]}
         managed_ids = {int(row["offer_id"]) for row in self.store.offers() if row["managed"]}
         for offer in offers:
@@ -628,12 +615,11 @@ class LendingRuntimeV3:
             offer["display_type"] = self._offer_display_type(offer)
         authoritative_account = self._account(
             {
-                "wallets": parse_wallet_rows_v3(raw_wallets, currency=self.currency),
+                "wallets": parse_wallet_rows_v3(raw_wallets),
                 "offers": offers,
                 "credits": credits,
                 "loans": loans,
-            },
-            self.currency,
+            }
         )
         active_offer_ids = {int(row["id"]) for row in offers}
         known_credit_ids = {int(row["credit_id"]) for row in self.store.credits()}
@@ -644,7 +630,7 @@ class LendingRuntimeV3:
                 recent_rows = self.client.funding_trades_history(
                     symbol, start=now - 600_000, end=now, limit=250, sort=1
                 )
-                self._store_funding_trade_history(parse_funding_trade_rows_v3(recent_rows, currency=self.currency))
+                self._store_funding_trade_history(parse_funding_trade_rows_v3(recent_rows))
             except (BitfinexApiError, AttributeError) as exc:
                 self._log(f"成交归属即时同步失败，将保持待归属并安全重试：{exc}")
         self.store.reconcile_offers(offers, now)
@@ -671,16 +657,12 @@ class LendingRuntimeV3:
             strategy_version = active_strategy["version_id"] if active_strategy else "3"
             confirmed_external = []
             for offer in offers:
-                if offer.get("managed") or str(offer.get("currency") or self.currency).upper() != self.currency:
+                if offer.get("managed") or str(offer.get("currency") or "USD").upper() != "USD":
                     continue
                 takeover = self.store.observe_external_takeover(offer, now)
                 if takeover.get("state") == "CONFIRMED":
                     confirmed_external.append(offer)
-            adopted = (
-                self.store.adopt_external_offers(confirmed_external, strategy_version)
-                if self.policy.strategy_engine != "adaptive_net_yield_v3"
-                else []
-            )
+            adopted = self.store.adopt_external_offers(confirmed_external, strategy_version)
             if adopted:
                 adopted_ids = set(adopted)
                 for offer in offers:
@@ -750,7 +732,7 @@ class LendingRuntimeV3:
                     credit["display_type"] = stored.get("display_type") or credit.get("display_type")
             self.hub.apply_rest_snapshot(offers=offers, credits=credits, loans=loans, synced_at_ms=now)
         snapshot = self.hub.snapshot(now)
-        account = self._account(snapshot, self.currency)
+        account = self._account(snapshot)
         current = self.store.runtime()
         if current["mode"] == "PAUSED" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
             resolved_runtime = self.store.observe_ambiguous_cancel(active_offer_ids, now)
@@ -767,21 +749,7 @@ class LendingRuntimeV3:
             self._reconcile_ambiguous_dust_consolidation(active_offer_ids, now)
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
-            qualified = True
-            if current.get("safe_reason") == "ADAPTIVE_FRR_STALE" or (
-                self.policy.strategy_engine in ("adaptive_net_yield_v2", "adaptive_net_yield_v3")
-                and self.store.recovery_status()["active"]
-            ):
-                from AdaptiveRuntime import recovery_qualified
-
-                qualified = recovery_qualified(
-                    self.store, self.policy, snapshot,
-                    int(self.clock() * 1000) if now_ms is None else now, self._stats
-                )
-            if qualified:
-                self.store.record_consistent_sync(now)
-            elif self.store.recovery_status()["active"]:
-                self.store.record_recovery_failure("Adaptive model or fresh FRR is not qualified", now_ms=now)
+            self.store.record_consistent_sync(now)
         elif self.store.recovery_status()["active"]:
             reason = (
                 "MARKET_DATA_STALE"
@@ -807,7 +775,7 @@ class LendingRuntimeV3:
         busy accounts. Recovery therefore queries each request's own time window.
         """
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
-        symbol = currency_to_symbol(self.currency)
+        symbol = currency_to_symbol("USD")
         complete = True
         for intent in intents:
             request_ms = int(intent.get("request_started_at_ms") or intent.get("updated_at_ms") or now)
@@ -828,7 +796,7 @@ class LendingRuntimeV3:
                 complete = False
                 self._log(f"未知挂单 Funding Trades 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
-                self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows, currency=self.currency))
+                self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
                 if len(funding_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
                     complete = False
                     self._log("未知挂单 Funding Trades 达到 500 条上限，无法证明历史窗口完整。")
@@ -846,7 +814,7 @@ class LendingRuntimeV3:
                 complete = False
                 self._log(f"未知挂单 Funding Offers 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
-                self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows, currency=self.currency))
+                self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
                 if len(offer_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
                     complete = False
                     self._log("未知挂单 Funding Offers 达到 500 条上限，无法证明历史窗口完整。")
@@ -855,7 +823,6 @@ class LendingRuntimeV3:
         return complete
 
     def _store_funding_trade_history(self, parsed_funding):
-        self.store._validate_currency_rows(parsed_funding)
         with self.store.transaction(immediate=True) as connection:
             for row in parsed_funding:
                 managed = (
@@ -867,10 +834,9 @@ class LendingRuntimeV3:
                 connection.execute(
                     """INSERT OR REPLACE INTO funding_trades(
                         trade_id, currency, offer_id, amount, rate, period, mts, managed
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES(?, 'USD', ?, ?, ?, ?, ?, ?)""",
                     (
                         row["id"],
-                        self.currency,
                         row["offer_id"],
                         format(row["amount"], "f"),
                         format(row["rate"], "f"),
@@ -882,7 +848,7 @@ class LendingRuntimeV3:
 
     def sync_history(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
-        symbol = currency_to_symbol(self.currency)
+        symbol = currency_to_symbol("USD")
         start = now - 90 * 86_400_000
         try:
             funding_rows = (
@@ -900,7 +866,7 @@ class LendingRuntimeV3:
             funding_history_complete = False
         else:
             funding_history_complete = len(funding_rows) < AUTH_FUNDING_HISTORY_LIMIT
-        self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows, currency=self.currency))
+        self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
         try:
             offer_rows = self.client.funding_offers_history(
                 symbol, start=start, end=now, limit=AUTH_FUNDING_HISTORY_LIMIT
@@ -913,18 +879,18 @@ class LendingRuntimeV3:
             )
         except (BitfinexApiError, AttributeError):
             credit_rows = []
-        self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows, currency=self.currency))
-        self.store.upsert_credit_history(parse_credit_rows_v3(credit_rows, currency=self.currency))
+        self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
+        self.store.upsert_credit_history(parse_credit_rows_v3(credit_rows))
         self.store.prune_market_data(self.policy.market_retention_days, now)
         self._last_history_sync_ms = now
         return funding_history_complete
 
     @staticmethod
-    def _account(snapshot, currency="USD"):
+    def _account(snapshot):
         funding_wallets = [
             row
             for row in snapshot.get("wallets", [])
-            if row.get("wallet_type") == "funding" and row.get("currency") == currency
+            if row.get("wallet_type") == "funding" and row.get("currency") == "USD"
         ]
         wallet_available_known = bool(funding_wallets) and all(
             row.get("available") is not None for row in funding_wallets
@@ -936,8 +902,8 @@ class LendingRuntimeV3:
         wallet_balance = (
             sum((D(row["balance"]) for row in funding_wallets), D("0")) if wallet_balance_available else None
         )
-        offers = [row for row in snapshot.get("offers", []) if row.get("currency") == currency]
-        lending_rows = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []), currency)
+        offers = [row for row in snapshot.get("offers", []) if row.get("currency") == "USD"]
+        lending_rows = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []))
         offer_total = sum((D(row["amount"]) for row in offers), D("0"))
         credit_total = sum(
             (D(row["amount"]) for row in lending_rows if row.get("funding_state") != "loan"),
@@ -1005,12 +971,6 @@ class LendingRuntimeV3:
             "loanPrincipal": loan_total,
             "componentTotal": component_total,
             "total": total,
-            "openOfferCount": len(offers),
-            "managedOffers": [row for row in offers if row.get("managed")],
-            "exposureByPeriod": {
-                p: sum((D(r["amount"]) for r in [*offers, *lending_rows] if int(r.get("period") or 0) == p), D(0))
-                for p in {int(r.get("period") or 0) for r in [*offers, *lending_rows]}
-            },
             "reconciliationDifference": reconciliation_difference,
             "reconciliationStatus": reconciliation_status,
             "exposure": exposure,
@@ -1027,10 +987,6 @@ class LendingRuntimeV3:
 
     @staticmethod
     def _build_plan(account, policy, signals, strategy_version):
-        if policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-            from AdaptiveRuntime import plan
-
-            return plan(account, policy, signals, strategy_version)
         return build_strategy_plan_v3(
             account["total"],
             account["wallet"],
@@ -1046,7 +1002,7 @@ class LendingRuntimeV3:
         )
 
     def _net_interest_total(self):
-        return self.store.realized_income(self.currency)
+        return self.store.realized_income("USD")
 
     def _persist_period_selection(self, signals, strategy_version, now_ms):
         selection = signals.get("periodSelection") or signals.get("period_selection") or {}
@@ -1173,18 +1129,14 @@ class LendingRuntimeV3:
             curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
             stages = self.policy.reprice_stages(pool, layer, curve_version)
             exploration_curve = curve_version in EXACT_TERM_EXPLORATION_CURVES
-            landing_stage = (
-                min(
-                    len(stages),
-                    int(
-                        self.policy.balanced_landing_stage
-                        if layer in {"quick", "balanced"}
-                        else self.policy.high_landing_stage
-                    ),
-                )
-                if exploration_curve
-                else None
-            )
+            landing_stage = min(
+                len(stages),
+                int(
+                    self.policy.balanced_landing_stage
+                    if layer in {"quick", "balanced"}
+                    else self.policy.high_landing_stage
+                ),
+            ) if exploration_curve else None
             next_stage = stage + 1 if stage < len(stages) else None
             next_at = (
                 int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000 if next_stage is not None else None
@@ -1206,7 +1158,7 @@ class LendingRuntimeV3:
             landing_gap = max(D("0"), observed_rate - fixed_landing)
             final_due_at = int(chain["started_at_ms"]) + int(stages[-1]) * 60_000
             pending_action = chain.get("pending_action")
-            below_repost_minimum = D(offer.get("amount") or 0) < funding_minimum()
+            below_repost_minimum = D(offer.get("amount") or 0) < USD_ORDER_CHUNK
             if below_repost_minimum and floor_gap >= self.policy.minimum_rate_change:
                 floor_state = "BELOW_REPOST_MINIMUM"
             elif pending_action == "AGE_STAGE" and stage >= len(stages):
@@ -1236,9 +1188,7 @@ class LendingRuntimeV3:
                         stage_count=len(stages),
                     )
             stage_type = (
-                "FLOOR"
-                if exploration_curve and stage > landing_stage
-                else "MARKET"
+                "FLOOR" if exploration_curve and stage > landing_stage else "MARKET"
                 if exploration_curve
                 else _reprice_stage_type(stage, len(stages))
             )
@@ -1277,7 +1227,8 @@ class LendingRuntimeV3:
                         if exploration_curve and landing_gap < self.policy.minimum_rate_change
                         else "REPRICE_REQUIRED"
                         if exploration_curve
-                        and now_ms >= int(chain["started_at_ms"]) + int(stages[landing_stage - 1]) * 60_000
+                        and now_ms
+                        >= int(chain["started_at_ms"]) + int(stages[landing_stage - 1]) * 60_000
                         else "NOT_DUE"
                         if exploration_curve
                         else None
@@ -1294,21 +1245,15 @@ class LendingRuntimeV3:
         return json_decimal(rows)
 
     def _strategy_status(self, snapshot, signals, result=None):
-        account = self._account(snapshot, self.currency)
+        account = self._account(snapshot)
         runtime = self.store.runtime()
-        realized_income = self.store.realized_income_summary(self.currency)
-        income_sync = self.store.income_history_sync_payload(self.currency)
+        realized_income = self.store.realized_income_summary("USD")
+        income_sync = self.store.income_history_sync_payload("USD")
         now = int(snapshot.get("now") or self.clock() * 1000)
-        repricing = (
-            []
-            if self.policy.strategy_engine in (
-                "adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"
-            )
-            else self._repricing_status(signals, now)
-        )
+        repricing = self._repricing_status(signals, now)
         repricing_by_offer = {int(row["offerId"]): row for row in repricing}
         open_offers = json_decimal(snapshot["offers"])
-        active_lending = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []), self.currency)
+        active_lending = _active_lending_rows(snapshot.get("credits", []), snapshot.get("loans", []))
         active_credit_dashboard = build_active_credit_dashboard(
             active_lending,
             account["total"],
@@ -1332,18 +1277,12 @@ class LendingRuntimeV3:
             strategy_payload["periodSelection"] = selection_payload
             strategy_payload["dustConsolidation"] = json_decimal(self.store.consolidation_status())
             strategy_payload["externalTakeover"] = json_decimal(
-                {
-                    "automatic": bool(self.policy.adopt_external_offers)
-                    and self.policy.strategy_engine != "adaptive_net_yield_v3",
-                    "offers": self.store.external_takeovers(),
-                }
+                {"automatic": bool(self.policy.adopt_external_offers), "offers": self.store.external_takeovers()}
             )
-            strategy_payload["periodActivity"] = json_decimal(
-                self.store.period_activity(now - 86_400_000, self.currency)
-            )
+            strategy_payload["periodActivity"] = json_decimal(self.store.period_activity(now - 86_400_000, "USD"))
         status = {
             "schemaVersion": 3,
-            "stateSchemaVersion": 17,
+            "stateSchemaVersion": 16,
             "operationMode": runtime["mode"],
             "runtime": runtime,
             "recovery": self.store.recovery_status(),
@@ -1359,7 +1298,7 @@ class LendingRuntimeV3:
             "activeCreditSummary": active_credit_dashboard["summary"],
             "realizedIncome": realized_income,
             "incomeHistorySync": income_sync,
-            "releaseComparison": json_decimal(self.store.release_comparison(now, self.currency)),
+            "releaseComparison": json_decimal(self.store.release_comparison(now, "USD")),
             "writeRecovery": self._write_recovery_status(),
             "strategyV3": strategy_payload,
             "activeStrategy": self.store.strategy("ACTIVE"),
@@ -1393,58 +1332,31 @@ class LendingRuntimeV3:
         continuation_offer_id=None,
     ):
         submitted = []
-        if self.store.intents(states={"PLANNED", "SUBMITTING", "AMBIGUOUS"}):
-            plan_result["executionBlockReasons"] = ["存在尚未完成对账的写入；禁止追加提交"]
-            return submitted
         remaining = D(wallet_available)
         now = int(self.clock() * 1000)
         recent_attempts = self.store.submission_attempt_count_since(
             now - FUNDING_SUBMISSION_WINDOW_MS,
-            self.currency,
+            "USD",
         )
         attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
         attempts = 0
         plan_hash = str(plan_result.get("plan_hash") or "unhashed")
-        from ExecutionSafety import blocked, record_rejection
-
         for row in plan_result["plan"]:
             if attempts >= attempt_budget:
                 break
             base_slice_key = f"{strategy_version}:{plan_hash}:{row['pool']}:{row['layer']}:{row['slice_index']}"
             submit_row = dict(row)
-            order = {
-                **submit_row,
-                "currency": self.currency,
-                "slice_key": self.store.replenishment_slice_key(base_slice_key),
-                "strategy_version": strategy_version,
-                "pricing_curve_version": submit_row.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE,
-                "fixed_landing_rate": submit_row.get("fixed_landing_rate"),
-            }
-            try:
-                barrier = blocked(self.store, order)
-            except OSError:
-                self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                plan_result["executionBlockReasons"] = ["无法核对持久化拒绝记录；禁止写入"]
-                break
-            if barrier:
-                plan_result.setdefault("executionBlockReasons", []).append("相同参数已被明确拒绝，等待修正")
-                continue
-            try:
-                validate_funding_payload(
-                    submit_row["amount"], submit_row["submitted_rate"], submit_row["period"],
-                    submit_row["offer_type"], submit_row["flags"]
-                )
-            except BitfinexApiError as exc:
-                result = WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc), category=exc.category)
-                try:
-                    record_rejection(self.store, order, result, now)
-                except OSError:
-                    self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                    break
-                plan_result.setdefault("executionBlockReasons", []).append(str(exc))
-                continue
             if submit_row["amount"] > remaining:
                 break
+            order = {
+                **submit_row,
+                "currency": "USD",
+                "slice_key": self.store.replenishment_slice_key(base_slice_key),
+                "strategy_version": strategy_version,
+                "pricing_curve_version": submit_row.get("pricing_curve_version")
+                or EXACT_TERM_EXPLORATION_CURVE,
+                "fixed_landing_rate": submit_row.get("fixed_landing_rate"),
+            }
             try:
                 created, intent = self.store.reserve_intent(order, remaining)
             except InsufficientReservedBalance:
@@ -1457,7 +1369,7 @@ class LendingRuntimeV3:
                 self.client,
                 "submit_funding_offer_result",
                 "submit_funding_offer",
-                currency_to_symbol(self.currency),
+                "fUSD",
                 format(submit_row["amount"], "f"),
                 format(submit_row["submitted_rate"], "f"),
                 submit_row["period"],
@@ -1515,12 +1427,7 @@ class LendingRuntimeV3:
                 break
             else:
                 self.store.reject_intent(intent["id"], result.error)
-                try:
-                    record_rejection(self.store, order, result, now)
-                except OSError:
-                    self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                    break
-                self._log(f"{self.currency} v3 挂单被明确拒绝：{result.error}")
+                self._log(f"USD v3 挂单被明确拒绝：{result.error}")
                 if result.category == "BALANCE_DRIFT":
                     self.store.set_mode("PAUSED", "AUTO_RECOVERY:BALANCE_DRIFT")
                     self.store.begin_recovery(
@@ -1540,24 +1447,30 @@ class LendingRuntimeV3:
         cap_limited_available=None,
     ):
         """Restore canceled offers before new wallet cash is allocated."""
-        from ExecutionSafety import blocked, record_rejection
 
         submitted = []
         remaining = D(wallet_available)
         pending_rows = self.store.pending_reprices(strategy_version)
         replacement_principal = sum((D(row["source_amount"]) for row in pending_rows), D("0"))
-        cap_available = D(wallet_available if cap_limited_available is None else cap_limited_available)
+        cap_available = D(
+            wallet_available if cap_limited_available is None else cap_limited_available
+        )
         replacement_surplus = min(
             max(D("0"), remaining - replacement_principal),
             max(D("0"), cap_available - replacement_principal),
         ).quantize(SATOSHI, rounding=ROUND_DOWN)
         absorption_chain = None
-        if D("0") < replacement_surplus < funding_minimum():
+        if D("0") < replacement_surplus < USD_ORDER_CHUNK:
             absorption_chain = next(
                 (
                     row["chain_key"]
                     for row in pending_rows
-                    if str(row.get("source_display_type") or row.get("source_offer_type") or "LIMIT").upper() == "LIMIT"
+                    if str(
+                        row.get("source_display_type")
+                        or row.get("source_offer_type")
+                        or "LIMIT"
+                    ).upper()
+                    == "LIMIT"
                     and str(row.get("source_offer_type") or "LIMIT").upper() == "LIMIT"
                     and not (int(row.get("source_flags") or 0) & 64)
                 ),
@@ -1566,7 +1479,7 @@ class LendingRuntimeV3:
         now = int(self.clock() * 1000)
         recent_attempts = self.store.submission_attempt_count_since(
             now - FUNDING_SUBMISSION_WINDOW_MS,
-            self.currency,
+            "USD",
         )
         attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
         attempts = 0
@@ -1610,29 +1523,14 @@ class LendingRuntimeV3:
             )
             order = {
                 **row,
-                "currency": str(pending.get("source_currency") or self.currency).upper(),
+                "currency": str(pending.get("source_currency") or "USD").upper(),
                 "slice_key": self.store.replenishment_slice_key(pending["base_slice_key"]),
                 "strategy_version": strategy_version,
-                "pricing_curve_version": str(pending.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE),
+                "pricing_curve_version": str(
+                    pending.get("pricing_curve_version") or EXACT_TERM_EXPLORATION_CURVE
+                ),
                 "fixed_landing_rate": pending.get("fixed_landing_rate"),
             }
-            try:
-                if blocked(self.store, order):
-                    continue
-                validate_funding_payload(
-                    row["amount"], row["submitted_rate"], row["period"], row["offer_type"], row["flags"]
-                )
-            except BitfinexApiError as exc:
-                result = WriteResult(WriteOutcome.DEFINITE_REJECT, error=str(exc), category=exc.category)
-                try:
-                    record_rejection(self.store, order, result, now)
-                except OSError:
-                    self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                    break
-                continue
-            except OSError:
-                self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                break
             try:
                 created, intent = self.store.reserve_intent(order, remaining)
             except InsufficientReservedBalance:
@@ -1670,12 +1568,7 @@ class LendingRuntimeV3:
                 break
             else:
                 self.store.reject_intent(intent["id"], result.error)
-                self._log(f"{self.currency} 调价重挂被明确拒绝：{result.error}")
-                try:
-                    record_rejection(self.store, order, result, now)
-                except OSError:
-                    self.store.enter_protected_pause("EXECUTION_BARRIER_UNAVAILABLE")
-                    break
+                self._log(f"USD 调价重挂被明确拒绝：{result.error}")
                 if result.category == "BALANCE_DRIFT":
                     self.store.set_mode("PAUSED", "AUTO_RECOVERY:BALANCE_DRIFT")
                     self.store.begin_recovery(
@@ -1731,9 +1624,17 @@ class LendingRuntimeV3:
             pool = offer.get("pool") or pool_for_period(offer.get("period") or 0)
             layer = offer.get("layer") or "balanced"
             chain = self.store.reprice_chain_for_offer(int(offer["offer_id"]))
-            started_at = int((chain or {}).get("started_at_ms") or offer.get("mts_created") or now)
+            started_at = int(
+                (chain or {}).get("started_at_ms")
+                or offer.get("mts_created")
+                or now
+            )
             curve_version = str((chain or {}).get("pricing_curve_version") or "LEGACY")
-            stages = self.policy.reprice_stages(pool, layer, curve_version) if pool in POOLS else (0,)
+            stages = (
+                self.policy.reprice_stages(pool, layer, curve_version)
+                if pool in POOLS
+                else (0,)
+            )
             final_due_at = started_at + int(stages[-1]) * 60_000
             return (
                 0 if now >= final_due_at else 1,
@@ -1743,12 +1644,12 @@ class LendingRuntimeV3:
             )
 
         for offer in sorted(offers, key=reprice_priority):
-            if not offer["managed"] or offer["currency"] != self.currency:
+            if not offer["managed"] or offer["currency"] != "USD":
                 continue
             offer_id = int(offer["offer_id"])
             if offer_id in self._pending_cancel_requested:
                 continue
-            if D(offer.get("amount") or 0) < funding_minimum():
+            if D(offer.get("amount") or 0) < USD_ORDER_CHUNK:
                 continue
             pool = offer.get("pool") or pool_for_period(offer["period"])
             layer = offer.get("layer") or "balanced"
@@ -1849,7 +1750,9 @@ class LendingRuntimeV3:
                             chain["chain_key"],
                             next_stage,
                             now,
-                            market_anchor_rate=(old_rate if not exploration_curve and next_stage == 3 else None),
+                            market_anchor_rate=(
+                                old_rate if not exploration_curve and next_stage == 3 else None
+                            ),
                         )
                         self.store.record_ownership_event(
                             "REPRICE_STAGE_SKIPPED",
@@ -1888,7 +1791,8 @@ class LendingRuntimeV3:
             last_family_reprice = self.store.last_reprice_for_family(pool, layer)
             if (
                 not final_floor_priority
-                and last_family_reprice is not None
+                and
+                last_family_reprice is not None
                 and now - int(last_family_reprice) < self.policy.reprice_cooldown_minutes * 60_000
             ):
                 continue
@@ -1917,7 +1821,9 @@ class LendingRuntimeV3:
                 stage=stage,
                 now_ms=now,
                 market_anchor_rate=(
-                    desired_rate if action == "AGE_STAGE" and stage == 3 and not exploration_curve else None
+                    desired_rate
+                    if action == "AGE_STAGE" and stage == 3 and not exploration_curve
+                    else None
                 ),
                 source_offer_id=offer_id,
             )
@@ -2117,15 +2023,19 @@ class LendingRuntimeV3:
             if expected_remaining == 0:
                 self.store.clear_consolidation(now_ms)
                 return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
-            if wallet < expected_remaining or expected_remaining < funding_minimum():
-                if deployed > 0 and expected_remaining < funding_minimum():
+            if wallet < expected_remaining or expected_remaining < USD_ORDER_CHUNK:
+                if deployed > 0 and expected_remaining < USD_ORDER_CHUNK:
                     self.store.clear_consolidation(now_ms)
                     return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
                 self.store.update_consolidation("READY", now_ms=now_ms)
                 return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
 
             source_offer = next(
-                (row for row in self.store.offers() if int(row["offer_id"]) == int(status["offer_id"])),
+                (
+                    row
+                    for row in self.store.offers()
+                    if int(row["offer_id"]) == int(status["offer_id"])
+                ),
                 None,
             )
             if source_offer is None:
@@ -2154,7 +2064,7 @@ class LendingRuntimeV3:
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
             submitted_rate = D(source_offer["rate"])
             effective_rate = D(source_offer.get("rate_real") or source_offer["rate"])
-            slice_count = int(expected_remaining // funding_minimum())
+            slice_count = int(expected_remaining // USD_ORDER_CHUNK)
             amounts = evenly_distributed_amounts(expected_remaining, slice_count)
             slice_offset = len(related)
             dust_plan = {
@@ -2168,7 +2078,9 @@ class LendingRuntimeV3:
                         "period": int(source_offer["period"]),
                         "offer_type": str(source_offer.get("offer_type") or "LIMIT"),
                         "display_type": str(
-                            source_offer.get("display_type") or source_offer.get("offer_type") or "LIMIT"
+                            source_offer.get("display_type")
+                            or source_offer.get("offer_type")
+                            or "LIMIT"
                         ),
                         "flags": int(source_offer.get("flags") or 0),
                         "submitted_rate": submitted_rate,
@@ -2205,7 +2117,7 @@ class LendingRuntimeV3:
         if self._last_dust_check_bucket == bucket:
             return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
         self._last_dust_check_bucket = bucket
-        if wallet < DUST_REINVEST_MINIMUM or wallet >= funding_minimum():
+        if wallet < DUST_REINVEST_MINIMUM or wallet >= USD_ORDER_CHUNK:
             return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
         if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
             return {"blocking": False, "state": "RATE_LIMITED", "canceled": [], "submitted": []}
@@ -2218,7 +2130,8 @@ class LendingRuntimeV3:
             layer = str(offer.get("layer") or "balanced")
             last_family = self.store.last_reprice_for_family(pool, layer)
             cooling_down = (
-                last_family is not None and now_ms - int(last_family) < self.policy.reprice_cooldown_minutes * 60_000
+                last_family is not None
+                and now_ms - int(last_family) < self.policy.reprice_cooldown_minutes * 60_000
             )
             if (
                 offer.get("managed")
@@ -2227,7 +2140,7 @@ class LendingRuntimeV3:
                 and not (self.store.reprice_chain_for_offer(int(offer["offer_id"])) or {}).get("pending_action")
                 and not cooling_down
                 and age >= self.policy.minimum_offer_minutes * 60_000
-                and amount + wallet >= funding_minimum()
+                and amount + wallet >= USD_ORDER_CHUNK
             ):
                 candidates.append(offer)
         if not candidates:
@@ -2299,7 +2212,7 @@ class LendingRuntimeV3:
         """
         adjustments = []
         managed_offers = [
-            row for row in self.store.offers(active_only=True) if row["managed"] and row["currency"] == self.currency
+            row for row in self.store.offers(active_only=True) if row["managed"] and row["currency"] == "USD"
         ]
         cap_excess = max(
             D("0"),
@@ -2429,29 +2342,24 @@ class LendingRuntimeV3:
         }
 
     def cycle(self, now_ms=None):
-        active = self.store.strategy("ACTIVE")
-        if active is not None:
-            self.policy = policy_v3_with_overrides(StrategyPolicyV3(), active["policy"])
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         self.store.touch_heartbeat(now)
         if not self._bootstrapped:
             self.bootstrap(start_websocket=True)
-            if now_ms is None:
-                now = int(self.clock() * 1000)
         recovery = self.store.recovery_status()
         rest_due = now - self._last_rest_sync_ms >= self.policy.rest_stale_seconds * 1000
         if recovery["active"]:
             rest_due = self.store.recovery_probe_due(now)
         if rest_due:
             try:
-                snapshot = self.sync_rest(now_ms=now) if now_ms is not None else self.sync_rest()
+                snapshot = self.sync_rest(now_ms=now)
             except BitfinexApiError as exc:
                 decision = classify_runtime_error(exc)
                 if not decision.retryable:
                     raise
                 runtime = self.store.runtime()
                 recovery = self.store.recovery_status()
-                origin = resume_target(runtime, recovery)
+                origin = recovery.get("targetMode") or runtime["mode"]
                 if runtime["mode"] != "PAUSED":
                     self.store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
                 self.store.begin_recovery(
@@ -2465,11 +2373,9 @@ class LendingRuntimeV3:
                 self._log(f"v3 REST 同步失败：{exc}")
         else:
             snapshot = self.hub.snapshot(now)
-        if now_ms is None:
-            now = int(self.clock() * 1000)
         if snapshot["safeRequired"]:
             self.store.enter_protected_pause("MARKET_DATA_STALE")
-        account = self._account(snapshot, self.currency)
+        account = self._account(snapshot)
         runtime = self.store.runtime()
         if runtime["mode"] == "LIVE" and account["reconciliationStatus"] != "MATCHED":
             reason = (
@@ -2483,11 +2389,7 @@ class LendingRuntimeV3:
         self._record_variable_floor_violations(now)
         runtime = self.store.runtime()
         resume_barrier = self.store.consume_resume_barrier()
-        if self.policy.strategy_engine in ("adaptive_net_yield_v1", "adaptive_net_yield_v2", "adaptive_net_yield_v3"):
-            from AdaptiveRuntime import cycle
-
-            result = cycle(self, snapshot, account, signals, now, resume_barrier)
-        elif runtime["mode"] == "LIVE" and not resume_barrier:
+        if runtime["mode"] == "LIVE" and not resume_barrier:
             validate_policy_v3(self.policy, require_live_floors=True)
             pending_status = self._advance_pending_strategy(snapshot, account, signals, now)
             if pending_status and pending_status.get("pending"):

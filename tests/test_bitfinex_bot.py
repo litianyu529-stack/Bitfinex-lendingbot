@@ -174,7 +174,7 @@ def build_strategy_settings(extra_bot=None):
 
 class BitfinexBotTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(APP_VERSION, "4.0.0")
+        self.assertEqual(APP_VERSION, "0.3.5.2")
 
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
@@ -502,35 +502,6 @@ class BitfinexBotTests(unittest.TestCase):
         self.assertTrue(backups_exist)
         self.assertEqual([event["event_type"] for event in events], ["SCHEMA_NORMALIZATION"])
 
-    def test_startup_preserves_legacy_active_without_adaptive_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "test.cfg")
-            database = os.path.join(directory, "state.sqlite3")
-            write_test_config(path, {"statedbfile": database})
-            config, _ = lendingbot.read_config(path)
-            settings = lendingbot.build_settings(lendingbot.parse_args(["--config", path]), config)
-            raw = lendingbot.json_decimal(settings.strategy_v3.__dict__)
-            for key in (
-                "strategy_engine", "long_from_days", "long_max_share",
-                "maximum_period", "model_id", "fee_verified",
-            ):
-                raw.pop(key)
-            store = lendingbot.LendingStateStore(database)
-            version = store.save_strategy(raw, status="ACTIVE")
-            before = store.strategy("ACTIVE")
-            with open(path, "rb") as file:
-                original_config = file.read()
-            for _ in range(2):
-                result = lendingbot.normalize_current_active_strategy(path)
-                self.assertFalse(result["changed"])
-                self.assertEqual(result["versionId"], version)
-                self.assertIsNone(result["backup"])
-                self.assertEqual(store.strategy("ACTIVE"), before)
-            with open(path, "rb") as file:
-                self.assertEqual(file.read(), original_config)
-            with store.read_connection() as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM strategy_events").fetchone()[0], 0)
-
     def test_preflight_summary_and_warning(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "test.cfg")
@@ -750,8 +721,6 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(len(popen_calls), 1)
             self.assertEqual(sum(result is not None for result in results), 1)
             self.assertIn("--live", popen_calls[0][0][0])
-            command = popen_calls[0][0][0]
-            self.assertEqual(command[command.index("--currencies") + 1], "USD")
             self.assertTrue(store.recovery_status()["active"])
             lendingbot.stop_controlled_bot(config_path, context=context)
             lendingbot.cleanup_controlled_bot_handle(context)
