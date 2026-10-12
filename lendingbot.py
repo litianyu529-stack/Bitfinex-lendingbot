@@ -937,7 +937,10 @@ def dashboard_status_payload(status_path, config_path, context=None):
                 if runtime.get("safe_reason")
                 else "策略已暂停；实盘进程仍在运行。"
             )
-        payload.update(stats_v3_payload(store))
+        # The worker publishes statistics with the account snapshot. Rebuilding
+        # every history window here blocks frequent UI polls on large databases
+        # and mixes newer statistics with an older account snapshot. Explicit
+        # history requests can still use /api/stats/v3.
     except Exception as exc:
         unavailable = empty_status_payload()
         unavailable["log"] = list(payload.get("log") or [])

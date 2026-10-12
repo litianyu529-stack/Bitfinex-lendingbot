@@ -821,6 +821,51 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(payload["lastStopReason"], "dashboard_started_without_live_process")
             self.assertIn("控制台启动时未发现实盘进程", payload["last_status"])
 
+    def test_dashboard_poll_uses_worker_statistics_without_history_queries(self):
+        published = {
+            "schemaVersion": 3,
+            "operationMode": "LIVE",
+            "last_update": "2026-10-12 15:00:00",
+            "account": {"total": "123", "walletAvailableKnown": True},
+            "statistics": {"30d": {"netInterest": "9.87"}},
+            "realizedIncome": {"total": "12.34"},
+            "incomeHistorySync": {"currency": "USD"},
+        }
+        store = mock.Mock()
+        store.runtime.return_value = {"mode": "PAUSED", "safe_reason": "manual_pause"}
+        store.recovery_status.return_value = {"active": False}
+        with (
+            mock.patch.object(lendingbot, "read_status_payload", return_value=published.copy()),
+            mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+            mock.patch.object(lendingbot, "controlled_bot_status", return_value={"running": True}),
+            mock.patch.object(lendingbot, "stats_v3_payload", side_effect=AssertionError("history scan in UI poll")),
+        ):
+            payload = lendingbot.dashboard_status_payload("botlog.json", "test.cfg")
+        self.assertEqual(payload["statistics"], published["statistics"])
+        self.assertEqual(payload["realizedIncome"], published["realizedIncome"])
+        self.assertEqual(payload["incomeHistorySync"], published["incomeHistorySync"])
+        self.assertEqual(payload["last_update"], published["last_update"])
+        self.assertEqual(payload["operationMode"], "PAUSED")
+        self.assertIn("manual_pause", payload["last_status"])
+        self.assertTrue(payload["snapshotAvailable"])
+        store.statistics.assert_not_called()
+
+    def test_dashboard_poll_without_worker_history_does_not_fabricate_statistics(self):
+        store = mock.Mock()
+        store.runtime.return_value = {"mode": "LIVE"}
+        store.recovery_status.return_value = {"active": False}
+        with (
+            mock.patch.object(lendingbot, "read_status_payload", return_value=lendingbot.empty_status_payload()),
+            mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+            mock.patch.object(lendingbot, "controlled_bot_status", return_value={"running": True}),
+            mock.patch.object(lendingbot, "stats_v3_payload", side_effect=AssertionError("history scan in UI poll")),
+        ):
+            payload = lendingbot.dashboard_status_payload("botlog.json", "test.cfg")
+        self.assertFalse(payload["snapshotAvailable"])
+        self.assertEqual(payload["last_update"], "")
+        self.assertNotIn("statistics", payload)
+        store.statistics.assert_not_called()
+
     def test_dashboard_status_failure_hides_stale_account_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             status_path = os.path.join(directory, "botlog.json")
